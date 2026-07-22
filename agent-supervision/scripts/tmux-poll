@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# tmux-poll: read only new content from a tmux pane since last poll.
+# Designed for monitoring pi coding agent TUI sessions.
+#
+# Usage: tmux-poll [options] <target>
+#   --reset    Clear cursor
+#   --full     Ignore cursor, return full content
+#   --dir DIR  Cursor dir (default: /tmp/tmux-poll-cursors)
+
+set -euo pipefail
+
+RESET=0; FULL=0; CURSOR_DIR="/tmp/tmux-poll-cursors"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --reset) RESET=1; shift ;;
+        --full)  FULL=1; shift ;;
+        --dir)   CURSOR_DIR="$2"; shift 2 ;;
+        *)       TARGET="$1"; shift ;;
+    esac
+done
+: "${TARGET:?Usage: tmux-poll [options] <target>}"
+SAFE_NAME="${TARGET//[^a-zA-Z0-9_.-]/_}"
+SNAP_FILE="${CURSOR_DIR}/${SAFE_NAME}.snap"
+mkdir -p "$CURSOR_DIR"
+
+[[ $RESET -eq 1 ]] && { rm -f "$SNAP_FILE"; echo "Cursor reset for $TARGET"; exit 0; }
+
+extract_content() {
+    local raw="$1"
+    # Strip bottom TUI chrome: from 2nd-to-last separator to end
+    local sep_line
+    sep_line=$(echo "$raw" | grep -n '^─\{10,\}' | tail -2 | head -1 | cut -d: -f1)
+    if [[ -n "$sep_line" && "$sep_line" -gt 5 ]]; then
+        raw=$(echo "$raw" | head -n "$((sep_line - 1))")
+    fi
+    # Strip trailing blanks
+    echo "$raw" | sed -e :a -e '/^[[:space:]]*$/{ $d; N; ba; }'
+    # Filter spinner lines (braille chars + "Working...")
+}
+
+stabilize() {
+    # Remove transient lines: spinners, progress indicators
+    grep -v '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]' | grep -v '^ *Working\.\.\.' || true
+}
+
+RAW=$(tmux capture-pane -t "$TARGET" -p -S -)
+CAPTURE=$(extract_content "$RAW")
+STABLE=$(echo "$CAPTURE" | stabilize)
+
+[[ $FULL -eq 1 ]] && { echo "$CAPTURE"; echo "$STABLE" > "$SNAP_FILE"; exit 0; }
+
+if [[ -f "$SNAP_FILE" ]]; then
+    PREV=$(cat "$SNAP_FILE")
+    [[ "$STABLE" == "$PREV" ]] && exit 0
+
+    # Find anchor: last non-blank line from previous stable snapshot
+    ANCHOR=$(echo "$PREV" | grep -v '^[[:space:]]*$' | grep -v '^─' | tail -1)
+
+    if [[ -n "$ANCHOR" ]]; then
+        MATCH=$(echo "$CAPTURE" | grep -nF -- "$ANCHOR" | tail -1 | cut -d: -f1)
+        TOTAL=$(echo "$CAPTURE" | wc -l)
+        if [[ -n "$MATCH" && "$MATCH" -lt "$TOTAL" ]]; then
+            echo "$CAPTURE" | tail -n +"$((MATCH + 1))"
+        fi
+    else
+        echo "$CAPTURE"
+    fi
+else
+    echo "$CAPTURE"
+fi
+
+echo "$STABLE" > "$SNAP_FILE"

@@ -1,0 +1,2662 @@
+#!/usr/bin/env python3
+"""
+superv — unified CLI for agent supervision.
+
+Subcommands:
+  list                         Auto-discover candidate workers (tmux + http).
+  name                         Print next available worker name from the pool.
+  register <id> ...            Register a new worker (fails if id already taken).
+  unregister <id>              Remove a registry entry (cursor and notes are kept).
+  watch <id>                   Incremental view of new persisted entries since cursor.
+  watch <id> --live            Live-state probe (tmux pane / http /session/status).
+  detail <id> <entry-id>       Full content for one persisted entry.
+  send <id> "<msg>"            Send a message to the worker (any text, single or multi-line).
+  send <id> --file <path>      Send a message read from a file (convenience).
+  status <id>                  One-line mechanical classification: running/idle/stalled/broken.
+  note <id> "<obs>" --tag T    Append a timestamped tagged entry to the notes file.
+  heartbeat <id> --bump|--reset|--teardown|--show
+                               Manage the polled-supervisor heartbeat instruction file.
+
+Filesystem state lives under ~/.agent-supervision/. Stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+# -- paths --------------------------------------------------------------------
+
+STATE_ROOT = Path.home() / ".agent-supervision"
+WORKERS_DIR = STATE_ROOT / "workers"
+CURSORS_DIR = STATE_ROOT / "cursors"
+NOTES_DIR = STATE_ROOT / "notes"
+HEARTBEATS_DIR = STATE_ROOT / "heartbeats"
+POINTER_FILES_DIR = STATE_ROOT / "pointer-files"
+TMUX_CURSORS_DIR = STATE_ROOT / "tmux-cursors"
+TMUX_LOCK_FILE = STATE_ROOT / "tmux.lock"
+
+PI_SESSIONS_ROOT = Path.home() / ".pi" / "agent" / "sessions"
+CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+CLAUDE_PID_META_DIR = Path.home() / ".claude" / "sessions"
+CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
+
+OC_BASE = os.environ.get("OPENCODE_BASE", "http://localhost:4096")
+
+# -- truncation defaults ------------------------------------------------------
+
+ARGS_TRUNC = 140
+RESULT_TRUNC = 220
+TEXT_TRUNC = 4000
+RECENT_COUNT_DEFAULT = 6
+MAX_RENDERED_CHARS = 12000
+ESTABLISHED_THRESHOLD = 20  # entries; cursor required beyond this on bootstrap
+
+# -- name pool ----------------------------------------------------------------
+
+NAME_POOL = [
+    "alice", "bob", "carol", "dave", "frank", "grace", "helen", "iris",
+    "jack", "kate", "liam", "mary", "nina", "owen", "paul", "rose",
+    "sam", "tom", "charlie", "ed", "bill", "adam", "mike", "kyle",
+    "john", "ivy", "rachel", "ronnie", "allison", "amy", "andrew",
+]
+
+# -- heartbeat schedule -------------------------------------------------------
+
+HEARTBEAT_START = 30
+HEARTBEAT_STEP = 30
+HEARTBEAT_CAP = 240
+CANONICAL_HEARTBEAT_PROMPT = (
+    "You are a supervisor agent. Reassess the current project using conversation context and durable supervision state. "
+    "Observe and interpret whatever currently needs attention, then continue your supervisor duties as appropriate—wait, "
+    "nudge, correct, dispatch, review, transition, or escalate—following the agent-supervision skill. This heartbeat does not "
+    "define or limit task scope. Preserve this prompt in this generic form: do not rewrite it around a specific worker, task, "
+    "phase, or current state. Keep project details in conversation, session files, or supervision notes rather than this prompt."
+)
+
+
+# -- utilities ----------------------------------------------------------------
+
+def eprint(*args: Any) -> None:
+    print(*args, file=sys.stderr)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def ensure_dirs() -> None:
+    for d in (WORKERS_DIR, CURSORS_DIR, NOTES_DIR, HEARTBEATS_DIR, POINTER_FILES_DIR, TMUX_CURSORS_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def trunc(text: str, limit: int) -> str:
+    s = "" if text is None else str(text)
+    if len(s) <= limit:
+        return s
+    return f"{s[:limit]}... ({len(s)} chars)"
+
+
+def single_line(text: str, limit: int) -> str:
+    return trunc(str(text).replace("\n", "\\n"), limit)
+
+
+def fmt_ts(ts: Any) -> str:
+    if not ts:
+        return "?"
+    try:
+        if isinstance(ts, (int, float)):
+            seconds = ts / 1000 if ts > 1e12 else ts
+            return datetime.fromtimestamp(seconds).strftime("%H:%M:%S")
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).strftime("%H:%M:%S")
+    except Exception:
+        return str(ts)[:19]
+
+
+def shell_escape(s: str) -> str:
+    return shlex.quote(s)
+
+
+# -- registry -----------------------------------------------------------------
+
+def registry_path(worker_id: str) -> Path:
+    return WORKERS_DIR / f"{worker_id}.json"
+
+
+def load_record(worker_id: str) -> Dict[str, Any]:
+    p = registry_path(worker_id)
+    if not p.exists():
+        raise ValueError(f"Unknown worker id: {worker_id} (no registry entry at {p})")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def save_record(rec: Dict[str, Any]) -> None:
+    ensure_dirs()
+    p = registry_path(rec["id"])
+    rec.setdefault("created_at", now_iso())
+    rec["updated_at"] = now_iso()
+    p.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+
+
+def list_records() -> List[Dict[str, Any]]:
+    ensure_dirs()
+    return [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in sorted(WORKERS_DIR.glob("*.json"))
+    ]
+
+
+# -- cursor -------------------------------------------------------------------
+
+def cursor_path(worker_id: str) -> Path:
+    return CURSORS_DIR / f"{worker_id}.json"
+
+
+def load_cursor(worker_id: str) -> Optional[Dict[str, Any]]:
+    p = cursor_path(worker_id)
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def save_cursor(worker_id: str, payload: Dict[str, Any]) -> None:
+    ensure_dirs()
+    payload = dict(payload)
+    payload["updated_at"] = now_iso()
+    cursor_path(worker_id).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def reset_cursor(worker_id: str) -> None:
+    p = cursor_path(worker_id)
+    if p.exists():
+        p.unlink()
+
+
+# -- tmux mutex --------------------------------------------------------------
+
+@contextlib.contextmanager
+def tmux_lock(timeout_s: float = 30.0, poll_s: float = 0.05):
+    """Strong mutex serializing tmux interactions across superv invocations.
+
+    tmux's paste buffer is global per server, so two concurrent `superv send`
+    calls can interleave: caller A loads text into the buffer, caller B loads
+    its own text (overwriting A), then A pastes and delivers B's text to A's
+    worker — cross-contaminating the two workers. Holding an exclusive flock
+    across each tmux critical section makes those sections atomic.
+
+    flock is released automatically when the holding process exits, so a
+    crashed or killed peer cannot wedge the lock. A bounded timeout prevents a
+    stuck peer from blocking everyone forever.
+    """
+    ensure_dirs()
+    f = open(TMUX_LOCK_FILE, "w")
+    deadline = time.time() + timeout_s
+    try:
+        while True:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    raise TimeoutError(
+                        f"timed out after {timeout_s:.0f}s waiting for tmux lock {TMUX_LOCK_FILE}; "
+                        "another superv process may be stuck inside a tmux critical section"
+                    )
+                time.sleep(poll_s)
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+# -- tmux helpers -------------------------------------------------------------
+
+def tmux_capture(target: str, lines: int = 200) -> str:
+    with tmux_lock():
+        try:
+            out = subprocess.check_output(
+                ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+                stderr=subprocess.STDOUT,
+            )
+            return out.decode("utf-8", errors="replace")
+        except subprocess.CalledProcessError as e:
+            return e.output.decode("utf-8", errors="replace") if e.output else ""
+
+
+def tmux_capture_full(target: str) -> str:
+    with tmux_lock():
+        try:
+            out = subprocess.check_output(
+                ["tmux", "capture-pane", "-t", target, "-p", "-S", "-"],
+                stderr=subprocess.STDOUT,
+            )
+            return out.decode("utf-8", errors="replace")
+        except subprocess.CalledProcessError as e:
+            return e.output.decode("utf-8", errors="replace") if e.output else ""
+
+
+def tmux_send_keys(target: str, text: str) -> None:
+    """Send arbitrary text (single or multi-line) to a tmux pane, then submit.
+
+    Uses tmux's paste-buffer mechanism rather than `send-keys <text>` so that
+    embedded newlines arrive as literal newlines in the worker's input field
+    rather than being interpreted as Enter (which would submit prematurely).
+    Behavior:
+      1. Load `text` into the tmux paste buffer via stdin.
+      2. Paste it into the target pane (deleting the buffer afterwards).
+      3. Send a single Enter to submit.
+    Works for any worker whose TUI accepts a paste followed by Enter.
+    """
+    if not text:
+        return
+    with tmux_lock():
+        p = subprocess.Popen(["tmux", "load-buffer", "-"], stdin=subprocess.PIPE)
+        p.communicate(input=text.encode("utf-8"))
+        if p.returncode != 0:
+            raise RuntimeError(f"tmux load-buffer failed (exit {p.returncode})")
+        # -d delete buffer after paste, -p bracketed paste, -r keep LF as LF (don't translate to CR).
+        # Without -r, tmux's default LF→CR substitution would treat every newline as Enter, submitting
+        # each paragraph as a separate message instead of letting the worker accumulate the full draft.
+        subprocess.check_call(["tmux", "paste-buffer", "-d", "-p", "-r", "-t", target])
+        subprocess.check_call(["tmux", "send-keys", "-t", target, "Enter"])
+
+
+def tmux_send_enter(target: str) -> None:
+    with tmux_lock():
+        subprocess.check_call(["tmux", "send-keys", "-t", target, "Enter"])
+
+
+def tmux_pane_path(target: str) -> Optional[str]:
+    with tmux_lock():
+        try:
+            out = subprocess.check_output(
+                ["tmux", "display-message", "-pt", target, "#{pane_current_path}"],
+                stderr=subprocess.STDOUT,
+            )
+            return out.decode("utf-8", errors="replace").strip()
+        except subprocess.CalledProcessError:
+            return None
+
+
+def tmux_pane_pid(target: str) -> Optional[int]:
+    with tmux_lock():
+        try:
+            out = subprocess.check_output(
+                ["tmux", "display-message", "-pt", target, "#{pane_pid}"],
+                stderr=subprocess.STDOUT,
+            )
+            return int(out.decode("utf-8", errors="replace").strip())
+        except (subprocess.CalledProcessError, ValueError):
+            return None
+
+
+def tmux_list_panes() -> List[Dict[str, Any]]:
+    with tmux_lock():
+        fmt = "#{session_name}:#{window_index}.#{pane_index}|#{window_name}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}"
+        try:
+            out = subprocess.check_output(
+                ["tmux", "list-panes", "-a", "-F", fmt],
+                stderr=subprocess.STDOUT,
+            )
+        except subprocess.CalledProcessError:
+            return []
+        panes = []
+        for line in out.decode("utf-8", errors="replace").splitlines():
+            parts = line.split("|", 4)
+            if len(parts) != 5:
+                continue
+            panes.append({
+                "target": parts[0],
+                "window_name": parts[1],
+                "pid": int(parts[2]) if parts[2].isdigit() else None,
+                "cmd": parts[3],
+                "path": parts[4],
+            })
+        return panes
+
+
+def proc_descendants_running(pid: int, name: str) -> Optional[int]:
+    """Find a descendant process of pid whose comm matches `name`."""
+    try:
+        out = subprocess.check_output(["pgrep", "-P", str(pid), name], stderr=subprocess.DEVNULL)
+        for line in out.decode().splitlines():
+            if line.strip().isdigit():
+                return int(line.strip())
+    except subprocess.CalledProcessError:
+        pass
+    return None
+
+
+# -- http helpers (OpenCode) --------------------------------------------------
+
+def http_get(path: str, directory: str = "/", timeout: int = 10) -> Any:
+    req = urllib.request.Request(f"{OC_BASE}{path}", headers={"x-opencode-directory": directory})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def http_post(path: str, body: Dict[str, Any], directory: str = "/", timeout: int = 30) -> Tuple[int, Any]:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OC_BASE}{path}",
+        data=data,
+        method="POST",
+        headers={"x-opencode-directory": directory, "content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            if not raw:
+                return r.status, None
+            try:
+                return r.status, json.loads(raw)
+            except Exception:
+                return r.status, raw.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        return e.code, body_text
+
+
+# -- adapters base ------------------------------------------------------------
+
+class Entry:
+    """Uniform rendered entry shape returned by adapters."""
+
+    def __init__(self, eid: str, ts: str, kind: str, header: str, body: str = ""):
+        self.id = eid
+        self.ts = ts
+        self.kind = kind
+        self.header = header
+        self.body = body
+
+    def render(self) -> str:
+        if self.body:
+            return f"{self.header}\n{self.body}"
+        return self.header
+
+
+def render_entries(entries: List[Entry]) -> str:
+    return "\n\n".join(e.render() for e in entries)
+
+
+# -- adapter: pi --------------------------------------------------------------
+
+def pi_path_key_for_cwd(cwd: str) -> str:
+    trimmed = cwd.strip("/")
+    return f"--{trimmed.replace('/', '-')}--"
+
+
+def pi_resolve_session(cwd: Optional[str], hint: Optional[str]) -> Path:
+    if hint:
+        p = Path(hint).expanduser()
+        if p.exists():
+            return p
+        if PI_SESSIONS_ROOT.exists():
+            matches = [c for c in PI_SESSIONS_ROOT.rglob("*.jsonl") if hint in c.name]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise ValueError(f"Ambiguous pi session hint '{hint}'")
+        raise ValueError(f"pi session not found: {hint}")
+    if not cwd:
+        raise ValueError("pi: need cwd to resolve session")
+    target_dir = PI_SESSIONS_ROOT / pi_path_key_for_cwd(cwd)
+    if not target_dir.exists():
+        raise ValueError(f"pi: no sessions dir for cwd {cwd}")
+    files = sorted(target_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        raise ValueError(f"pi: no jsonl files in {target_dir}")
+    return files[0]
+
+
+def pi_load_active(path: Path) -> List[Dict[str, Any]]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    parsed = [json.loads(line) for line in lines if line.strip()]
+    if not parsed or parsed[0].get("type") != "session":
+        raise ValueError(f"not a pi session file: {path}")
+    entries = parsed[1:]
+
+    id_map: Dict[str, Dict[str, Any]] = {}
+    leaf: Optional[Dict[str, Any]] = None
+    for e in entries:
+        eid = e.get("id")
+        if eid:
+            id_map[eid] = e
+            leaf = e
+    if leaf is None:
+        return []
+    chain: List[Dict[str, Any]] = []
+    seen = set()
+    cur: Optional[Dict[str, Any]] = leaf
+    while cur is not None:
+        eid = cur.get("id")
+        if eid in seen:
+            break
+        seen.add(eid)
+        chain.append(cur)
+        parent_id = cur.get("parentId")
+        cur = id_map.get(parent_id) if parent_id else None
+    chain.reverse()
+    return chain
+
+
+def pi_displayable(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    types = {"message", "model_change", "thinking_level_change", "compaction",
+             "branch_summary", "session_info", "custom_message", "label"}
+    return [e for e in entries if e.get("type") in types]
+
+
+def pi_stringify(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: List[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            parts.append(str(block))
+            continue
+        bt = block.get("type")
+        if bt == "text":
+            parts.append(block.get("text", ""))
+        elif bt == "image":
+            parts.append(f"[image:{block.get('mimeType', '?')}]")
+        elif bt == "thinking":
+            continue
+        elif bt == "toolCall":
+            parts.append(f"[toolCall:{block.get('name', '?')}]")
+        else:
+            parts.append(f"[{bt}]")
+    return "\n".join(p for p in parts if p)
+
+
+def pi_preview_args(args: Any, limit: int) -> str:
+    if not isinstance(args, dict):
+        return single_line(str(args), limit)
+    preferred = ["path", "command", "pattern", "oldText", "newText", "content",
+                 "file", "filePath", "description", "text", "name"]
+    for k in preferred:
+        if k in args:
+            return f"{k}={single_line(json.dumps(args[k], ensure_ascii=False), limit)}"
+    if not args:
+        return ""
+    k = next(iter(args))
+    return f"{k}={single_line(json.dumps(args[k], ensure_ascii=False), limit)}"
+
+
+def pi_format(entry: Dict[str, Any]) -> Entry:
+    etype = entry.get("type")
+    eid = entry.get("id", "?")
+    ts = fmt_ts(entry.get("timestamp"))
+    if etype != "message":
+        if etype == "model_change":
+            return Entry(eid, ts, etype, f"[model] {ts} id={eid} {entry.get('provider', '?')}/{entry.get('modelId', '?')}")
+        if etype == "compaction":
+            return Entry(eid, ts, etype, f"[compaction] {ts} id={eid}", "  " + single_line(entry.get("summary", ""), RESULT_TRUNC))
+        if etype == "branch_summary":
+            return Entry(eid, ts, etype, f"[branch-summary] {ts} id={eid} from={entry.get('fromId', '?')}", "  " + single_line(entry.get("summary", ""), RESULT_TRUNC))
+        return Entry(eid, ts, etype, f"[{etype}] {ts} id={eid}")
+
+    msg = entry.get("message", {})
+    role = msg.get("role", "?")
+    if role == "user":
+        text = pi_stringify(msg.get("content", ""))
+        body = "\n".join("    " + line for line in trunc(text, TEXT_TRUNC).splitlines() or [""])
+        return Entry(eid, ts, "user", f"[user] {ts} id={eid}", "  text:\n" + body)
+    if role == "assistant":
+        content = msg.get("content", [])
+        text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+        text = "\n".join(p for p in text_parts if p).strip()
+        lines: List[str] = []
+        if text:
+            lines.append("  text:")
+            for line in trunc(text, TEXT_TRUNC).splitlines() or [""]:
+                lines.append("    " + line)
+        for tc in [b for b in content if isinstance(b, dict) and b.get("type") == "toolCall"]:
+            preview = pi_preview_args(tc.get("arguments", {}), ARGS_TRUNC)
+            suffix = f" {preview}" if preview else ""
+            lines.append(f"  toolCall: {tc.get('name', '?')}{suffix} [{tc.get('id', '?')}]")
+        sr = msg.get("stopReason")
+        if sr:
+            lines.append(f"  stopReason: {sr}")
+        return Entry(eid, ts, "assistant", f"[assistant] {ts} id={eid}", "\n".join(lines))
+    if role == "toolResult":
+        text = pi_stringify(msg.get("content", []))
+        err = " ERROR" if msg.get("isError") else ""
+        header = f"[toolResult{err}] {ts} id={eid} tool={msg.get('toolName', '?')} call={msg.get('toolCallId', '?')}"
+        body = f"  result: {single_line(text, RESULT_TRUNC)}" if text else ""
+        return Entry(eid, ts, "tool_result", header, body)
+    if role == "bashExecution":
+        out = msg.get("output", "")
+        body_lines = [f"  command: {single_line(msg.get('command', ''), ARGS_TRUNC)}"]
+        if out:
+            body_lines.append(f"  output: {single_line(out, RESULT_TRUNC)}")
+        ec = msg.get("exitCode")
+        if ec is not None:
+            body_lines.append(f"  exitCode: {ec}")
+        return Entry(eid, ts, "bash", f"[bashExecution] {ts} id={eid}", "\n".join(body_lines))
+    return Entry(eid, ts, role, f"[{role}] {ts} id={eid}")
+
+
+class PiAdapter:
+    kind = "pi"
+
+    @staticmethod
+    def session_path(rec: Dict[str, Any]) -> Path:
+        path = rec.get("persisted", {}).get("path")
+        if path and Path(path).exists():
+            return Path(path)
+        cwd = rec.get("persisted", {}).get("cwd") or rec.get("extra", {}).get("cwd")
+        return pi_resolve_session(cwd, None)
+
+    @classmethod
+    def read_persisted(cls, rec: Dict[str, Any], count: Optional[int] = None,
+                       use_cursor: bool = True) -> Tuple[List[Entry], Dict[str, Any]]:
+        path = cls.session_path(rec)
+        active = pi_displayable(pi_load_active(path))
+        cursor = load_cursor(rec["id"]) if use_cursor else None
+        if cursor and cursor.get("session_path") == str(path):
+            last_id = cursor.get("last_entry_id")
+            ids = [e.get("id") for e in active]
+            try:
+                idx = ids.index(last_id)
+                window = active[idx + 1:]
+            except ValueError:
+                raise ValueError("cursor entry not on active branch — use 'watch --reset' to rebootstrap")
+        else:
+            if cursor is None and len(active) > ESTABLISHED_THRESHOLD and count is None:
+                raise ValueError(f"established session ({len(active)} entries) requires a cursor — use 'watch --reset' or 'watch --count N' to bootstrap")
+            window = active[-(count or RECENT_COUNT_DEFAULT):]
+
+        rendered = [pi_format(e) for e in window]
+        new_cursor = {
+            "session_path": str(path),
+            "last_entry_id": window[-1].get("id") if window else (active[-1].get("id") if active else None),
+        }
+        return rendered, new_cursor
+
+    @classmethod
+    def detail(cls, rec: Dict[str, Any], target: str) -> str:
+        path = cls.session_path(rec)
+        for entry in pi_load_active(path):
+            if entry.get("id") == target:
+                return json.dumps(entry, indent=2, ensure_ascii=False)
+            if entry.get("type") == "message":
+                msg = entry.get("message", {})
+                if msg.get("role") == "toolResult" and msg.get("toolCallId") == target:
+                    return json.dumps(entry, indent=2, ensure_ascii=False)
+                for block in msg.get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "toolCall" and block.get("id") == target:
+                        return json.dumps(block, indent=2, ensure_ascii=False)
+        raise ValueError(f"id not found on active branch: {target}")
+
+    @classmethod
+    def read_live(cls, rec: Dict[str, Any]) -> str:
+        target = rec.get("live", {}).get("target")
+        if not target:
+            return "(no tmux target registered)"
+        return tmux_capture(target, lines=120)
+
+    @classmethod
+    def send(cls, rec: Dict[str, Any], text: str) -> None:
+        target = rec.get("send", {}).get("target") or rec.get("live", {}).get("target")
+        if not target:
+            raise ValueError("pi: no tmux target registered for send")
+        tmux_send_keys(target, text)
+
+    @classmethod
+    def turn_state(cls, rec: Dict[str, Any]) -> str:
+        try:
+            entries = pi_load_active(cls.session_path(rec))
+        except Exception:
+            return "unknown"
+        for entry in reversed(entries):
+            if entry.get("type") != "message":
+                continue
+            msg = entry.get("message", {})
+            role = msg.get("role")
+            if role == "assistant":
+                content = msg.get("content", [])
+                has_tool_call = any(isinstance(b, dict) and b.get("type") == "toolCall" for b in content if isinstance(content, list))
+                stop = str(msg.get("stopReason") or msg.get("stop_reason") or "").lower()
+                if has_tool_call or stop in {"tooluse", "tool_use", "tool-use"}:
+                    return "busy"
+                return "idle"
+            if role in {"user", "toolResult", "bashExecution"}:
+                return "busy"
+            return "unknown"
+        return "unknown"
+
+    @classmethod
+    def status_signals(cls, rec: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            path = cls.session_path(rec)
+            mtime = path.stat().st_mtime
+            age = time.time() - mtime
+        except Exception:
+            path = None
+            age = float("inf")
+        ctx = pi_last_context_tokens(path) if path else None
+        return {"turn": cls.turn_state(rec), "persisted_age_s": age, "context_input_tokens": ctx}
+
+
+def pi_last_context_tokens(path: Path) -> Optional[int]:
+    """Most recent assistant turn's prompt token count.
+
+    Pi message.usage shape:
+      {"input": N, "output": M, "cacheRead": K, "cacheWrite": L, "totalTokens": ...}
+    Pi treats input and cacheRead as ADDITIVE (verified: totalTokens = input + cacheRead + output).
+    Total prompt = input + cacheRead.
+    Returns None when no usage block is found.
+    """
+    try:
+        entries = pi_load_active(path)
+    except Exception:
+        return None
+    for entry in reversed(entries):
+        if entry.get("type") != "message":
+            continue
+        msg = entry.get("message", {})
+        if msg.get("role") != "assistant":
+            continue
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        try:
+            input_t = int(usage.get("input") or usage.get("input_tokens") or 0)
+            cache_read = int(usage.get("cacheRead") or usage.get("cache_read_input_tokens") or 0)
+        except (TypeError, ValueError):
+            continue
+        total = input_t + cache_read
+        if total > 0:
+            return total
+    return None
+
+
+# -- adapter: claude ----------------------------------------------------------
+
+def claude_path_key_for_cwd(cwd: str) -> str:
+    trimmed = cwd.strip("/")
+    return f"-{trimmed.replace('/', '-')}"
+
+
+def claude_resolve_session(cwd: Optional[str], hint: Optional[str]) -> Path:
+    if hint:
+        p = Path(hint).expanduser()
+        if p.exists():
+            return p
+        if CLAUDE_PROJECTS_ROOT.exists():
+            matches = [c for c in CLAUDE_PROJECTS_ROOT.rglob("*.jsonl") if hint in c.name]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise ValueError(f"ambiguous claude session hint: {hint}")
+        raise ValueError(f"claude session not found: {hint}")
+    if not cwd:
+        raise ValueError("claude: need cwd to resolve session")
+    d = CLAUDE_PROJECTS_ROOT / claude_path_key_for_cwd(cwd)
+    if not d.exists():
+        raise ValueError(f"claude: no projects dir for cwd {cwd}")
+    files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        raise ValueError(f"claude: no jsonl files in {d}")
+    return files[0]
+
+
+def claude_load_entries(path: Path) -> List[Dict[str, Any]]:
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def claude_visible(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for e in entries:
+        t = e.get("type")
+        if t in {"user", "assistant"}:
+            out.append(e)
+    return out
+
+
+def claude_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: List[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            parts.append(str(block))
+            continue
+        bt = block.get("type")
+        if bt == "text":
+            parts.append(block.get("text", ""))
+        elif bt == "thinking":
+            continue
+        elif bt == "tool_use":
+            parts.append(f"[tool_use:{block.get('name', '?')}]")
+        elif bt == "tool_result":
+            v = block.get("content", "")
+            parts.append(v if isinstance(v, str) else str(v))
+        else:
+            parts.append(f"[{bt}]")
+    return "\n".join(p for p in parts if p)
+
+
+def claude_preview_args(args: Any, limit: int) -> str:
+    if not isinstance(args, dict):
+        return single_line(str(args), limit)
+    preferred = ["command", "file_path", "path", "pattern", "query", "url", "prompt", "content", "description"]
+    for k in preferred:
+        if k in args:
+            return f"{k}={single_line(json.dumps(args[k], ensure_ascii=False), limit)}"
+    if not args:
+        return ""
+    k = next(iter(args))
+    return f"{k}={single_line(json.dumps(args[k], ensure_ascii=False), limit)}"
+
+
+def claude_format(entry: Dict[str, Any]) -> Entry:
+    etype = entry.get("type")
+    uuid = entry.get("uuid", "?")
+    ts = fmt_ts(entry.get("timestamp"))
+    if etype == "assistant":
+        msg = entry.get("message", {})
+        text_parts: List[str] = []
+        tool_lines: List[str] = []
+        for block in msg.get("content", []):
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "text":
+                text_parts.append(block.get("text", ""))
+            elif bt == "tool_use":
+                preview = claude_preview_args(block.get("input", {}), ARGS_TRUNC)
+                suffix = f" {preview}" if preview else ""
+                tool_lines.append(f"  toolUse: {block.get('name', '?')}{suffix} [{block.get('id', '?')}]")
+        text = "\n".join(p for p in text_parts if p).strip()
+        body_lines = []
+        if text:
+            body_lines.append("  text:")
+            for line in trunc(text, TEXT_TRUNC).splitlines() or [""]:
+                body_lines.append("    " + line)
+        body_lines.extend(tool_lines)
+        sr = msg.get("stop_reason")
+        if sr:
+            body_lines.append(f"  stopReason: {sr}")
+        return Entry(uuid, ts, "assistant", f"[assistant] {ts} id={uuid}", "\n".join(body_lines))
+    if etype == "user":
+        msg = entry.get("message", {})
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            tool_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+            if tool_blocks:
+                lines = []
+                for block in tool_blocks:
+                    tool_id = block.get("tool_use_id", "?")
+                    text = block.get("content", "")
+                    if not isinstance(text, str):
+                        text = claude_content_text(text)
+                    err = " ERROR" if block.get("is_error") else ""
+                    lines.append(f"[toolResult{err}] {ts} id={uuid} call={tool_id}")
+                    lines.append(f"  result: {single_line(text, RESULT_TRUNC)}")
+                return Entry(uuid, ts, "tool_result", "\n".join(lines))
+        text = claude_content_text(content)
+        body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
+        return Entry(uuid, ts, "user", f"[user] {ts} id={uuid}", "  text:\n" + body)
+    return Entry(uuid, ts, etype or "other", f"[{etype}] {ts} id={uuid}")
+
+
+class ClaudeAdapter:
+    kind = "claude"
+
+    @staticmethod
+    def session_path(rec: Dict[str, Any]) -> Path:
+        path = rec.get("persisted", {}).get("path")
+        if path and Path(path).exists():
+            return Path(path)
+        cwd = rec.get("persisted", {}).get("cwd") or rec.get("extra", {}).get("cwd")
+        return claude_resolve_session(cwd, None)
+
+    @classmethod
+    def read_persisted(cls, rec, count=None, use_cursor=True):
+        path = cls.session_path(rec)
+        entries = claude_visible(claude_load_entries(path))
+        cursor = load_cursor(rec["id"]) if use_cursor else None
+        if cursor and cursor.get("session_path") == str(path):
+            last_uuid = cursor.get("last_entry_id")
+            ids = [e.get("uuid") for e in entries]
+            try:
+                idx = ids.index(last_uuid)
+                window = entries[idx + 1:]
+            except ValueError:
+                raise ValueError("claude cursor not in session — use 'watch --reset' to rebootstrap")
+        else:
+            if cursor is None and len(entries) > ESTABLISHED_THRESHOLD and count is None:
+                raise ValueError(f"established session ({len(entries)} entries) requires a cursor")
+            window = entries[-(count or RECENT_COUNT_DEFAULT):]
+        rendered = [claude_format(e) for e in window]
+        new_cursor = {
+            "session_path": str(path),
+            "last_entry_id": window[-1].get("uuid") if window else (entries[-1].get("uuid") if entries else None),
+        }
+        return rendered, new_cursor
+
+    @classmethod
+    def detail(cls, rec, target):
+        path = cls.session_path(rec)
+        for entry in claude_load_entries(path):
+            if entry.get("uuid") == target:
+                return json.dumps(entry, indent=2, ensure_ascii=False)
+            msg = entry.get("message", {})
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use" and block.get("id") == target:
+                        return json.dumps(block, indent=2, ensure_ascii=False)
+                    if block.get("type") == "tool_result" and block.get("tool_use_id") == target:
+                        return json.dumps(block, indent=2, ensure_ascii=False)
+        raise ValueError(f"id not found: {target}")
+
+    @classmethod
+    def read_live(cls, rec):
+        target = rec.get("live", {}).get("target")
+        if not target:
+            return "(no tmux target registered — claude is being watched via JSONL only)"
+        return tmux_capture(target, lines=120)
+
+    @classmethod
+    def send(cls, rec, text):
+        target = rec.get("send", {}).get("target") or rec.get("live", {}).get("target")
+        if not target:
+            raise ValueError("claude: no tmux target registered for send")
+        tmux_send_keys(target, text)
+
+    @classmethod
+    def turn_state(cls, rec) -> str:
+        try:
+            entries = claude_visible(claude_load_entries(cls.session_path(rec)))
+        except Exception:
+            return "unknown"
+        if not entries:
+            return "unknown"
+        last = entries[-1]
+        etype = last.get("type")
+        msg = last.get("message", {})
+        if etype == "assistant":
+            content = msg.get("content", [])
+            has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content if isinstance(content, list))
+            stop = str(msg.get("stop_reason") or msg.get("stopReason") or "").lower()
+            if has_tool_use or stop in {"tool_use", "tooluse", "tool-use"}:
+                return "busy"
+            return "idle"
+        if etype == "user":
+            return "busy"
+        return "unknown"
+
+    @classmethod
+    def status_signals(cls, rec):
+        try:
+            path = cls.session_path(rec)
+            age = time.time() - path.stat().st_mtime
+        except Exception:
+            path = None
+            age = float("inf")
+        ctx = claude_last_context_tokens(path) if path else None
+        return {"turn": cls.turn_state(rec), "persisted_age_s": age, "context_input_tokens": ctx}
+
+
+def claude_last_context_tokens(path: Path) -> Optional[int]:
+    """Most recent assistant turn's prompt token count.
+
+    Claude message.usage shape:
+      {"input_tokens": N, "cache_read_input_tokens": K, "cache_creation_input_tokens": L, "output_tokens": M}
+    Where input_tokens, cache_read_input_tokens, and cache_creation_input_tokens
+    are SEPARATE (additive). Total prompt = sum of the three.
+    Returns None when no usage block is found in the tail.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 50000))
+            tail_lines = f.read().splitlines()
+    except Exception:
+        return None
+    for line in reversed(tail_lines):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        usage = (obj.get("message") or {}).get("usage")
+        if not isinstance(usage, dict):
+            continue
+        try:
+            input_t = int(usage.get("input_tokens") or 0)
+            cache_read = int(usage.get("cache_read_input_tokens") or 0)
+            cache_create = int(usage.get("cache_creation_input_tokens") or 0)
+        except (TypeError, ValueError):
+            continue
+        total = input_t + cache_read + cache_create
+        if total > 0:
+            return total
+    return None
+
+
+# -- adapter: codex -----------------------------------------------------------
+
+def codex_resolve_session(cwd: Optional[str], session_id_hint: Optional[str]) -> Path:
+    if session_id_hint:
+        for p in sorted(CODEX_SESSIONS_ROOT.rglob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
+            if session_id_hint in p.name:
+                return p
+        raise ValueError(f"codex session not found: {session_id_hint}")
+    if not cwd:
+        raise ValueError("codex: need cwd to resolve session")
+    if not CODEX_SESSIONS_ROOT.exists():
+        raise ValueError("codex: no sessions root")
+    candidates = sorted(CODEX_SESSIONS_ROOT.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in candidates[:50]:
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                first = f.readline()
+                if not first:
+                    continue
+                meta = json.loads(first)
+                if meta.get("type") == "session_meta":
+                    payload = meta.get("payload", {})
+                    if os.path.realpath(payload.get("cwd", "")) == os.path.realpath(cwd):
+                        return p
+        except Exception:
+            continue
+    raise ValueError(f"codex: no recent session matching cwd {cwd}")
+
+
+def codex_load_entries(path: Path) -> List[Dict[str, Any]]:
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def codex_visible(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filter codex JSONL entries to a deduplicated, supervisor-relevant set.
+
+    Codex emits each user/assistant message twice — once as event_msg
+    (user_message / agent_message) and once as response_item.message.
+    response_item is the canonical primary record (it carries full content
+    structure including tool calls), so we surface that and drop the
+    event_msg duplicates. We keep event_msg.task_started / task_complete
+    because they have no response_item analogue and signal turn boundaries.
+    """
+    out = []
+    for e in entries:
+        t = e.get("type")
+        if t == "session_meta":
+            continue
+        if t == "turn_context":
+            continue
+        if t == "event_msg":
+            ptype = e.get("payload", {}).get("type")
+            # Skip user_message/agent_message — duplicated by response_item.message.
+            if ptype in {"task_started", "task_complete"}:
+                out.append(e)
+        elif t == "response_item":
+            ptype = e.get("payload", {}).get("type")
+            if ptype in {"message", "function_call", "function_call_output"}:
+                role = e.get("payload", {}).get("role")
+                if ptype == "message" and role == "developer":
+                    continue
+                out.append(e)
+    return out
+
+
+def codex_format(entry: Dict[str, Any], idx: int) -> Entry:
+    ts = fmt_ts(entry.get("timestamp"))
+    eid = f"codex-{idx}"
+    payload = entry.get("payload", {})
+    ptype = payload.get("type", "?")
+
+    if entry.get("type") == "event_msg":
+        if ptype == "task_started":
+            return Entry(eid, ts, "system", f"[task_started] {ts} id={eid} turn={payload.get('turn_id', '?')}")
+        if ptype == "task_complete":
+            return Entry(eid, ts, "system", f"[task_complete] {ts} id={eid}")
+        if ptype == "user_message":
+            text = payload.get("message") or payload.get("text") or ""
+            body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
+            return Entry(eid, ts, "user", f"[user] {ts} id={eid}", "  text:\n" + body)
+        if ptype == "agent_message":
+            text = payload.get("message") or ""
+            body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
+            return Entry(eid, ts, "assistant", f"[assistant] {ts} id={eid}", "  text:\n" + body)
+
+    if entry.get("type") == "response_item":
+        if ptype == "message":
+            role = payload.get("role", "?")
+            content = payload.get("content", [])
+            text_parts: List[str] = []
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
+                    continue
+                bt = block.get("type")
+                if bt in ("input_text", "output_text", "text"):
+                    text_parts.append(block.get("text", ""))
+            text = "\n".join(p for p in text_parts if p).strip()
+            body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
+            label = "user" if role == "user" else ("assistant" if role == "assistant" else role)
+            return Entry(eid, ts, label, f"[{label}] {ts} id={eid}", "  text:\n" + body)
+        if ptype == "function_call":
+            name = payload.get("name", "?")
+            args = payload.get("arguments", "")
+            preview = single_line(args, ARGS_TRUNC) if isinstance(args, str) else single_line(json.dumps(args), ARGS_TRUNC)
+            call_id = payload.get("call_id", payload.get("id", "?"))
+            return Entry(eid, ts, "tool_call", f"[function_call] {ts} id={eid} call={call_id}", f"  {name}({preview})")
+        if ptype == "function_call_output":
+            output = payload.get("output", "")
+            if isinstance(output, dict):
+                output = output.get("content", "") or json.dumps(output)
+            call_id = payload.get("call_id", payload.get("id", "?"))
+            return Entry(eid, ts, "tool_result", f"[function_call_output] {ts} id={eid} call={call_id}", f"  output: {single_line(str(output), RESULT_TRUNC)}")
+
+    return Entry(eid, ts, "other", f"[{entry.get('type', '?')}/{ptype}] {ts} id={eid}")
+
+
+class CodexAdapter:
+    kind = "codex"
+
+    @staticmethod
+    def session_path(rec: Dict[str, Any]) -> Path:
+        path = rec.get("persisted", {}).get("path")
+        if path and Path(path).exists():
+            return Path(path)
+        cwd = rec.get("persisted", {}).get("cwd") or rec.get("extra", {}).get("cwd")
+        sid = rec.get("extra", {}).get("session_id")
+        return codex_resolve_session(cwd, sid)
+
+    @classmethod
+    def read_persisted(cls, rec, count=None, use_cursor=True):
+        path = cls.session_path(rec)
+        entries = codex_visible(codex_load_entries(path))
+        # Provide stable indices matching pre-cursor positions
+        indexed = list(enumerate(entries))
+        cursor = load_cursor(rec["id"]) if use_cursor else None
+        if cursor and cursor.get("session_path") == str(path):
+            last_idx = cursor.get("last_idx", -1)
+            window = [(i, e) for i, e in indexed if i > last_idx]
+        else:
+            if cursor is None and len(entries) > ESTABLISHED_THRESHOLD and count is None:
+                raise ValueError(f"established session ({len(entries)} entries) requires a cursor")
+            window = indexed[-(count or RECENT_COUNT_DEFAULT):]
+        rendered = [codex_format(e, i) for i, e in window]
+        last_idx = window[-1][0] if window else (len(entries) - 1 if entries else -1)
+        new_cursor = {"session_path": str(path), "last_idx": last_idx}
+        return rendered, new_cursor
+
+    @classmethod
+    def detail(cls, rec, target):
+        path = cls.session_path(rec)
+        entries = codex_load_entries(path)
+        m = re.match(r"^codex-(\d+)$", target)
+        if m:
+            visible = codex_visible(entries)
+            i = int(m.group(1))
+            if 0 <= i < len(visible):
+                return json.dumps(visible[i], indent=2, ensure_ascii=False)
+        # try call_id match
+        for e in entries:
+            payload = e.get("payload", {})
+            if payload.get("call_id") == target or payload.get("id") == target:
+                return json.dumps(e, indent=2, ensure_ascii=False)
+        raise ValueError(f"id not found: {target}")
+
+    @classmethod
+    def read_live(cls, rec):
+        target = rec.get("live", {}).get("target")
+        if not target:
+            return "(no tmux target registered)"
+        return tmux_capture(target, lines=120)
+
+    @classmethod
+    def send(cls, rec, text):
+        target = rec.get("send", {}).get("target") or rec.get("live", {}).get("target")
+        if not target:
+            raise ValueError("codex: no tmux target for send")
+        tmux_send_keys(target, text)
+
+    @classmethod
+    def turn_state(cls, rec) -> str:
+        # KNOWN-ISSUE (status accuracy, informational only): unrecognized entries are silently
+        # skipped, falling through to an older (often idle-looking) entry — response_item types
+        # local_shell_call / custom_tool_call / web_search_call have no branch, so a rollout that
+        # records shell work that way reads idle for the whole exec. Fix sketch: map the
+        # *_call/*_call_output families -> busy; return unknown for unrecognized response_item types.
+        try:
+            entries = codex_load_entries(cls.session_path(rec))
+        except Exception:
+            return "unknown"
+        for last in reversed(entries):
+            payload = last.get("payload", {})
+            ptype = payload.get("type")
+            etype = last.get("type")
+            if etype in {"session_meta", "turn_context"} or ptype in {"token_count", "reasoning"}:
+                continue
+            if etype == "event_msg":
+                if ptype == "task_complete":
+                    return "idle"
+                if ptype in {"task_started", "user_message"}:
+                    return "busy"
+                if ptype == "agent_message":
+                    return "idle"
+                continue
+            if etype == "response_item":
+                if ptype in {"function_call", "function_call_output"}:
+                    return "busy"
+                if ptype == "message":
+                    role = payload.get("role")
+                    if role == "assistant":
+                        return "idle"
+                    if role == "user":
+                        return "busy"
+                    if role == "developer":
+                        continue
+        return "unknown"
+
+    @classmethod
+    def status_signals(cls, rec):
+        try:
+            path = cls.session_path(rec)
+            age = time.time() - path.stat().st_mtime
+        except Exception:
+            path = None
+            age = float("inf")
+        ctx, window = codex_last_context_tokens(path) if path else (None, None)
+        return {
+            "turn": cls.turn_state(rec),
+            "persisted_age_s": age,
+            "context_input_tokens": ctx,
+            "context_window_tokens": window,
+        }
+
+
+def codex_last_context_tokens(path: Path) -> Tuple[Optional[int], Optional[int]]:
+    """Return (last-turn input token count, model context window) from the
+    most recent token_count event in the JSONL.
+
+    Codex emits event_msg entries of type token_count with:
+      info.last_token_usage.input_tokens     — most recent prompt size
+      info.total_token_usage.input_tokens    — cumulative across turns
+      info.model_context_window              — model's context window
+    Codex semantics: input_tokens INCLUDES cached_input_tokens (subset, not additive).
+    """
+    try:
+        entries = codex_load_entries(path)
+    except Exception:
+        return (None, None)
+    for entry in reversed(entries):
+        if entry.get("type") != "event_msg":
+            continue
+        payload = entry.get("payload", {})
+        if payload.get("type") != "token_count":
+            continue
+        info = payload.get("info", {})
+        last = info.get("last_token_usage", {})
+        try:
+            input_t = int(last.get("input_tokens") or 0) or None
+        except (TypeError, ValueError):
+            input_t = None
+        try:
+            window = int(info.get("model_context_window") or 0) or None
+        except (TypeError, ValueError):
+            window = None
+        if input_t is not None or window is not None:
+            return (input_t, window)
+    return (None, None)
+
+
+# -- adapter: opencode --------------------------------------------------------
+
+class OpenCodeAdapter:
+    kind = "opencode"
+
+    @staticmethod
+    def directory(rec: Dict[str, Any]) -> str:
+        return rec.get("extra", {}).get("directory") or "/"
+
+    @staticmethod
+    def session_id(rec: Dict[str, Any]) -> str:
+        sid = rec.get("extra", {}).get("session_id")
+        if not sid:
+            raise ValueError("opencode: no session_id in registry")
+        return sid
+
+    @classmethod
+    def read_persisted(cls, rec, count=None, use_cursor=True):
+        sid = cls.session_id(rec)
+        directory = cls.directory(rec)
+        messages = http_get(f"/session/{sid}/message", directory=directory)
+        if not isinstance(messages, list):
+            raise ValueError("opencode: unexpected /message response")
+        cursor = load_cursor(rec["id"]) if use_cursor else None
+        if cursor and cursor.get("session_id") == sid:
+            last_count = cursor.get("last_msg_count", 0)
+            window = messages[last_count:]
+        else:
+            if cursor is None and len(messages) > ESTABLISHED_THRESHOLD:
+                raise ValueError(f"established session ({len(messages)} messages) requires a cursor")
+            window = messages[-(count or RECENT_COUNT_DEFAULT):] if count is not None or cursor is None else messages
+        rendered = [oc_format_message(m, idx + (len(messages) - len(window))) for idx, m in enumerate(window)]
+        new_cursor = {"session_id": sid, "last_msg_count": len(messages)}
+        return rendered, new_cursor
+
+    @classmethod
+    def detail(cls, rec, target):
+        sid = cls.session_id(rec)
+        directory = cls.directory(rec)
+        messages = http_get(f"/session/{sid}/message", directory=directory)
+        for i, m in enumerate(messages):
+            mid = m.get("id") or m.get("info", {}).get("id") or f"oc-{i}"
+            if mid == target or f"oc-{i}" == target:
+                return json.dumps(m, indent=2, ensure_ascii=False)
+        raise ValueError(f"opencode message not found: {target}")
+
+    @classmethod
+    def read_live(cls, rec):
+        try:
+            status = http_get("/session/status", directory=cls.directory(rec))
+        except Exception as e:
+            return f"(opencode unreachable: {e})"
+        sid = cls.session_id(rec)
+        # /session/status returns a dict keyed by session id, e.g.
+        # {"ses_abc": {"type": "busy"}} during an active turn, or {} when idle.
+        if not isinstance(status, dict):
+            return f"(unexpected /session/status shape: {type(status).__name__})"
+        my = status.get(sid)
+        if my:
+            return json.dumps({sid: my}, indent=2)
+        return f"(no /session/status entry for {sid} — session is idle)"
+
+    @classmethod
+    def send(cls, rec, text):
+        sid = cls.session_id(rec)
+        directory = cls.directory(rec)
+        body = {"parts": [{"type": "text", "text": text}]}
+        # Prefer prompt_async (non-blocking); fall back to /message if not available.
+        code, resp = http_post(f"/session/{sid}/prompt_async", body, directory=directory)
+        if code in (200, 202, 204):
+            return
+        if code == 404:
+            code2, resp2 = http_post(f"/session/{sid}/message", body, directory=directory)
+            if code2 in (200, 202, 204):
+                return
+            raise ValueError(f"opencode send failed: {code2} {resp2}")
+        raise ValueError(f"opencode send failed: {code} {resp}")
+
+    @classmethod
+    def turn_state(cls, rec) -> str:
+        # KNOWN-ISSUE (status accuracy, informational only — turn= drives no decisions):
+        # - ignores info.time.completed, so an in-flight assistant turn that has not yet
+        #   emitted a tool part (or is generating text after tools finished) reads idle mid-turn.
+        # - the part scan treats any errored tool in the final message as busy, so a session
+        #   whose last turn had one failed tool reads busy forever; 'error' should be terminal.
+        # Fix sketch: info.time.completed == null -> busy (primary); treat error states as terminal.
+        try:
+            sid = cls.session_id(rec)
+            messages = http_get(f"/session/{sid}/message", directory=cls.directory(rec))
+        except Exception:
+            return "unknown"
+        if not isinstance(messages, list) or not messages:
+            return "unknown"
+        last = messages[-1]
+        info = last.get("info", last) if isinstance(last, dict) else {}
+        role = info.get("role")
+        if role == "user":
+            return "busy"
+        if role == "assistant":
+            parts = last.get("parts", []) if isinstance(last, dict) else []
+            for part in parts if isinstance(parts, list) else []:
+                if part.get("type") != "tool":
+                    continue
+                state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
+                status = state.get("status")
+                if status and status not in {"completed", "done", "success"}:
+                    return "busy"
+            return "idle"
+        return "unknown"
+
+    @classmethod
+    def status_signals(cls, rec):
+        try:
+            sid = cls.session_id(rec)
+            meta = http_get(f"/session/{sid}", directory=cls.directory(rec))
+            updated_ms = (meta.get("time", {}) or {}).get("updated") or 0
+            age = (time.time() - updated_ms / 1000) if updated_ms else float("inf")
+        except Exception:
+            age = float("inf")
+        ctx = oc_last_context_tokens(rec)
+        return {"turn": cls.turn_state(rec), "persisted_age_s": age, "context_input_tokens": ctx}
+
+
+def oc_last_context_tokens(rec: Dict[str, Any]) -> Optional[int]:
+    """Most recent assistant message's prompt token count.
+
+    OpenCode message info.tokens shape:
+      {"total": N, "input": K, "output": M, "reasoning": R, "cache": {"read": C, "write": W}}
+    Verified additive: total = input + cache.read + output (cache.read is NOT a subset of input).
+    Total prompt = input + cache.read.
+
+    The model context window is available via /provider but it's expensive to call
+    on every status check (~3MB response, ~200ms), so we emit raw tokens. Look up
+    the window separately if you need a percentage.
+    """
+    try:
+        sid = OpenCodeAdapter.session_id(rec)
+        directory = OpenCodeAdapter.directory(rec)
+        messages = http_get(f"/session/{sid}/message", directory=directory)
+    except Exception:
+        return None
+    if not isinstance(messages, list):
+        return None
+    for m in reversed(messages):
+        info = m.get("info", {}) if isinstance(m, dict) else {}
+        if info.get("role") != "assistant":
+            continue
+        tokens = info.get("tokens")
+        if not isinstance(tokens, dict):
+            continue
+        try:
+            input_t = int(tokens.get("input") or 0)
+            cache = tokens.get("cache") or {}
+            cache_read = int(cache.get("read") or 0) if isinstance(cache, dict) else 0
+        except (TypeError, ValueError):
+            continue
+        total = input_t + cache_read
+        if total > 0:
+            return total
+    return None
+
+
+def oc_format_message(m: Dict[str, Any], idx: int) -> Entry:
+    info = m.get("info", m)
+    role = info.get("role", "?")
+    mid = info.get("id") or m.get("id") or f"oc-{idx}"
+    ts_raw = info.get("time", {}).get("created") if isinstance(info.get("time"), dict) else info.get("created")
+    ts = fmt_ts(ts_raw)
+
+    parts = m.get("parts", [])
+    if not parts and "content" in info:
+        parts = [{"type": "text", "text": info.get("content", "")}]
+
+    if role == "assistant":
+        body_lines: List[str] = []
+        text_parts = [p.get("text", "") for p in parts if p.get("type") == "text"]
+        text = "\n".join(t for t in text_parts if t).strip()
+        if text:
+            body_lines.append("  text:")
+            for line in trunc(text, TEXT_TRUNC).splitlines() or [""]:
+                body_lines.append("    " + line)
+        for p in parts:
+            if p.get("type") == "tool":
+                tool = p.get("tool", "?")
+                state = p.get("state", {}).get("status", "?") if isinstance(p.get("state"), dict) else "?"
+                args = p.get("state", {}).get("input") if isinstance(p.get("state"), dict) else p.get("input", {})
+                preview = claude_preview_args(args, ARGS_TRUNC)
+                body_lines.append(f"  tool: {tool} state={state} {preview}")
+        return Entry(mid, ts, "assistant", f"[assistant] {ts} id={mid}", "\n".join(body_lines))
+
+    if role == "user":
+        text_parts = [p.get("text", "") for p in parts if p.get("type") == "text"]
+        text = "\n".join(t for t in text_parts if t).strip()
+        body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
+        return Entry(mid, ts, "user", f"[user] {ts} id={mid}", "  text:\n" + body)
+
+    return Entry(mid, ts, role, f"[{role}] {ts} id={mid}")
+
+
+# -- adapter dispatch ---------------------------------------------------------
+
+ADAPTERS = {
+    "pi": PiAdapter,
+    "claude": ClaudeAdapter,
+    "codex": CodexAdapter,
+    "opencode": OpenCodeAdapter,
+}
+
+
+def adapter_for(rec: Dict[str, Any]):
+    kind = rec.get("kind")
+    if kind not in ADAPTERS:
+        raise ValueError(f"unknown worker kind: {kind}")
+    return ADAPTERS[kind]
+
+
+# -- subcommands --------------------------------------------------------------
+
+def cmd_list(args: argparse.Namespace) -> int:
+    ensure_dirs()
+    print("=== registered workers ===")
+    for rec in list_records():
+        print(f"  {rec['id']}  kind={rec['kind']}  live={rec.get('live', {})}")
+
+    print("\n=== auto-discovered tmux panes (kind candidates) ===")
+    for pane in tmux_list_panes():
+        cmd = pane["cmd"]
+        guess = None
+        if cmd == "pi":
+            guess = "pi"
+        elif cmd == "claude":
+            guess = "claude"
+        elif cmd == "codex":
+            guess = "codex"
+        if guess:
+            print(f"  {pane['target']}  cmd={cmd}  path={pane['path']}  -> kind={guess}")
+
+    print("\n=== auto-discovered opencode sessions ===")
+    try:
+        sessions = http_get("/session", directory="/")
+        if isinstance(sessions, list):
+            for s in sessions[:20]:
+                sid = s.get("id", "?")
+                directory = s.get("directory", "?")
+                title = (s.get("title") or "").strip()[:60]
+                print(f"  {sid}  dir={directory}  title={title!r}")
+    except Exception as e:
+        print(f"  (opencode unreachable on {OC_BASE}: {e})")
+    return 0
+
+
+def acquire_context_window(rec: Dict[str, Any]) -> Optional[int]:
+    """One-time per-kind context window acquisition.
+
+    Stashed in rec["extra"]["context_window_tokens"] at register time so cmd_status
+    can compute a percentage. Returns None if the window can't be determined; that's
+    not fatal — status falls back to printing raw token counts.
+
+    Per-kind sources:
+      pi:       tmux status bar (look for `46.8%/1.0M` style fragment)
+      claude:   tmux status bar after the agent-supervision statusLine script is wired in
+                (look for `ctx:1000k` fragment); requires `superv install-claude-statusline`
+      codex:    None — Codex publishes the window per turn in the JSONL token_count event,
+                so no register-time acquisition needed
+      opencode: GET /provider, lookup providerID/modelID from latest message
+    """
+    kind = rec.get("kind")
+    if kind == "codex":
+        return None  # Codex publishes per-turn; status_signals reads from JSONL.
+
+    if kind in ("pi", "claude"):
+        target = rec.get("live", {}).get("target")
+        if not target:
+            return None
+        live = tmux_capture(target, lines=120)
+        if kind == "pi":
+            # Pi status bar: "...46.8%/1.0M (auto)..."
+            m = re.search(r"(\d+(?:\.\d+)?)%/(\d+(?:\.\d+)?)([KMG])\b", live)
+            if not m:
+                return None
+            try:
+                value = float(m.group(2))
+            except ValueError:
+                return None
+            unit = {"K": 1000, "M": 1_000_000, "G": 1_000_000_000}[m.group(3)]
+            return int(value * unit)
+        else:  # claude
+            # Our statusline script emits `ctx:1000k` — see scripts/claude-statusline.sh
+            m = re.search(r"\bctx:(\d+)k\b", live)
+            if m:
+                try:
+                    return int(m.group(1)) * 1000
+                except ValueError:
+                    return None
+            return None
+
+    if kind == "opencode":
+        try:
+            providers = http_get("/provider", directory=rec.get("extra", {}).get("directory") or "/")
+        except Exception:
+            return None
+        # Need providerID + modelID from the latest assistant message to look up the limit.
+        try:
+            sid = OpenCodeAdapter.session_id(rec)
+            directory = OpenCodeAdapter.directory(rec)
+            messages = http_get(f"/session/{sid}/message", directory=directory)
+        except Exception:
+            return None
+        provider_id = None
+        model_id = None
+        if isinstance(messages, list):
+            for m in reversed(messages):
+                info = m.get("info", {}) if isinstance(m, dict) else {}
+                if info.get("role") == "assistant":
+                    provider_id = info.get("providerID")
+                    model_id = info.get("modelID")
+                    if provider_id and model_id:
+                        break
+        if not (provider_id and model_id):
+            return None
+        try:
+            for prov in providers.get("all", []):
+                if prov.get("id") != provider_id:
+                    continue
+                model = (prov.get("models") or {}).get(model_id)
+                if not model:
+                    return None
+                ctx = (model.get("limit") or {}).get("context")
+                return int(ctx) if ctx else None
+        except Exception:
+            return None
+    return None
+
+
+def cmd_install_claude_statusline(args: argparse.Namespace) -> int:
+    """Install the agent-supervision Claude statusLine into ~/.claude/settings.json.
+
+    The status line gives the operator an at-a-glance context-window display
+    AND lets `superv register --kind claude` parse the model context window from
+    the rendered tmux pane (one-time acquisition, cached in the worker registry).
+
+    If the user already has a statusLine configured, this command refuses unless
+    --force is passed.
+    """
+    settings_path = Path.home() / ".claude" / "settings.json"
+    script_path = Path(__file__).resolve().parent / "claude-statusline.sh"
+    if not script_path.exists():
+        raise ValueError(f"statusline script not found at {script_path}")
+
+    settings: Dict[str, Any] = {}
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"~/.claude/settings.json is not valid JSON: {e}")
+
+    existing = settings.get("statusLine")
+    if existing and not args.force:
+        existing_cmd = existing.get("command") if isinstance(existing, dict) else None
+        if existing_cmd and str(script_path) in existing_cmd:
+            print(f"already installed: statusLine command points at {script_path}")
+            return 0
+        raise ValueError(
+            f"~/.claude/settings.json already has a statusLine entry:\n"
+            f"  {json.dumps(existing, indent=2)}\n"
+            f"  pass --force to overwrite, or edit settings.json manually"
+        )
+
+    settings["statusLine"] = {
+        "type": "command",
+        "command": str(script_path),
+    }
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    print(f"installed: statusLine -> {script_path}")
+    print(f"  ({settings_path})")
+    print("  restart any running Claude Code TUIs to pick up the change.")
+    return 0
+
+
+def cmd_register(args: argparse.Namespace) -> int:
+    # Per-kind flag validation: reject flags that don't apply to the chosen kind.
+    tmux_kinds = ("pi", "claude", "codex")
+    if args.kind in tmux_kinds:
+        if not args.tmux:
+            raise ValueError(
+                f"--tmux <session>:<window>.<pane> is required for kind={args.kind}\n"
+                f"  example: superv register myworker --kind {args.kind} --tmux 0:my-window.0\n"
+                f"  hint: run 'superv list' to see candidate tmux panes"
+            )
+        if args.oc_session:
+            raise ValueError(f"--oc-session is only valid for kind=opencode, not kind={args.kind}")
+    elif args.kind == "opencode":
+        if not args.oc_session:
+            raise ValueError(
+                "--oc-session ses_... is required for kind=opencode\n"
+                "  example: superv register myworker --kind opencode --oc-session ses_abc123\n"
+                "  hint: run 'superv list' to see live opencode sessions"
+            )
+        if args.tmux:
+            raise ValueError("--tmux is not valid for kind=opencode (opencode uses HTTP transport)")
+
+    rec: Dict[str, Any] = {
+        "id": args.id,
+        "kind": args.kind,
+        "live": {},
+        "persisted": {},
+        "send": {},
+        "extra": {},
+    }
+
+    if args.kind in tmux_kinds:
+        target = args.tmux
+        cwd = tmux_pane_path(target)
+        if cwd is None:
+            raise ValueError(
+                f"tmux target not found: {target}\n"
+                f"  hint: run 'tmux list-panes -a' or 'superv list' to confirm the target exists"
+            )
+        rec["live"] = {"type": "tmux", "target": target}
+        rec["send"] = {"type": "tmux", "target": target}
+
+        if args.kind == "claude":
+            pid = tmux_pane_pid(target)
+            child = proc_descendants_running(pid, "claude") if pid else None
+            if not child:
+                if args.path:
+                    rec["persisted"] = {"type": "jsonl", "path": args.path, "cwd": cwd}
+                else:
+                    raise ValueError(
+                        f"could not find a running 'claude' process under tmux pane {target}\n"
+                        f"  hint: ensure Claude Code is actually running in that pane,\n"
+                        f"  or pass --path /home/user/.claude/projects/<key>/<sid>.jsonl explicitly"
+                    )
+            else:
+                meta = CLAUDE_PID_META_DIR / f"{child}.json"
+                if not meta.exists():
+                    raise ValueError(
+                        f"claude metadata file not found: {meta}\n"
+                        f"  hint: this Claude version may not write per-pid metadata; pass --path explicitly"
+                    )
+                md = json.loads(meta.read_text())
+                sid = md.get("sessionId")
+                cwd2 = md.get("cwd") or cwd
+                if not sid or not cwd2:
+                    raise ValueError(f"claude metadata missing sessionId/cwd: {meta}")
+                candidate = CLAUDE_PROJECTS_ROOT / claude_path_key_for_cwd(cwd2) / f"{sid}.jsonl"
+                if not candidate.exists():
+                    raise ValueError(
+                        f"resolved claude session file does not exist: {candidate}\n"
+                        f"  hint: send Claude at least one message so it writes its JSONL, then re-register"
+                    )
+                rec["extra"]["session_id"] = sid
+                rec["persisted"] = {"type": "jsonl", "path": str(candidate), "cwd": cwd2}
+        elif args.kind == "pi":
+            if args.path:
+                if not Path(args.path).exists():
+                    raise ValueError(f"--path does not exist: {args.path}")
+                rec["persisted"] = {"type": "jsonl", "path": args.path, "cwd": cwd}
+            else:
+                try:
+                    p = pi_resolve_session(cwd, None)
+                except ValueError as e:
+                    raise ValueError(
+                        f"could not auto-resolve pi session for cwd={cwd}: {e}\n"
+                        f"  hint: send the worker at least one message so it writes its JSONL, then re-register;\n"
+                        f"  or pass --path /home/user/.pi/agent/sessions/<dir>/<file>.jsonl explicitly"
+                    )
+                rec["persisted"] = {"type": "jsonl", "path": str(p), "cwd": cwd}
+        elif args.kind == "codex":
+            if args.path:
+                if not Path(args.path).exists():
+                    raise ValueError(f"--path does not exist: {args.path}")
+                rec["persisted"] = {"type": "jsonl", "path": args.path, "cwd": cwd}
+            else:
+                try:
+                    p = codex_resolve_session(cwd, None)
+                except ValueError as e:
+                    raise ValueError(
+                        f"could not auto-resolve codex rollout for cwd={cwd}: {e}\n"
+                        f"  hint: send the worker at least one message so it writes a rollout JSONL, then re-register;\n"
+                        f"  or pass --path /home/user/.codex/sessions/YYYY/MM/DD/rollout-...jsonl explicitly"
+                    )
+                rec["persisted"] = {"type": "jsonl", "path": str(p), "cwd": cwd}
+
+    elif args.kind == "opencode":
+        sid = args.oc_session
+        try:
+            meta = http_get(f"/session/{sid}", directory="/")
+        except Exception as e:
+            raise ValueError(
+                f"could not fetch /session/{sid} from {OC_BASE}: {e}\n"
+                f"  hint: ensure opencode is running on the expected port and the session id is correct\n"
+                f"  override port: OPENCODE_BASE=http://host:port superv register ..."
+            )
+        directory = meta.get("directory")
+        if not directory:
+            raise ValueError(f"opencode session {sid} has no 'directory' field — cannot scope future requests")
+        rec["extra"]["session_id"] = sid
+        rec["extra"]["directory"] = directory
+        rec["live"] = {"type": "http", "base": OC_BASE}
+        rec["send"] = {"type": "http", "base": OC_BASE}
+        rec["persisted"] = {"type": "http", "base": OC_BASE}
+
+    # Reject if this ID is already registered — caller must unregister first.
+    existing = registry_path(args.id)
+    if existing.exists():
+        raise ValueError(
+            f"worker '{args.id}' is already registered at {existing}\n"
+            f"  hint: run 'superv unregister {args.id}' first if you want to re-register"
+        )
+
+    # Best-effort one-time context-window acquisition (not fatal if it fails).
+    try:
+        ctx_window = acquire_context_window(rec)
+        if ctx_window:
+            rec["extra"]["context_window_tokens"] = ctx_window
+    except Exception as e:
+        eprint(f"warning: context-window acquisition failed ({e!r}); status will report raw tokens only")
+
+    save_record(rec)
+    print(json.dumps(rec, indent=2))
+    if args.kind == "claude" and "context_window_tokens" not in rec.get("extra", {}):
+        eprint("hint: install the agent-supervision statusLine for auto-percentage:")
+        eprint("      superv install-claude-statusline")
+    return 0
+
+
+def cmd_name(args: argparse.Namespace) -> int:
+    """Print the next available name from the pool."""
+    ensure_dirs()
+    taken = {p.stem for p in WORKERS_DIR.glob("*.json")}
+    for name in NAME_POOL:
+        if name not in taken:
+            print(name)
+            return 0
+    raise ValueError(f"all {len(NAME_POOL)} names are taken — unregister a worker to free one")
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    rec = load_record(args.id)
+    print(json.dumps(rec, indent=2))
+    # Also list adjacent state files so the operator sees the full picture.
+    print()
+    print("--- side files ---")
+    for label, path in [
+        ("cursor",          cursor_path(args.id)),
+        ("notes",           NOTES_DIR / f"{args.id}.md"),
+        ("heartbeat",       HEARTBEATS_DIR / f"{args.id}.md"),
+        ("heartbeat-state", HEARTBEATS_DIR / f"{args.id}.state.json"),
+    ]:
+        if path.exists():
+            size = path.stat().st_size
+            print(f"  {label}: {path} ({size} bytes)")
+        else:
+            print(f"  {label}: (none)")
+    return 0
+
+
+def cmd_unregister(args: argparse.Namespace) -> int:
+    p = registry_path(args.id)
+    if not p.exists():
+        raise ValueError(
+            f"no registry entry for {args.id} at {p}\n"
+            f"  hint: run 'superv list' to see registered worker ids"
+        )
+    p.unlink()
+    print(f"removed registry entry: {p}")
+    if args.purge:
+        purge_paths = [
+            CURSORS_DIR / f"{args.id}.json",
+            HEARTBEATS_DIR / f"{args.id}.md",
+            HEARTBEATS_DIR / f"{args.id}.state.json",
+            NOTES_DIR / f"{args.id}.md",
+        ]
+        for f in purge_paths:
+            if f.exists():
+                f.unlink()
+                print(f"  purged: {f}")
+    else:
+        print("  (cursor, notes, heartbeat preserved — pass --purge to remove all state)")
+    return 0
+
+
+# -- pause / resume -----------------------------------------------------------
+
+# Default resume-time CLI flags per agent kind. Conservative posture:
+# autonomous mode (no permission prompts) for claude/codex; pi has no equivalent flag.
+RESUME_DEFAULT_FLAGS: Dict[str, str] = {
+    "pi": "",
+    "claude": "--dangerously-skip-permissions",
+    "codex": "--dangerously-bypass-approvals-and-sandbox",
+}
+
+
+def extract_session_id(rec: Dict[str, Any]) -> str:
+    """Return the resume-able session ID for a worker, derived from the registry.
+
+    For claude this is rec.extra.session_id (or the JSONL stem as fallback).
+    For pi the JSONL filename is <ts>_<uuid>.jsonl and we want the uuid.
+    For codex the rollout filename is rollout-<ISO>-<uuid>.jsonl and we
+    extract the uuid (last 5 dash-separated tokens, since UUIDs have 4 dashes).
+    """
+    kind = rec.get("kind")
+    if kind == "claude":
+        sid = (rec.get("extra") or {}).get("session_id")
+        if sid:
+            return sid
+        path = (rec.get("persisted") or {}).get("path")
+        if path:
+            return Path(path).stem
+        raise ValueError("no claude session_id available (registry missing extra.session_id and persisted.path)")
+    if kind == "pi":
+        path = (rec.get("persisted") or {}).get("path") or ""
+        stem = Path(path).stem
+        if "_" in stem:
+            return stem.split("_", 1)[1]
+        return stem
+    if kind == "codex":
+        path = (rec.get("persisted") or {}).get("path") or ""
+        stem = Path(path).stem
+        if stem.startswith("rollout-"):
+            tokens = stem.split("-")
+            # rollout-2026-05-08T01-23-45-<uuid8>-<uuid4>-<uuid4>-<uuid4>-<uuid12>
+            # the last 5 tokens are the uuid
+            if len(tokens) >= 5:
+                return "-".join(tokens[-5:])
+        return stem
+    raise ValueError(f"resume not supported for kind={kind}")
+
+
+def build_resume_cmd(rec: Dict[str, Any], extra_flags: str = "") -> str:
+    """Construct the shell command to resume a worker's TUI session.
+
+    extra_flags is appended verbatim (e.g. "--effort high --model claude-opus-4-7").
+    Returns a string suitable for tmux send-keys.
+    """
+    kind = rec["kind"]
+    sid = extract_session_id(rec)
+    base = RESUME_DEFAULT_FLAGS.get(kind, "")
+    if kind == "claude":
+        parts = ["claude"]
+        if base:
+            parts.extend(base.split())
+        parts.extend(["--resume", sid])
+        if extra_flags:
+            parts.extend(shlex.split(extra_flags))
+        return " ".join(parts)
+    if kind == "pi":
+        parts = ["pi", "--session", sid]
+        if base:
+            parts.extend(base.split())
+        if extra_flags:
+            parts.extend(shlex.split(extra_flags))
+        return " ".join(parts)
+    if kind == "codex":
+        parts = ["codex", "resume", sid]
+        if base:
+            parts.extend(base.split())
+        if extra_flags:
+            parts.extend(shlex.split(extra_flags))
+        return " ".join(parts)
+    raise ValueError(f"resume not supported for kind={kind}")
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    rec = load_record(args.id)
+    kind = rec.get("kind")
+    if kind not in ("pi", "claude", "codex"):
+        raise ValueError(
+            f"pause not supported for kind={kind}\n"
+            f"  hint: pause/resume is for tmux-backed workers only (pi/claude/codex);\n"
+            f"  opencode sessions live on the opencode server and don't need pause/resume"
+        )
+
+    target = (rec.get("live") or {}).get("target")
+    if not target:
+        raise ValueError(f"no tmux target stored for {args.id}; cannot pause")
+
+    # Pre-flight: confirm we can build a resume command before killing anything.
+    try:
+        cmd = build_resume_cmd(rec, args.launch_hint or (rec.get("extra") or {}).get("launch_hint", ""))
+    except ValueError as e:
+        raise ValueError(
+            f"cannot prepare resume command for {args.id}: {e}\n"
+            f"  hint: registry entry may be incomplete; refusing to kill the tmux window"
+        )
+
+    rec.setdefault("extra", {})
+    rec["extra"]["paused"] = True
+    rec["extra"]["paused_at"] = now_iso()
+    rec["extra"]["resume_cmd"] = cmd
+    if args.launch_hint:
+        rec["extra"]["launch_hint"] = args.launch_hint
+    save_record(rec)
+
+    # Kill the tmux window the pane belongs to (target is "session:window.pane").
+    if "." in target:
+        window = target.rsplit(".", 1)[0]
+    else:
+        window = target
+
+    if args.keep_window:
+        print(f"paused {args.id} (kind={kind}); tmux window {window} left intact (--keep-window)")
+    else:
+        with tmux_lock():
+            try:
+                r = subprocess.run(
+                    ["tmux", "kill-window", "-t", window],
+                    capture_output=True, text=True, check=False,
+                )
+                if r.returncode != 0:
+                    eprint(f"warning: tmux kill-window {window} returned {r.returncode}: {r.stderr.strip()}")
+            except Exception as e:
+                eprint(f"warning: failed to run tmux kill-window: {e}")
+        print(f"paused {args.id} (kind={kind}); killed tmux window {window}")
+
+    print(f"  session preserved at: {(rec.get('persisted') or {}).get('path')}")
+    print(f"  resume with: superv resume {args.id}")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    rec = load_record(args.id)
+    kind = rec.get("kind")
+    if kind not in ("pi", "claude", "codex"):
+        raise ValueError(f"resume not supported for kind={kind}")
+
+    if not (rec.get("extra") or {}).get("paused"):
+        eprint(f"note: {args.id} is not marked paused; resuming anyway (use --force to silence)")
+
+    cwd = args.cwd or (rec.get("persisted") or {}).get("cwd")
+    if not cwd:
+        raise ValueError(f"no cwd stored for {args.id}; pass --cwd <path>")
+    if not Path(cwd).exists():
+        raise ValueError(
+            f"cwd does not exist: {cwd}\n"
+            f"  hint: pass --cwd <other-path>; the worker's stored cwd may be a deleted worktree"
+        )
+
+    extra_flags = args.launch_hint or (rec.get("extra") or {}).get("launch_hint", "")
+    cmd = build_resume_cmd(rec, extra_flags)
+
+    # Determine target tmux session and window.
+    prev_target = (rec.get("live") or {}).get("target", "")
+    if ":" in prev_target:
+        prev_session, rest = prev_target.split(":", 1)
+        prev_window = rest.split(".", 1)[0]
+    else:
+        prev_session, prev_window = "0", args.id
+
+    tmux_session = args.tmux_session or prev_session
+    new_window = args.window or prev_window or args.id
+
+    with tmux_lock():
+        # Kill any existing window with that name (clean slate); ignore errors.
+        subprocess.run(
+            ["tmux", "kill-window", "-t", f"{tmux_session}:{new_window}"],
+            capture_output=True, check=False,
+        )
+
+        # Create the window in the chosen cwd.
+        r = subprocess.run(
+            ["tmux", "new-window", "-t", f"{tmux_session}:", "-n", new_window, "-d", "-c", cwd],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            raise ValueError(f"tmux new-window failed: {r.stderr.strip() or 'unknown error'}")
+
+        new_target = f"{tmux_session}:{new_window}.0"
+
+        # Send the resume command.
+        subprocess.run(
+            ["tmux", "send-keys", "-t", new_target, cmd, "Enter"],
+            capture_output=True, check=False,
+        )
+
+    # Update registry to reflect the new pane address and clear paused state.
+    rec.setdefault("live", {})["type"] = "tmux"
+    rec["live"]["target"] = new_target
+    rec.setdefault("send", {})["type"] = "tmux"
+    rec["send"]["target"] = new_target
+    rec.setdefault("extra", {})
+    rec["extra"]["paused"] = False
+    rec["extra"]["resumed_at"] = now_iso()
+    if args.cwd:
+        # If the user resumed in a different cwd, update the stored cwd too,
+        # since future re-pause/re-resume should use the new location.
+        rec.setdefault("persisted", {})
+        rec["persisted"]["cwd"] = cwd
+    save_record(rec)
+
+    print(f"resumed {args.id} (kind={kind}) in tmux {new_target}")
+    print(f"  cwd: {cwd}")
+    print(f"  command: {cmd}")
+    return 0
+
+
+def _enforce_safety_caps(entries: List[Entry], force: bool) -> int:
+    # Gate only on total rendered size, not entry count. Individual entries are
+    # short (tool args/results are truncated when rendered), so a high entry
+    # count is fine as long as the rendered text stays under the char cap.
+    rendered = render_entries(entries)
+    if len(rendered) > MAX_RENDERED_CHARS and not force:
+        eprint(f"refusing to print {len(rendered)} chars from {len(entries)} entries (max {MAX_RENDERED_CHARS}). use --count to scope down, detail for one entry, or --force.")
+        return 1
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    # Flag interactions:
+    #   --live alone         → read live channel only; cursor flags are nonsensical here
+    #   --reset              → delete cursor before reading; persisted read uses tail
+    #   --full               → ignore cursor for this read; cursor still updates
+    #   --count N            → read tail of N (implies bootstrap if no cursor)
+    if args.live:
+        for flag in ("reset", "full", "count", "force"):
+            if getattr(args, flag):
+                raise ValueError(
+                    f"watch --live: --{flag} is not valid in live mode\n"
+                    f"  --live reads only the tmux pane / http status — there's no cursor or count.\n"
+                    f"  drop --live to use cursor flags, or drop --{flag} to keep --live."
+                )
+
+    rec = load_record(args.id)
+    adapter = adapter_for(rec)
+
+    if args.live:
+        print(adapter.read_live(rec))
+        return 0
+
+    if args.reset:
+        reset_cursor(args.id)
+
+    use_cursor = not args.full
+    entries, new_cursor = adapter.read_persisted(rec, count=args.count, use_cursor=use_cursor)
+
+    if not entries:
+        print("(no new entries)")
+        save_cursor(args.id, new_cursor)
+        return 0
+
+    if _enforce_safety_caps(entries, args.force):
+        return 1
+
+    print(render_entries(entries))
+    save_cursor(args.id, new_cursor)
+    print(f"\n(cursor: {cursor_path(args.id)})")
+    return 0
+
+
+def cmd_detail(args: argparse.Namespace) -> int:
+    rec = load_record(args.id)
+    adapter = adapter_for(rec)
+    try:
+        print(adapter.detail(rec, args.entry_id))
+    except ValueError as e:
+        eprint(f"error: {e}")
+        return 1
+    return 0
+
+
+def _snapshot_entry_ids(adapter, rec: Dict[str, Any]) -> set:
+    """Return the set of persisted entry ids visible right now (no cursor)."""
+    try:
+        entries, _ = adapter.read_persisted(rec, count=20, use_cursor=False)
+    except Exception:
+        return set()
+    return {e.id for e in entries}
+
+
+def _verify_send_landed(adapter, rec: Dict[str, Any], pre_ids: set, timeout_s: float = 6.0) -> bool:
+    """Poll persisted history until a new entry id appears (signaling our send landed)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            entries, _ = adapter.read_persisted(rec, count=20, use_cursor=False)
+        except Exception:
+            continue
+        if any(e.id not in pre_ids for e in entries):
+            return True
+    return False
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    # Mutual exclusion: exactly one of (positional message, --file) must be given.
+    if args.message and args.file:
+        raise ValueError(
+            "send: pass either a positional message OR --file <path>, not both\n"
+            "  examples:\n"
+            "    superv send <id> 'Continue.'\n"
+            "    superv send <id> --file /tmp/instruction.md"
+        )
+    if not args.message and not args.file:
+        raise ValueError(
+            "send: provide a message (positional) or --file <path>\n"
+            "  examples:\n"
+            "    superv send <id> 'Continue.'\n"
+            "    superv send <id> --file /tmp/instruction.md"
+        )
+
+    rec = load_record(args.id)
+    adapter = adapter_for(rec)
+    transport = rec.get("send", {}).get("type")
+
+    # Snapshot persisted entries before send, for --verify polling later.
+    pre_ids = _snapshot_entry_ids(adapter, rec) if args.verify else None
+
+    if args.file:
+        path = Path(args.file)
+        if not path.exists():
+            raise ValueError(f"--file path does not exist: {path}")
+        text = path.read_text(encoding="utf-8")
+        if not text.strip():
+            raise ValueError(f"--file is empty: {path}")
+        adapter.send(rec, text)
+        print(f"sent {len(text)} chars from {path} via {transport}.")
+    else:
+        adapter.send(rec, args.message)
+        print(f"sent via {transport}.")
+
+    if args.verify:
+        landed = _verify_send_landed(adapter, rec, pre_ids, timeout_s=args.verify_timeout)
+        if not landed and transport == "tmux":
+            # Composer-Enter quirk: prompt may be sitting in the composer.
+            # Send a bare Enter and try once more.
+            print("verify: no new entry seen yet — sending a bare Enter to nudge submission")
+            target = rec.get("send", {}).get("target") or rec.get("live", {}).get("target")
+            if target:
+                tmux_send_enter(target)
+            landed = _verify_send_landed(adapter, rec, pre_ids, timeout_s=args.verify_timeout)
+        if not landed:
+            raise ValueError(
+                "verify: no new persisted entry appeared within "
+                f"{args.verify_timeout}s after sending. The send may have been swallowed "
+                "(composer-Enter quirk, busy worker, or wrong target). Inspect with:\n"
+                f"  superv watch {args.id} --live\n"
+                f"  superv watch {args.id} --reset --count 5"
+            )
+        print("verify: confirmed — a new persisted entry appeared.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    rec = load_record(args.id)
+    adapter = adapter_for(rec)
+    sig = adapter.status_signals(rec)
+
+    turn = sig.get("turn", "unknown")
+    age = sig.get("persisted_age_s", float("inf"))
+    broken = sig.get("broken", False)
+
+    # KNOWN-ISSUE (status accuracy, informational only): an agent that dies mid-turn reads
+    # 'running' forever — a trailing user/tool entry never expires and tmux kinds never set
+    # 'broken' (nothing checks pane/process reachability here). Operator sees persisted_age
+    # climbing as the tell. Fix sketch: busy + persisted_age above a generous cap (~60 min,
+    # clears worst-case pi thinking) -> stalled; optionally a cheap tmux-target-exists check -> broken.
+    if broken or turn == "unknown":
+        verdict = "broken"
+    elif turn == "busy":
+        verdict = "running"
+    elif age < 600:
+        verdict = "idle"
+    else:
+        verdict = "stalled"
+
+    age_min = age / 60 if age != float("inf") else None
+    age_str = f"{age_min:.1f}m" if age_min is not None else "?"
+
+    parts = [
+        f"id={args.id}",
+        f"kind={rec['kind']}",
+        f"status={verdict}",
+        f"turn={turn}",
+        f"persisted_age={age_str}",
+    ]
+
+    ctx_tokens = sig.get("context_input_tokens")
+    # Prefer per-status window from adapter (Codex), else fall back to cached
+    # one-time acquisition stashed at register time.
+    ctx_window = sig.get("context_window_tokens") or rec.get("extra", {}).get("context_window_tokens")
+    if ctx_tokens:
+        if ctx_window:
+            pct = (ctx_tokens / ctx_window) * 100
+            parts.append(f"ctx={ctx_tokens / 1000:.0f}k/{ctx_window / 1000:.0f}k({pct:.0f}%)")
+        else:
+            parts.append(f"ctx={ctx_tokens / 1000:.0f}k")
+
+    print(" ".join(parts))
+    return 0
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    if args.tag not in ("user", "supervisor", "self"):
+        eprint("note: --tag must be one of user|supervisor|self")
+        return 1
+    ensure_dirs()
+    notes_path = NOTES_DIR / f"{args.id}.md"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"\n### {ts} [{args.tag}-directed]\n{args.text}\n"
+    with notes_path.open("a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"appended to {notes_path}")
+    return 0
+
+
+def cmd_heartbeat(args: argparse.Namespace) -> int:
+    if not (args.bump or args.reset or args.teardown or args.show):
+        raise ValueError(
+            "heartbeat: pass exactly one of --bump --reset --teardown --show\n"
+            "  --reset:    initialize a fresh instruction file at start interval (30s)\n"
+            "  --bump:     advance backoff by +30s (cap 240s) and rewrite the file\n"
+            "  --teardown: remove the file when overall supervision is complete, requires user input, or the user says stop\n"
+            "  --show:     print the current file contents\n"
+            f"  example: superv heartbeat {args.id} --bump"
+        )
+    # Confirm the worker exists before doing anything else.
+    load_record(args.id)
+    ensure_dirs()
+    hb_path = HEARTBEATS_DIR / f"{args.id}.md"
+    state_path = HEARTBEATS_DIR / f"{args.id}.state.json"
+
+    if args.teardown:
+        existing = [path for path in (hb_path, state_path) if path.exists()]
+        if not existing:
+            raise ValueError(f"heartbeat --teardown: no heartbeat state for {args.id}")
+        for path in existing:
+            path.unlink()
+            print(f"teardown: removed {path}")
+        return 0
+
+    if args.show:
+        if not hb_path.exists():
+            raise ValueError(
+                f"heartbeat --show: no heartbeat file at {hb_path}\n"
+                f"  hint: 'superv heartbeat {args.id} --reset' to create one"
+            )
+        print(hb_path.read_text(encoding="utf-8"))
+        return 0
+
+    if args.reset:
+        next_sleep = HEARTBEAT_START
+    else:  # args.bump
+        prev = 0
+        if state_path.exists():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            prev = int(state.get("next_sleep", 0))
+        elif hb_path.exists():
+            # Migrate heartbeat files generated before timer metadata moved to
+            # the sidecar. The prompt itself is rewritten canonically below.
+            m = re.search(r"^next_sleep=(\d+)", hb_path.read_text(encoding="utf-8"), flags=re.M)
+            if m:
+                prev = int(m.group(1))
+        next_sleep = min(HEARTBEAT_CAP, prev + HEARTBEAT_STEP) if prev else HEARTBEAT_START
+
+    rec = load_record(args.id)
+    hb_path.write_text(f"{CANONICAL_HEARTBEAT_PROMPT}\n", encoding="utf-8")
+    state_path.write_text(json.dumps({
+        "next_sleep": next_sleep,
+        "anchor_worker": args.id,
+        "anchor_worker_kind": rec["kind"],
+    }, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {hb_path}")
+    print(f"\nnext step: sleep {next_sleep} && cat {hb_path}")
+    return 0
+
+
+# -- argparse -----------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="superv",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Unified agent supervision CLI — supervise Claude / Pi / Codex / OpenCode workers.",
+        epilog="""\
+typical workflows:
+
+  attach to a running worker:
+    # 1. you launch the worker yourself with whatever tooling fits (tmux + the agent's CLI,
+    #    or just opening Claude Code / opencode by hand). superv does NOT launch agents.
+    # 2. once the worker has produced its first output (so its session file exists), register:
+    superv list                                   # see candidate tmux panes / oc sessions
+    superv register my-worker --kind <kind> [--tmux T:W.P | --oc-session ses_...]
+    superv watch my-worker --count 3              # initial bootstrap of cursor
+    superv watch my-worker                        # incremental polling thereafter
+
+  send a message:
+    superv send my-worker "Continue."
+    superv send my-worker --file /tmp/long-instruction.md
+
+  classify and observe:
+    superv status my-worker
+    superv watch my-worker
+    superv watch my-worker --live                 # live channel only
+    superv detail my-worker <entry-id>            # full content of one entry
+
+  heartbeat (polled supervisors only — codex/opencode):
+    superv heartbeat my-worker --reset            # initial 30s
+    superv heartbeat my-worker --bump             # +30s, cap 240s
+    superv heartbeat my-worker --teardown         # only when overall supervision should stop
+
+  notes:
+    superv note my-worker "blocked on dep X" --tag supervisor
+
+state location: ~/.agent-supervision/{workers,cursors,notes,heartbeats}/
+""",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
+
+    # list
+    sp = sub.add_parser(
+        "list",
+        help="auto-discover candidate workers (tmux panes + opencode sessions)",
+        description="Show registered workers, candidate tmux panes running pi/claude/codex, and OpenCode sessions on http://localhost:4096.",
+    )
+    sp.set_defaults(func=cmd_list)
+
+    # register
+    sp = sub.add_parser(
+        "register",
+        help="register a running worker by id",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Register a new worker. Fails if the id is already taken — unregister first to re-use an id. Auto-resolves session/transcript path from the transport.",
+        epilog="""\
+required flags by kind:
+  --kind pi      requires --tmux T:W.P                (auto-resolves cwd → JSONL)
+  --kind claude  requires --tmux T:W.P                (auto-resolves PID → sessionId → JSONL)
+  --kind codex   requires --tmux T:W.P                (auto-resolves cwd → rollout JSONL)
+  --kind opencode requires --oc-session ses_...       (auto-resolves directory via http)
+
+if auto-resolution fails (e.g. JSONL doesn't exist yet), the command fails with a hint.
+pass --path explicitly to override.
+
+examples:
+  superv register tv-pi   --kind pi   --tmux 0:pi-worker.0
+  superv register c-acp   --kind claude --tmux 0:claude.0
+  superv register oc-impl --kind opencode --oc-session ses_29ab1c5e...
+""",
+    )
+    sp.add_argument("id", help="stable id you'll use for all subsequent superv commands")
+    sp.add_argument("--kind", required=True, choices=list(ADAPTERS.keys()))
+    sp.add_argument("--tmux", help="tmux target for tmux-backed kinds, e.g. 0:my-window.0")
+    sp.add_argument("--oc-session", help="opencode session id, e.g. ses_29ab...; only valid for --kind opencode")
+    sp.add_argument("--path", help="explicit session/JSONL path override (skips auto-resolution)")
+    sp.set_defaults(func=cmd_register)
+
+    # name
+    sp = sub.add_parser(
+        "name",
+        help="print next available worker name from the pool",
+        description="Returns the first unused name from the built-in name pool (checks the registry). Use this to pick a name before creating a tmux window and registering.",
+    )
+    sp.set_defaults(func=cmd_name)
+
+    # install-claude-statusline
+    sp = sub.add_parser(
+        "install-claude-statusline",
+        help="install the agent-supervision statusLine into ~/.claude/settings.json",
+        description="Wires scripts/claude-statusline.sh as the Claude Code statusLine. Gives the operator a context-window display in the TUI status bar AND lets `superv register --kind claude` parse the model context window from a tmux capture (one-time acquisition, cached in the worker registry).",
+    )
+    sp.add_argument("--force", action="store_true", help="overwrite an existing statusLine entry")
+    sp.set_defaults(func=cmd_install_claude_statusline)
+
+    # show
+    sp = sub.add_parser(
+        "show",
+        help="show full registry record + side files for one worker",
+        description="Print the full registry record for a worker id (paths, extras) and list which side files (cursor, notes, heartbeat) currently exist for it.",
+    )
+    sp.add_argument("id")
+    sp.set_defaults(func=cmd_show)
+
+    # unregister
+    sp = sub.add_parser(
+        "unregister",
+        help="remove a worker registry entry",
+        description="Remove the registry entry. Cursor, notes, and heartbeat are preserved by default; pass --purge to remove everything.",
+    )
+    sp.add_argument("id")
+    sp.add_argument("--purge", action="store_true", help="also delete cursor, notes, and heartbeat files")
+    sp.set_defaults(func=cmd_unregister)
+
+    # pause
+    sp = sub.add_parser(
+        "pause",
+        help="terminate the worker's tmux window but preserve its session for later resume",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Kill the worker's tmux window. The persisted session file (Pi/Claude JSONL, Codex rollout) is left intact. The registry entry is marked paused with a stored resume command. Resume later with 'superv resume <id>'.",
+        epilog="""\
+behavior by kind:
+  pi      kills tmux window; resume re-launches with `pi --session <uuid>`
+  claude  kills tmux window; resume re-launches with `claude --resume <uuid> --dangerously-skip-permissions`
+  codex   kills tmux window; resume re-launches with `codex resume <uuid> --dangerously-bypass-approvals-and-sandbox`
+  opencode  not supported — opencode sessions live on the opencode server, no pause needed
+
+examples:
+  superv pause my-worker                                # kill tmux window, store resume cmd
+  superv pause my-worker --launch-hint "--effort high"  # capture custom flags for resume
+  superv pause my-worker --keep-window                  # mark paused but don't kill tmux yet
+""",
+    )
+    sp.add_argument("id")
+    sp.add_argument("--launch-hint", help="extra flags to use when resuming (e.g. '--effort high'); appended to the default resume command")
+    sp.add_argument("--keep-window", action="store_true", help="mark paused but don't actually kill the tmux window (dry-run-ish)")
+    sp.set_defaults(func=cmd_pause)
+
+    # resume
+    sp = sub.add_parser(
+        "resume",
+        help="re-launch a paused worker into a fresh tmux window, continuing the same session",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Create a new tmux window in the worker's stored cwd and launch the agent CLI with the appropriate session-resume flag. The registry entry is updated with the new tmux target.",
+        epilog="""\
+session-id resolution:
+  pi      <uuid> from the JSONL filename (<ts>_<uuid>.jsonl)
+  claude  rec.extra.session_id (or JSONL stem fallback)
+  codex   <uuid> from the rollout filename (rollout-<ISO>-<uuid>.jsonl)
+
+cwd:
+  defaults to the cwd recorded at register time (rec.persisted.cwd).
+  pass --cwd <path> to resume from a different directory (e.g. if the
+  original was a deleted worktree). agents inherit cwd from the resuming
+  process, so this affects what file paths the agent thinks are relative.
+
+examples:
+  superv resume my-worker                                  # default cwd, default flags
+  superv resume my-worker --cwd /home/user/workspace/repo  # resume from a different dir
+  superv resume my-worker --window my-worker-2             # use a different tmux window name
+  superv resume my-worker --launch-hint "--effort high"    # add extra flags
+""",
+    )
+    sp.add_argument("id")
+    sp.add_argument("--cwd", help="override stored cwd")
+    sp.add_argument("--window", help="tmux window name (default: previous window name)")
+    sp.add_argument("--tmux-session", help="tmux session (default: previous tmux session)")
+    sp.add_argument("--launch-hint", help="extra flags to append to the resume command")
+    sp.set_defaults(func=cmd_resume)
+
+    # watch
+    sp = sub.add_parser(
+        "watch",
+        help="incremental view of new persisted entries (or --live for live channel)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Read new persisted entries past the cursor, or read the live channel with --live.",
+        epilog="""\
+modes:
+  default              read entries past the cursor (cursor advances)
+  --reset              delete cursor before reading; persisted read uses tail
+  --full               ignore cursor for this read (cursor still updates)
+  --count N            read tail of N entries (implies bootstrap if no cursor)
+  --live               read the live channel only (tmux pane / http status); cursor flags forbidden
+
+bootstrap rule:
+  on a session with >20 entries and no cursor, watch refuses unless --count or --reset is given.
+  this prevents accidentally dumping a huge history into the supervisor's context.
+
+examples:
+  superv watch tv-pi                  # incremental: only new entries since cursor
+  superv watch tv-pi --count 8        # initial bootstrap, show last 8
+  superv watch tv-pi --reset          # discard cursor and rebootstrap with default tail
+  superv watch tv-pi --live           # current tmux pane / http status
+""",
+    )
+    sp.add_argument("id")
+    sp.add_argument("--live", action="store_true", help="read live channel only (no cursor)")
+    sp.add_argument("--reset", action="store_true", help="delete cursor before reading")
+    sp.add_argument("--full", action="store_true", help="ignore cursor for this read")
+    sp.add_argument("--count", type=int, help="show last N entries (bootstrap mode)")
+    sp.add_argument("--force", action="store_true", help="bypass the safety cap (max 12000 rendered chars)")
+    sp.set_defaults(func=cmd_watch)
+
+    # detail
+    sp = sub.add_parser(
+        "detail",
+        help="full content for one entry (use when watch's truncation is too aggressive)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Show full original content for one persisted entry — full text, full tool args, full tool result.",
+        epilog="""\
+entry-id formats:
+  pi      entry uuid (from watch output 'id=...') OR toolCallId
+  claude  entry uuid OR tool_use id OR tool_use_id
+  codex   the codex-N index from watch output, OR a call_id
+  opencode message id (msg_...)
+
+examples:
+  superv detail tv-pi a6ca92b7
+  superv detail c-acp tool_01ABC
+  superv detail c1 codex-12
+""",
+    )
+    sp.add_argument("id")
+    sp.add_argument("entry_id", help="entry id, tool call id, or worker-specific identifier from watch output")
+    sp.set_defaults(func=cmd_detail)
+
+    # send
+    sp = sub.add_parser(
+        "send",
+        help="send a message to the worker (any text, single or multi-line)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Send a message via the worker's send transport. Exactly one of (positional message, --file) is required.",
+        epilog="""\
+transport behavior:
+  tmux  any text → tmux paste-buffer (-d -p -r) + Enter; multi-line is preserved as soft newlines
+  http  any text → POSTed directly to the worker's prompt endpoint
+
+examples:
+  superv send tv-pi "Continue."
+  superv send tv-pi "multi-line text
+goes here as one message"
+  superv send tv-pi --file /tmp/instruction.md
+""",
+    )
+    sp.add_argument("id")
+    sp.add_argument("message", nargs="?", help="message text (positional, exclusive with --file); single or multi-line")
+    sp.add_argument("--file", help="path to a file whose contents are sent (exclusive with positional message)")
+    sp.add_argument("--verify", action="store_true",
+                    help="poll persisted history after sending; if no new entry appears within --verify-timeout, retry one bare Enter (tmux only) and fail loudly if still missing")
+    sp.add_argument("--verify-timeout", type=float, default=6.0,
+                    help="seconds to wait per verify attempt (default: 6.0)")
+    sp.set_defaults(func=cmd_send)
+
+    # status
+    sp = sub.add_parser(
+        "status",
+        help="mechanical liveness verdict (running/idle/stalled/broken)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Mechanical verdict from persisted transcript turn-state + persisted age + reachability. Does NOT classify WORKER_COMPLETE or NEEDS_CORRECTION — those require reading content (use 'superv watch') and applying agent judgment.",
+        epilog="""\
+mechanical verdicts (script outputs):
+  running   transcript turn-state is busy
+  idle      transcript turn-state is idle and persisted age < 10min
+  stalled   transcript turn-state is idle and persisted age > 10min
+  broken    transcript turn-state is unknown or live channel unreachable
+
+agent-judgment verdicts (NOT script outputs — read content to decide):
+  WORKER_COMPLETE  worker's current assignment met, validations actually ran, no pending blocker
+  NEEDS_CORRECTION worker progressing in a wrong direction (anti-pattern detected)
+
+typical use: status narrows the worker-level question; the global supervisor still reassesses the overall goal.
+  - 'running' → do not nudge this worker solely because the heartbeat fired
+  - 'idle' / 'stalled' → run 'superv watch' and read recent entries to decide what's really going on
+  - 'broken' → escalate; do not nudge a dead worker
+""",
+    )
+    sp.add_argument("id")
+    sp.set_defaults(func=cmd_status)
+
+    # note
+    sp = sub.add_parser(
+        "note",
+        help="append a timestamped tagged entry to the worker's notes file",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Append a tagged observation. The tag attributes who drove the decision; this matters because the worker has multiple principals.",
+        epilog="""\
+--tag values:
+  user        the user talked to the worker directly
+  supervisor  you (the supervisor) sent a nudge or instruction
+  self        the worker made its own decision
+
+example:
+  superv note tv-pi "blocked on hermes 401; restarted token via X" --tag supervisor
+""",
+    )
+    sp.add_argument("id")
+    sp.add_argument("text")
+    sp.add_argument("--tag", required=True, choices=["user", "supervisor", "self"])
+    sp.set_defaults(func=cmd_note)
+
+    # heartbeat
+    sp = sub.add_parser(
+        "heartbeat",
+        help="manage the polled-supervisor heartbeat instruction file",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Create / advance / inspect / remove the heartbeat instruction file. For scheduled supervisors, prefer the native scheduling primitives instead: ScheduleWakeup or CronCreate on Claude, schedule_loop_wakeup or LoopCreate on Pi.",
+        epilog="""\
+modes (exactly one required):
+  --reset      initialize/reset the file at the start interval (30s)
+  --bump       advance backoff: +30s per call, capped at 240s
+  --show       print the current file contents
+  --teardown   remove the file only when overall supervision is complete, requires user input, or the user says stop
+
+after --reset or --bump, the script prints the next 'sleep N && cat <path>' command for you to run.
+
+example session:
+  superv heartbeat tv-pi --reset            # 30s
+  # ...run printed sleep+cat...
+  superv heartbeat tv-pi --bump             # 60s
+  # ...continue until done, then:
+  superv heartbeat tv-pi --teardown
+""",
+    )
+    sp.add_argument("id")
+    sp.add_argument("--bump", action="store_true")
+    sp.add_argument("--reset", action="store_true")
+    sp.add_argument("--teardown", action="store_true")
+    sp.add_argument("--show", action="store_true")
+    sp.set_defaults(func=cmd_heartbeat)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except ValueError as e:
+        eprint(f"error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

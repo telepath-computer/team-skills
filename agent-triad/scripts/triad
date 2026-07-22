@@ -1,0 +1,791 @@
+#!/usr/bin/env bash
+#
+# triad — lifecycle manager for supervised agent groups ("triads").
+#
+# A triad = one task worktree + N supervised agents (worker, reviewer, and any
+# added later) launched in tmux windows, supervised by the CURRENT agent (the
+# supervisor). The supervisor is never launched, registered, or torn down by
+# this tool — destroying the supervisor is the operator's job (Ctrl-D).
+#
+# State: ~/.triads/<repo>--<task-slug>/triad.json — written by `up`, appended
+# by `add`, updated by `pause`/`resume`, consumed by `down`. Successful
+# teardown archives state to ~/.triads/.archive/; failed teardown leaves state in
+# place with status `teardown_failed` so it can be re-run.
+#
+# Subcommands:
+#   triad up     --repo R --task T [opts]     create worktree + launch idle agents + write state
+#   triad add    <id>|--here --role ROLE --kind KIND [--name N] [--pi-model M] [--claude-model M]   add one idle agent
+#
+# pi-kind agents always launch with an explicit --model (default
+# openai-codex/gpt-5.6-sol:xhigh) so they never inherit the last interactive setting.
+# Override with the TRIAD_PI_MODEL env var or the --pi-model flag on up/add.
+# claude-kind agents always launch with an explicit --model (default `fable`) so a
+# triad's claude agents never silently follow a global default that someone flipped
+# to Opus (or anything else). Override with the TRIAD_CLAUDE_MODEL env var or the
+# --claude-model flag on up/add. Pass `--claude-model ''` to launch with no --model
+# flag at all (inherit Claude's configured default).
+#   triad pause  <id>|--here                   kill agent windows, preserve their sessions (resume later)
+#   triad resume <id>|--here                   re-launch all paused agents, same sessions + context
+#   triad down   <id>|--here [--force] [--delete-remote] [--dry-run]   tear down supervised agents + worktree
+#   triad ls                                   list current triads + archived count
+#   triad status <id>|--here                   state + live superv status per agent
+#
+# Safety properties:
+#   - down refuses if the worktree is dirty or the branch has unmerged commits (--force overrides)
+#   - down only touches ids/paths recorded in state; never globs shared dirs
+#   - down never kills the supervisor window or the tmux session
+#   - down archives state only after destructive steps succeed; a half-failed
+#     teardown leaves state in place and can be re-run
+#
+set -euo pipefail
+
+TRIADS_DIR="${TRIADS_DIR:-$HOME/.triads}"
+ARCHIVE_DIR="$TRIADS_DIR/.archive"
+
+# Pi inherits the last interactive model/reasoning unless launched with --model,
+# which silently picks up whatever you were last experimenting with. Always launch
+# pi-kind agents with an explicit model so the triad is reproducible. Override the
+# default per-shell with TRIAD_PI_MODEL, or per-invocation with `--pi-model`.
+PI_MODEL="${TRIAD_PI_MODEL:-openai-codex/gpt-5.6-sol:xhigh}"
+CLAUDE_MODEL="${TRIAD_CLAUDE_MODEL:-fable}"
+
+c_red=$'\033[31m'; c_yellow=$'\033[33m'; c_green=$'\033[32m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+info() { printf '%s==>%s %s\n' "$c_green" "$c_off" "$*"; }
+warn() { printf '%swarn:%s %s\n' "$c_yellow" "$c_off" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+note() { printf '%s  - %s%s\n' "$c_dim" "$*" "$c_off"; }
+
+usage() { awk 'NR==1 {next} /^#/ {sub(/^# ?/,""); print; next} {exit}' "$0"; exit "${1:-0}"; }
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now_stamp() { date -u +%Y%m%d-%H%M%S; }
+
+# ---------- JSON helpers (node) ----------
+state_get() { # state_get <file> <dot.path>  -> prints value ("" if missing)
+  node -e '
+    try {
+      const [f,p]=process.argv.slice(1);
+      let v=JSON.parse(require("fs").readFileSync(f,"utf8"));
+      for (const k of p.split(".")) { v = (v??{})[k]; }
+      if (v===undefined||v===null) process.exit(0);
+      process.stdout.write(typeof v==="object"?JSON.stringify(v):String(v));
+    } catch (e) { console.error(`triad: cannot read state ${process.argv[1]}: ${e.message}`); process.exit(1); }
+  ' "$1" "$2"
+}
+agents_count() { node -e 'try { const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if (!Array.isArray(j.agents)) throw new Error("agents is not an array"); console.log(j.agents.length); } catch (e) { console.error(`triad: cannot read agents from ${process.argv[1]}: ${e.message}`); process.exit(1); }' "$1"; }
+agent_field() { # agent_field <file> <index> <field>
+  node -e '
+    try {
+      const [f,i,k]=process.argv.slice(1);
+      const j=JSON.parse(require("fs").readFileSync(f,"utf8"));
+      if (!Array.isArray(j.agents)) throw new Error("agents is not an array");
+      const a=j.agents[Number(i)];
+      process.stdout.write(String(a?.[k] ?? ""));
+    } catch (e) { console.error(`triad: cannot read agent field from ${process.argv[1]}: ${e.message}`); process.exit(1); }
+  ' "$1" "$2" "$3"
+}
+state_set() { # state_set <file> <key> <string-value>
+  node -e '
+    try {
+      const fs=require("fs"); const [f,k,v]=process.argv.slice(1);
+      const j=JSON.parse(fs.readFileSync(f,"utf8"));
+      j[k]=v; j.updated_at=new Date().toISOString();
+      fs.writeFileSync(f, JSON.stringify(j,null,2)+"\n");
+    } catch (e) { console.error(`triad: cannot update state ${process.argv[1]}: ${e.message}`); process.exit(1); }
+  ' "$1" "$2" "$3"
+}
+state_set_status() { # state_set_status <file> <status>
+  node -e '
+    try {
+      const fs=require("fs"); const [f,s]=process.argv.slice(1);
+      const j=JSON.parse(fs.readFileSync(f,"utf8"));
+      j.status=s; j.updated_at=new Date().toISOString();
+      if (s==="torn_down") j.torn_down_at=j.updated_at;
+      fs.writeFileSync(f, JSON.stringify(j,null,2)+"\n");
+    } catch (e) { console.error(`triad: cannot set status in ${process.argv[1]}: ${e.message}`); process.exit(1); }
+  ' "$1" "$2"
+}
+state_append_agent() { # state_append_agent <file> <role> <name> <kind> <window> <window_id> <tmux> <session_id>
+  node -e '
+    try {
+      const fs=require("fs");
+      const [f,role,name,kind,win,window_id,tmux,sid]=process.argv.slice(1);
+      const j=JSON.parse(fs.readFileSync(f,"utf8"));
+      if (!Array.isArray(j.agents)) throw new Error("agents is not an array");
+      j.agents.push({role,name,kind,window:win,window_id:window_id||null,tmux,session_id:sid||null,added_at:new Date().toISOString()});
+      j.updated_at=new Date().toISOString();
+      fs.writeFileSync(f, JSON.stringify(j,null,2)+"\n");
+    } catch (e) { console.error(`triad: cannot append agent to ${process.argv[1]}: ${e.message}`); process.exit(1); }
+  ' "$@"
+}
+state_update_agent_window() { # state_update_agent_window <file> <name> <window> <window_id> <tmux>
+  node -e '
+    try {
+      const fs=require("fs");
+      const [f,name,win,window_id,tmux]=process.argv.slice(1);
+      const j=JSON.parse(fs.readFileSync(f,"utf8"));
+      if (!Array.isArray(j.agents)) throw new Error("agents is not an array");
+      const a=j.agents.find(a => a.name===name);
+      if (!a) process.exit(0);
+      a.window=win; a.window_id=window_id||null; a.tmux=tmux;
+      j.updated_at=new Date().toISOString();
+      fs.writeFileSync(f, JSON.stringify(j,null,2)+"\n");
+    } catch (e) { console.error(`triad: cannot update agent window in ${process.argv[1]}: ${e.message}`); process.exit(1); }
+  ' "$@"
+}
+worker_tmux_target() { # worker_tmux_target <name>  (from superv registry; "" if unknown)
+  local f="$HOME/.agent-supervision/workers/$1.json"
+  [ -f "$f" ] || { echo ""; return 0; }
+  node -e '
+    const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
+    process.stdout.write(j.live?.target||"");
+  ' "$f"
+}
+worker_session_id() { # worker_session_id <name>  (from superv registry; "" if unknown)
+  local f="$HOME/.agent-supervision/workers/$1.json"
+  [ -f "$f" ] || { echo ""; return 0; }
+  node -e '
+    const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
+    let sid=j.extra?.session_id;
+    if (!sid && j.persisted?.path) {
+      const b=require("path").basename(j.persisted.path,".jsonl");
+      const us=b.lastIndexOf("_"); sid = us>=0 ? b.slice(us+1) : b;
+    }
+    process.stdout.write(sid||"");
+  ' "$f"
+}
+worker_paused() { # worker_paused <name> -> true|false|unknown
+  local f="$HOME/.agent-supervision/workers/$1.json"
+  [ -f "$f" ] || { echo unknown; return 0; }
+  node -e '
+    try {
+      const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
+      if (j.extra && Object.prototype.hasOwnProperty.call(j.extra,"paused")) process.stdout.write(j.extra.paused ? "true" : "false");
+      else process.stdout.write("unknown");
+    } catch { process.stdout.write("unknown"); }
+  ' "$f"
+}
+
+# ---------- triad resolution ----------
+# resolve_triad <id|--here>  -> sets TRIAD_DIR, TRIAD_FILE, TRIAD_ID
+resolve_triad() {
+  local sel="$1"
+  if [ "$sel" = "--here" ]; then
+    [ -n "${TMUX:-}" ] || die "--here requires running inside tmux"
+    local sess; sess="$(tmux display-message -p '#{session_name}')"
+    local matches=()
+    for f in "$TRIADS_DIR"/*/triad.json; do
+      [ -f "$f" ] || continue
+      local st; st="$(state_get "$f" status)"
+      if [ "$(state_get "$f" tmux_session)" = "$sess" ] && { [ "$st" = "active" ] || [ "$st" = "paused" ] || [ "$st" = "creating" ] || [ "$st" = "create_failed" ] || [ "$st" = "pause_failed" ] || [ "$st" = "resume_failed" ] || [ "$st" = "teardown_failed" ]; }; then
+        matches+=("$f")
+      fi
+    done
+    [ "${#matches[@]}" -gt 0 ] || die "no current triad recorded for tmux session '$sess'"
+    [ "${#matches[@]}" -eq 1 ] || die "multiple current triads claim session '$sess' — pass an explicit id: ${matches[*]}"
+    TRIAD_FILE="${matches[0]}"
+  else
+    TRIAD_FILE="$TRIADS_DIR/$sel/triad.json"
+    [ -f "$TRIAD_FILE" ] || die "no triad state at $TRIAD_FILE (see 'triad ls')"
+  fi
+  TRIAD_DIR="$(dirname "$TRIAD_FILE")"
+  TRIAD_ID="$(state_get "$TRIAD_FILE" id)"
+}
+
+# ---------- idle prompts (single line; no double quotes) ----------
+idle_prompt() { # idle_prompt <role> <name> <worktree>
+  local role="$1" name="$2" wt="$3"
+  case "$role" in
+    worker)
+      printf "You are '%s', an implementation worker. Your supervisor is your only point of contact. You are currently IDLE — do NOT start any work. Do not inspect any repository, read or edit files, run tests, install anything, or plan implementation until the supervisor sends you an explicit task. When work is later assigned you will use the git worktree at %s. For now just acknowledge you are ready and waiting for instructions, then stop." "$name" "$wt";;
+    reviewer)
+      printf "You are '%s', a code reviewer. Your supervisor is your only point of contact. You are currently IDLE — do not review anything yet. Do NOT inspect any repository, read diffs, read or run code, or run tests until the supervisor sends you an explicit review request. When a review is later requested you may be asked to inspect the git worktree at %s. For now just acknowledge you are ready and waiting for a review request, then stop." "$name" "$wt";;
+    *)
+      printf "You are '%s', a %s agent for the supervisor. Your supervisor is your only point of contact. You are currently IDLE — do NOT start any work. Do not inspect any repository, read or edit files, run tests, or act in any way until the supervisor sends you explicit instructions. When work is later assigned you will use the git worktree at %s. For now just acknowledge you are ready and waiting, then stop." "$name" "$role" "$wt";;
+  esac
+}
+
+valid_ident() { [[ "$1" =~ ^[a-z][a-z0-9-]*$ ]]; }
+shell_quote() { printf '%q' "$1"; }
+tmux_window_alive() { # tmux_window_alive <window-id> <expected-window-name>
+  local wid="$1" expected="$2" seen name
+  [ -n "$wid" ] || return 1
+  seen="$(tmux display-message -pt "$wid" '#{window_id}' 2>/dev/null || true)"
+  name="$(tmux display-message -pt "$wid" '#{window_name}' 2>/dev/null || true)"
+  [ "$seen" = "$wid" ] && [ "$name" = "$expected" ]
+}
+
+window_target_for_agent() { # window_target_for_agent <state-file> <index> -> tmux target, preferring verified immutable id
+  local sf="$1" idx="$2" wid win nm
+  wid="$(agent_field "$sf" "$idx" window_id)"
+  win="$(agent_field "$sf" "$idx" window)"
+  nm="$(agent_field "$sf" "$idx" name)"
+  if [ -n "$wid" ] && tmux_window_alive "$wid" "$win"; then
+    printf '%s' "$wid"
+  else
+    if [ -n "$wid" ]; then
+      warn "recorded window_id '$wid' for '$nm' is missing or no longer names '$win'; falling back to mutable window name '$win'"
+    else
+      warn "state for '$nm' lacks window_id; falling back to mutable window name '$win'"
+    fi
+    printf '%s:%s' "$(state_get "$sf" tmux_session)" "$win"
+  fi
+}
+
+# ---------- agent launching (shared by up + add) ----------
+wait_for_marker() { # wait_for_marker <tmux-target> <marker> [tries]
+  local target="$1" marker="$2" tries="${3:-80}"
+  for _ in $(seq 1 "$tries"); do
+    if tmux capture-pane -t "$target" -p -S -30 2>/dev/null | grep -qF "$marker"; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+register_with_retry() { # register_with_retry <id> <kind> <target> -> 0 ok, 2 name collision, 1 other
+  local id="$1" kind="$2" target="$3" tries=40 i=0 out
+  while [ "$i" -lt "$tries" ]; do
+    if out="$(superv register "$id" --kind "$kind" --tmux "$target" 2>&1)"; then return 0; fi
+    if printf '%s' "$out" | grep -qiE "already registered|worker .* already registered"; then return 2; fi
+    i=$((i+1))
+    if { [ "$kind" = "claude" ] || [ "$kind" = "codex" ]; } && [ $((i % 8)) -eq 0 ]; then
+      tmux send-keys -t "$target" Enter 2>/dev/null || true
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+launch_agent() { # launch_agent <state-file> <session> <worktree> <role> <kind> [name]
+  local sf="$1" session="$2" wt="$3" role="$4" kind="$5" requested_name="${6:-}"
+  case "$kind" in pi|claude|codex) ;; *) warn "unsupported kind '$kind' (pi|claude|codex)"; return 1;; esac
+  valid_ident "$role" || { warn "invalid role '$role' (use ^[a-z][a-z0-9-]*$)"; return 1; }
+  [ -z "$requested_name" ] || valid_ident "$requested_name" || { warn "invalid name '$requested_name' (use ^[a-z][a-z0-9-]*$)"; return 1; }
+
+  local attempts=0 max_attempts=5 name auto_name
+  while [ "$attempts" -lt "$max_attempts" ]; do
+    attempts=$((attempts+1))
+    if [ -n "$requested_name" ]; then name="$requested_name"; auto_name=0; else name="$(superv name)"; auto_name=1; fi
+    [ -n "$name" ] || { warn "could not allocate a name (superv name returned empty)"; return 1; }
+    valid_ident "$name" || { warn "allocated invalid name '$name' (use ^[a-z][a-z0-9-]*$)"; return 1; }
+
+    local prompt window_id target pane_target qprompt
+    prompt="$(idle_prompt "$role" "$name" "$wt")"
+    info "Launching $role '$name' ($kind) in window '$name'…"
+    if ! window_id="$(tmux new-window -P -F '#{window_id}' -t "$session:" -n "$name" -d -c "$wt")"; then
+      warn "failed to create tmux window '$name' in session '$session'"; return 1
+    fi
+    target="$window_id"
+    pane_target="$session:$name.0"
+
+    qprompt="$(shell_quote "$prompt")"
+    case "$kind" in
+      pi)
+        local qmodel; qmodel="$(shell_quote "$PI_MODEL")"
+        tmux send-keys -t "$target" "pi --model $qmodel $qprompt" Enter
+        wait_for_marker "$target" "escape interrupt" || warn "pi readiness marker not seen for $name; continuing."
+        ;;
+      claude)
+        if [ -n "$CLAUDE_MODEL" ]; then
+          local qcm; qcm="$(shell_quote "$CLAUDE_MODEL")"
+          tmux send-keys -t "$target" "claude --dangerously-skip-permissions --model $qcm" Enter
+        else
+          tmux send-keys -t "$target" "claude --dangerously-skip-permissions" Enter
+        fi
+        wait_for_marker "$target" "❯" || warn "claude compose box not seen for $name; continuing."
+        printf '%s' "$prompt" | tmux load-buffer -
+        tmux paste-buffer -d -t "$target"
+        sleep 0.4
+        tmux send-keys -t "$target" Enter
+        ;;
+      codex)
+        # Codex accepts a seeded positional prompt; --yolo is standard for autonomous workers.
+        tmux send-keys -t "$target" "codex --yolo $qprompt" Enter
+        wait_for_marker "$target" "❯" || warn "codex readiness marker not seen for $name; continuing."
+        ;;
+    esac
+
+    local reg_rc=0
+    register_with_retry "$name" "$kind" "$pane_target" || reg_rc=$?
+    if [ "$reg_rc" -eq 0 ]; then
+      info "Registered $role '$name' ($kind)."
+      local sid; sid="$(worker_session_id "$name")"
+      state_append_agent "$sf" "$role" "$name" "$kind" "$name" "$window_id" "$pane_target" "$sid"
+      LAUNCHED_NAME="$name"
+      return 0
+    fi
+
+    tmux kill-window -t "$window_id" 2>/dev/null || true
+    if [ "$reg_rc" -eq 2 ] && [ "$auto_name" -eq 1 ]; then
+      warn "name '$name' was claimed before registration; killed orphan window and retrying with a fresh name"
+      continue
+    fi
+    if [ "$reg_rc" -eq 2 ]; then
+      warn "name '$name' is already registered; killed orphan window"
+    else
+      warn "failed to register $role '$name' ($kind) — session file never appeared; killed orphan window '$name'"
+    fi
+    return 1
+  done
+  warn "failed to launch $role after $max_attempts name-allocation attempts"
+  return 1
+}
+
+# ============================================================ up ============
+cmd_up() {
+  local REPO="" TASK="" PARENT="$HOME/workspace" BASE="" SESSION=""
+  local WORKER_KIND="pi" REVIEWER_KIND="claude" DO_WORKER=1 DO_REVIEWER=1
+  local ALLOW_DIRTY=0 DRY_RUN=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) REPO="${2:?}"; shift 2;;
+      --task) TASK="${2:?}"; shift 2;;
+      --parent) PARENT="${2:?}"; shift 2;;
+      --base) BASE="${2:?}"; shift 2;;
+      --session) SESSION="${2:?}"; shift 2;;
+      --worker-kind) WORKER_KIND="${2:?}"; shift 2;;
+      --reviewer-kind) REVIEWER_KIND="${2:?}"; shift 2;;
+      --pi-model) PI_MODEL="${2:?}"; shift 2;;
+      --claude-model) CLAUDE_MODEL="${2-}"; shift 2;;
+      --no-worker) DO_WORKER=0; shift;;
+      --no-reviewer) DO_REVIEWER=0; shift;;
+      --allow-dirty) ALLOW_DIRTY=1; shift;;
+      --dry-run) DRY_RUN=1; shift;;
+      -h|--help) usage;;
+      *) die "up: unknown argument $1";;
+    esac
+  done
+  [ -n "$REPO" ] || die "up: missing --repo"
+  [ -n "$TASK" ] || die "up: missing --task"
+  command -v superv >/dev/null || die "superv not on PATH"
+  command -v tmux >/dev/null || die "tmux not on PATH"
+  [ -n "${TMUX:-}" ] || die "not inside tmux (the triad lives in your tmux session)"
+  [ -n "$SESSION" ] || SESSION="$(tmux display-message -p '#{session_name}')"
+
+  local CANON="$PARENT/$REPO"
+  [ -d "$CANON" ] || die "canonical repo not found: $CANON"
+  git -C "$CANON" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repo: $CANON"
+  if [ -n "$(git -C "$CANON" status --porcelain)" ] && [ "$ALLOW_DIRTY" -ne 1 ]; then
+    die "canonical repo $CANON has uncommitted changes (pass --allow-dirty to proceed)"
+  fi
+
+  local SLUG; SLUG="$(printf '%s' "$TASK" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+  [ -n "$SLUG" ] || die "task slug empty after normalization: '$TASK'"
+  local ID="$REPO--$SLUG"
+  local WT="$PARENT/wt/$REPO/$SLUG"
+  local BRANCH="thopter/$SLUG"
+  local def_ref; def_ref="$(git -C "$CANON" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
+  local DEFAULT_BRANCH="${def_ref##*/}"; [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="main"
+  [ -n "$BASE" ] || BASE="origin/$DEFAULT_BRANCH"
+
+  local SF="$TRIADS_DIR/$ID/triad.json"
+  if [ -f "$SF" ]; then
+    die "triad '$ID' already has status '$(state_get "$SF" status)' ($SF). Use 'triad status $ID', 'triad resume $ID' if paused, or 'triad down $ID' to abandon/clean it up. 'triad add' is allowed only once it is active."
+  fi
+  if [ -e "$TRIADS_DIR/$ID" ]; then
+    die "triad state directory already exists without a usable triad.json: $TRIADS_DIR/$ID — inspect or remove it before retrying"
+  fi
+
+  info "Triad id:     $ID"
+  info "Repo:         $CANON"
+  info "Worktree:     $WT"
+  info "Branch:       $BRANCH (base $BASE)"
+  info "tmux session: $SESSION"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    note "[dry-run] would: fetch; create/reuse worktree; write $SF;"
+    [ "$DO_WORKER" -eq 1 ] && note "[dry-run] would launch idle worker ($WORKER_KIND) + register + record"
+    [ "$DO_REVIEWER" -eq 1 ] && note "[dry-run] would launch idle reviewer ($REVIEWER_KIND) + register + record"
+    note "[dry-run] names are allocated at launch time via 'superv name'"
+    return 0
+  fi
+
+  mkdir -p "$TRIADS_DIR"
+  mkdir "$TRIADS_DIR/$ID" || die "triad '$ID' was created concurrently; use 'triad status $ID' or choose another task id"
+  node -e '
+    const fs=require("fs");
+    const [f,id,repo,canon,parent,slug,wt,branch,base,defb,sess]=process.argv.slice(1);
+    const j={id,created_at:new Date().toISOString(),repo,canonical_repo:canon,parent,task_slug:slug,
+             worktree:wt,branch,base,default_branch:defb,tmux_session:sess,
+             supervisor:{note:"current agent in this session; never managed or torn down by triad"},
+             agents:[],status:"creating"};
+    fs.writeFileSync(f, JSON.stringify(j,null,2)+"\n");
+  ' "$SF" "$ID" "$REPO" "$CANON" "$PARENT" "$SLUG" "$WT" "$BRANCH" "$BASE" "$DEFAULT_BRANCH" "$SESSION"
+  info "State written: $SF (creating)"
+
+  info "Fetching origin…"
+  if ! git -C "$CANON" fetch --all --prune --quiet; then state_set_status "$SF" create_failed; die "fetch failed; triad state left at $SF with status create_failed"; fi
+  if git -C "$CANON" worktree list --porcelain | grep -qx "worktree $WT"; then
+    local wt_branch; wt_branch="$(git -C "$WT" branch --show-current 2>/dev/null || true)"
+    [ "$wt_branch" = "$BRANCH" ] || { state_set_status "$SF" create_failed; die "existing worktree $WT is on '$wt_branch', expected '$BRANCH'; triad state left at $SF with status create_failed"; }
+    info "Reusing existing worktree at $WT"
+  elif git -C "$CANON" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    info "Branch $BRANCH exists — adding worktree from it."
+    mkdir -p "$PARENT/wt/$REPO"
+    if ! git -C "$CANON" worktree add "$WT" "$BRANCH"; then state_set_status "$SF" create_failed; die "worktree add failed; triad state left at $SF with status create_failed"; fi
+  else
+    info "Creating worktree + branch off $BASE."
+    mkdir -p "$PARENT/wt/$REPO"
+    if ! git -C "$CANON" worktree add -b "$BRANCH" "$WT" "$BASE"; then state_set_status "$SF" create_failed; die "worktree add failed; triad state left at $SF with status create_failed"; fi
+  fi
+
+
+  local WORKER_NAME="" REVIEWER_NAME=""
+  if [ "$DO_WORKER" -eq 1 ]; then
+    if launch_agent "$SF" "$SESSION" "$WT" worker "$WORKER_KIND"; then WORKER_NAME="$LAUNCHED_NAME"; else state_set_status "$SF" create_failed; die "worker launch failed; triad state left at $SF with status create_failed. Standard recovery: run 'triad down $ID', then re-run 'triad up' (the worktree/branch will be reused if present)."; fi
+  fi
+  if [ "$DO_REVIEWER" -eq 1 ]; then
+    if launch_agent "$SF" "$SESSION" "$WT" reviewer "$REVIEWER_KIND"; then REVIEWER_NAME="$LAUNCHED_NAME"; else state_set_status "$SF" create_failed; die "reviewer launch failed; triad state left at $SF with status create_failed. Standard recovery: run 'triad down $ID', then re-run 'triad up' (the worktree/branch will be reused if present)."; fi
+  fi
+  state_set_status "$SF" active
+
+  echo
+  info "Triad '$ID' is up. Agents are IDLE and isolated (they do not know about each other)."
+  cat <<EOF
+  worktree : $WT
+  branch   : $BRANCH (based on $BASE)
+  worker   : ${WORKER_NAME:-<skipped>}${WORKER_NAME:+ ($WORKER_KIND)}
+  reviewer : ${REVIEWER_NAME:-<skipped>}${REVIEWER_NAME:+ ($REVIEWER_KIND)}
+  state    : $SF
+  teardown : triad down $ID   (or: triad down --here)
+Setup is not execution — delegate explicitly when ready.
+EOF
+}
+
+# ============================================================ add ===========
+cmd_add() {
+  local SEL="" ROLE="" KIND="" NAME=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --here) SEL="--here"; shift;;
+      --role) ROLE="${2:?}"; shift 2;;
+      --kind) KIND="${2:?}"; shift 2;;
+      --name) NAME="${2:?}"; shift 2;;
+      --pi-model) PI_MODEL="${2:?}"; shift 2;;
+      --claude-model) CLAUDE_MODEL="${2-}"; shift 2;;
+      -h|--help) usage;;
+      -*) die "add: unknown flag $1";;
+      *) SEL="$1"; shift;;
+    esac
+  done
+  [ -n "$SEL" ] || die "add: pass a triad id or --here"
+  [ -n "$ROLE" ] || die "add: --role is required (no default)"
+  [ -n "$KIND" ] || die "add: --kind is required (no default; pi|claude|codex)"
+  resolve_triad "$SEL"
+  local st; st="$(state_get "$TRIAD_FILE" status)"
+  if [ "$st" != "active" ]; then
+    case "$st" in
+      paused|resume_failed) die "triad '$TRIAD_ID' is '$st' — resume it before adding agents";;
+      creating|create_failed) die "triad '$TRIAD_ID' is '$st' — standard recovery is 'triad down $TRIAD_ID', then re-run 'triad up'";;
+      teardown_failed) die "triad '$TRIAD_ID' is '$st' — finish cleanup with 'triad down $TRIAD_ID' before creating a new triad";;
+      *) die "triad '$TRIAD_ID' is '$st' — agents can be added only to active triads";;
+    esac
+  fi
+  local SESSION WT; SESSION="$(state_get "$TRIAD_FILE" tmux_session)"; WT="$(state_get "$TRIAD_FILE" worktree)"
+  tmux has-session -t "$SESSION" 2>/dev/null || die "tmux session '$SESSION' not found"
+  [ -d "$WT" ] || die "worktree missing: $WT"
+
+  if ! launch_agent "$TRIAD_FILE" "$SESSION" "$WT" "$ROLE" "$KIND" "$NAME"; then
+    die "failed to add $ROLE ($KIND) to triad '$TRIAD_ID'"
+  fi
+  info "Added $ROLE '$LAUNCHED_NAME' ($KIND) to triad '$TRIAD_ID' — idle, recorded in state, included in future teardown."
+}
+
+# ============================================================ pause =========
+cmd_pause() {
+  local SEL=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --here) SEL="--here"; shift;;
+      -h|--help) usage;;
+      -*) die "pause: unknown flag $1";;
+      *) SEL="$1"; shift;;
+    esac
+  done
+  [ -n "$SEL" ] || die "pause: pass a triad id or --here"
+  resolve_triad "$SEL"
+  local st; st="$(state_get "$TRIAD_FILE" status)"
+  { [ "$st" = "active" ] || [ "$st" = "pause_failed" ]; } || die "triad '$TRIAD_ID' is '$st' — only active/pause_failed triads can be paused"
+  local N; N="$(agents_count "$TRIAD_FILE")"
+
+  info "Pausing triad '$TRIAD_ID' ($N agent(s); sessions preserved, supervisor untouched)."
+  local i=0
+  local failed=0
+  while [ "$i" -lt "$N" ]; do
+    local nm target; nm="$(agent_field "$TRIAD_FILE" "$i" name)"; target="$(window_target_for_agent "$TRIAD_FILE" "$i")"
+    if superv pause "$nm" --keep-window >/dev/null 2>&1; then
+      if tmux kill-window -t "$target" 2>/dev/null; then note "paused '$nm' (killed window $target, session preserved)"; else warn "superv paused '$nm' but tmux window $target was already gone"; fi
+    else
+      warn "superv pause failed for '$nm'"; failed=1
+    fi
+    i=$((i+1))
+  done
+  if [ "$failed" -eq 0 ]; then
+    state_set_status "$TRIAD_FILE" paused
+    info "Triad '$TRIAD_ID' paused. Worktree + branch + state untouched. 'triad resume $TRIAD_ID' to continue."
+  else
+    state_set_status "$TRIAD_FILE" pause_failed
+    die "triad '$TRIAD_ID' only partially paused; status is pause_failed. Fix the failed agent(s), then retry or inspect manually."
+  fi
+}
+
+# ============================================================ resume ========
+cmd_resume() {
+  local SEL=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --here) SEL="--here"; shift;;
+      -h|--help) usage;;
+      -*) die "resume: unknown flag $1";;
+      *) SEL="$1"; shift;;
+    esac
+  done
+  [ -n "$SEL" ] || die "resume: pass a triad id or --here"
+  resolve_triad "$SEL"
+  local st; st="$(state_get "$TRIAD_FILE" status)"
+  { [ "$st" = "paused" ] || [ "$st" = "resume_failed" ]; } || die "triad '$TRIAD_ID' is '$st' — only paused/resume_failed triads can be resumed"
+  local WT SESSION; WT="$(state_get "$TRIAD_FILE" worktree)"; SESSION="$(state_get "$TRIAD_FILE" tmux_session)"
+  [ -d "$WT" ] || die "worktree missing: $WT — agents' stored cwd is gone; investigate before resuming"
+
+  # If the recorded tmux session no longer exists, resume into the current one.
+  local sess_args=()
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    [ -n "${TMUX:-}" ] || die "recorded tmux session '$SESSION' is gone and we are not inside tmux"
+    local cur; cur="$(tmux display-message -p '#{session_name}')"
+    warn "recorded session '$SESSION' is gone — resuming into current session '$cur'"
+    sess_args=(--tmux-session "$cur")
+    state_set "$TRIAD_FILE" tmux_session "$cur"
+    SESSION="$cur"
+  fi
+
+  local N; N="$(agents_count "$TRIAD_FILE")"
+  info "Resuming triad '$TRIAD_ID' ($N agent(s)) into session '$SESSION'."
+  local i=0 failed=0
+  while [ "$i" -lt "$N" ]; do
+    local nm paused_state recorded_wid recorded_win; nm="$(agent_field "$TRIAD_FILE" "$i" name)"
+    paused_state="$(worker_paused "$nm")"
+    recorded_wid="$(agent_field "$TRIAD_FILE" "$i" window_id)"
+    recorded_win="$(agent_field "$TRIAD_FILE" "$i" window)"
+    if [ "$paused_state" = "false" ] || tmux_window_alive "$recorded_wid" "$recorded_win"; then
+      note "'$nm' already resumed (ok)"
+      i=$((i+1))
+      continue
+    fi
+    if superv resume "$nm" "${sess_args[@]}" >/dev/null 2>&1; then
+      local tgt wid win
+      tgt="$(worker_tmux_target "$nm")"
+      wid=""; win="$(agent_field "$TRIAD_FILE" "$i" window)"
+      if [ -n "$tgt" ]; then
+        local seen_win
+        wid="$(tmux display-message -pt "$tgt" '#{window_id}' 2>/dev/null || true)"
+        seen_win="$(tmux display-message -pt "$tgt" '#{window_name}' 2>/dev/null || true)"
+        [ -n "$seen_win" ] && win="$seen_win"
+        state_update_agent_window "$TRIAD_FILE" "$nm" "$win" "$wid" "$tgt"
+      fi
+      note "resumed '$nm' (same session id, same context)"
+    else
+      warn "superv resume failed for '$nm' — inspect with 'superv show $nm'"; failed=1
+    fi
+    i=$((i+1))
+  done
+  if [ "$failed" -eq 0 ]; then
+    state_set_status "$TRIAD_FILE" active
+    info "Triad '$TRIAD_ID' is active again. Agents retain their prior context; re-orient them before delegating new work."
+  else
+    state_set_status "$TRIAD_FILE" resume_failed
+    die "triad '$TRIAD_ID' only partially resumed; status is resume_failed. Fix manually (superv show/resume <name>) before delegating."
+  fi
+}
+
+# ============================================================ down ==========
+cmd_down() {
+  local SEL="" FORCE=0 DELETE_REMOTE=0 DRY_RUN=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --here) SEL="--here"; shift;;
+      --force) FORCE=1; shift;;
+      --delete-remote) DELETE_REMOTE=1; shift;;
+      --dry-run) DRY_RUN=1; shift;;
+      -h|--help) usage;;
+      -*) die "down: unknown flag $1";;
+      *) SEL="$1"; shift;;
+    esac
+  done
+  [ -n "$SEL" ] || die "down: pass a triad id or --here"
+  resolve_triad "$SEL"
+
+  local CANON BRANCH WT SESSION DEFB
+  CANON="$(state_get "$TRIAD_FILE" canonical_repo)"
+  BRANCH="$(state_get "$TRIAD_FILE" branch)"
+  WT="$(state_get "$TRIAD_FILE" worktree)"
+  SESSION="$(state_get "$TRIAD_FILE" tmux_session)"
+  DEFB="$(state_get "$TRIAD_FILE" default_branch)"; [ -n "$DEFB" ] || DEFB=main
+  local N; N="$(agents_count "$TRIAD_FILE")"
+
+  info "Tearing down triad '$TRIAD_ID' ($N supervised agent(s); supervisor untouched)."
+
+  # ---- safety gate (skippable only via --force) ----
+  local blockers=()
+  if ! { [ -d "$CANON" ] && git -C "$CANON" rev-parse --is-inside-work-tree >/dev/null 2>&1; }; then
+    blockers+=("canonical repo missing or not a git repo: $CANON")
+  fi
+  if [ -d "$WT" ]; then
+    local wt_status_rc=0 wt_status
+    wt_status="$(git -C "$WT" status --porcelain 2>/dev/null)" || wt_status_rc=$?
+    if [ "$wt_status_rc" -ne 0 ]; then
+      blockers+=("could not inspect worktree status: $WT")
+    elif [ -n "$wt_status" ]; then
+      blockers+=("worktree has uncommitted changes: $WT")
+    fi
+  fi
+  if [ -d "$CANON" ] && git -C "$CANON" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    git -C "$CANON" fetch origin --prune --quiet 2>/dev/null || warn "fetch failed; merge check uses last-known remote state"
+    local ahead; ahead="$(git -C "$CANON" rev-list --count "origin/$DEFB..$BRANCH" 2>/dev/null || echo 0)"
+    if [ "$ahead" -gt 0 ]; then
+      if git -C "$CANON" merge-base --is-ancestor "$BRANCH" "origin/$DEFB" 2>/dev/null; then
+        : # merged via merge/ff
+      else
+        local tip pr_oids pr_count pr_oid
+        tip="$(git -C "$CANON" rev-parse "$BRANCH" 2>/dev/null || true)"
+        pr_oids=""
+        if command -v gh >/dev/null 2>&1; then
+          pr_oids="$(cd "$CANON" && gh pr list --head "$BRANCH" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null || true)"
+        fi
+        pr_count="$(printf '%s\n' "$pr_oids" | sed '/^$/d' | wc -l | tr -d ' ')"
+        pr_oid="$(printf '%s\n' "$pr_oids" | sed '/^$/d' | head -n 1)"
+        if [ "$pr_count" -eq 1 ] && [ -n "$tip" ] && [ "$pr_oid" = "$tip" ]; then
+          : # merged via squash/rebase PR; gh headRefOid matches current local branch tip
+        else
+          blockers+=("branch $BRANCH has $ahead commit(s) not merged into origin/$DEFB (no unique merged PR with headRefOid=$tip found)")
+        fi
+      fi
+    fi
+  fi
+  if [ "${#blockers[@]}" -gt 0 ] && [ "$FORCE" -ne 1 ]; then
+    for b in "${blockers[@]}"; do warn "BLOCKED: $b"; done
+    die "refusing to tear down — re-run with --force to destroy this work anyway"
+  fi
+  [ "${#blockers[@]}" -gt 0 ] && warn "--force: proceeding despite blockers above"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    note "[dry-run] plan for triad '$TRIAD_ID':"
+    local i=0; while [ "$i" -lt "$N" ]; do
+      note "[dry-run] superv unregister --purge $(agent_field "$TRIAD_FILE" "$i" name); tmux kill-window -t $(window_target_for_agent "$TRIAD_FILE" "$i")"
+      i=$((i+1))
+    done
+    note "[dry-run] git -C $CANON worktree remove $WT; worktree prune"
+    note "[dry-run] git -C $CANON branch -D $BRANCH"
+    [ "$DELETE_REMOTE" -eq 1 ] && note "[dry-run] git push origin --delete $BRANCH (if remote branch exists)" || note "[dry-run] remote branch: report only (no --delete-remote)"
+    note "[dry-run] archive $TRIAD_DIR -> $ARCHIVE_DIR/$TRIAD_ID-<ts>/  (supervisor window + session left running)"
+    return 0
+  fi
+
+  local LOG="$TRIAD_DIR/teardown.log"
+  log() { printf '%s %s\n' "$(now_iso)" "$*" >>"$LOG"; note "$*"; }
+  printf '\n%s teardown attempt for %s\n' "$(now_iso)" "$TRIAD_ID" >>"$LOG"
+  local teardown_failed=0
+  fail_step() { teardown_failed=1; log "$*"; }
+
+  # ---- 1. agents: purge registration/state, kill windows (never the supervisor) ----
+  local i=0
+  while [ "$i" -lt "$N" ]; do
+    local nm target; nm="$(agent_field "$TRIAD_FILE" "$i" name)"; target="$(window_target_for_agent "$TRIAD_FILE" "$i")"
+    if superv unregister --purge "$nm" >/dev/null 2>&1; then log "unregistered+purged '$nm'"; else log "'$nm' not in registry (ok)"; fi
+    if tmux kill-window -t "$target" 2>/dev/null; then log "killed window $target"; else log "window $target already gone (ok)"; fi
+    i=$((i+1))
+  done
+
+  # ---- 2. worktree ----
+  if [ -d "$WT" ]; then
+    local rmflags=(); [ "$FORCE" -eq 1 ] && rmflags+=(--force)
+    if git -C "$CANON" worktree remove "${rmflags[@]}" "$WT" 2>>"$LOG"; then log "removed worktree $WT"; else fail_step "worktree remove FAILED for $WT (see log)"; fi
+  else
+    log "worktree already absent: $WT (ok)"
+  fi
+  if [ -d "$CANON" ]; then git -C "$CANON" worktree prune 2>/dev/null || true; fi
+
+  # ---- 3. local branch ----
+  if [ -d "$CANON" ] && git -C "$CANON" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    if git -C "$CANON" branch -D "$BRANCH" >/dev/null 2>&1; then log "deleted local branch $BRANCH"; else fail_step "branch delete FAILED for $BRANCH"; fi
+  else
+    log "local branch already absent: $BRANCH (ok)"
+  fi
+
+  # ---- 4. remote branch (opt-in deletion) ----
+  if [ -d "$CANON" ] && git -C "$CANON" ls-remote --heads origin "$BRANCH" 2>/dev/null | grep -q .; then
+    if [ "$DELETE_REMOTE" -eq 1 ]; then
+      if git -C "$CANON" push origin --delete "$BRANCH" >/dev/null 2>&1; then log "deleted remote branch origin/$BRANCH"; else fail_step "remote branch delete FAILED"; fi
+    else
+      log "remote branch origin/$BRANCH still exists (pass --delete-remote to remove)"
+    fi
+  else
+    log "remote branch already absent (ok)"
+  fi
+
+  if [ "$teardown_failed" -ne 0 ]; then
+    state_set_status "$TRIAD_FILE" teardown_failed
+    die "teardown failed; state left in place with status teardown_failed and log at $LOG. Fix the cause and re-run 'triad down $TRIAD_ID'."
+  fi
+
+  # ---- 5. archive state (supervisor window + session untouched) ----
+  state_set_status "$TRIAD_FILE" torn_down
+  mkdir -p "$ARCHIVE_DIR"
+  local dest="$ARCHIVE_DIR/$TRIAD_ID-$(now_stamp)"
+  mv "$TRIAD_DIR" "$dest"
+  info "Triad '$TRIAD_ID' torn down. State archived: $dest"
+  info "Supervisor window and tmux session '$SESSION' left running — exit the supervisor yourself (Ctrl-D) when done."
+}
+
+# ============================================================ ls ============
+cmd_ls() {
+  local found=0
+  printf '%-40s %-16s %-22s %-30s %-7s %s\n' "ID" "STATUS" "SESSION" "BRANCH" "AGENTS" "CREATED"
+  for f in "$TRIADS_DIR"/*/triad.json; do
+    [ -f "$f" ] || continue
+    found=1
+    printf '%-40s %-16s %-22s %-30s %-7s %s\n' \
+      "$(state_get "$f" id)" "$(state_get "$f" status)" "$(state_get "$f" tmux_session)" \
+      "$(state_get "$f" branch)" "$(agents_count "$f")" "$(state_get "$f" created_at)"
+  done
+  [ "$found" -eq 1 ] || echo "(no current triads)"
+  local n_arch=0
+  [ -d "$ARCHIVE_DIR" ] && n_arch="$(find "$ARCHIVE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+  echo "(archived: $n_arch — see $ARCHIVE_DIR)"
+}
+
+# ============================================================ status ========
+cmd_status() {
+  local SEL="${1:-}"; [ -n "$SEL" ] || die "status: pass a triad id or --here"
+  resolve_triad "$SEL"
+  info "Triad '$TRIAD_ID' — $(state_get "$TRIAD_FILE" status)"
+  cat <<EOF
+  repo     : $(state_get "$TRIAD_FILE" canonical_repo)
+  worktree : $(state_get "$TRIAD_FILE" worktree)
+  branch   : $(state_get "$TRIAD_FILE" branch) (base $(state_get "$TRIAD_FILE" base))
+  session  : $(state_get "$TRIAD_FILE" tmux_session)
+  created  : $(state_get "$TRIAD_FILE" created_at)
+EOF
+  local N; N="$(agents_count "$TRIAD_FILE")"
+  echo "  agents   : $N"
+  local i=0
+  while [ "$i" -lt "$N" ]; do
+    local nm; nm="$(agent_field "$TRIAD_FILE" "$i" name)"
+    printf '    [%s] %s (%s) — ' "$(agent_field "$TRIAD_FILE" "$i" role)" "$nm" "$(agent_field "$TRIAD_FILE" "$i" kind)"
+    superv status "$nm" 2>/dev/null || echo "(not registered)"
+    i=$((i+1))
+  done
+}
+
+# ============================================================ main ==========
+[ $# -ge 1 ] || usage 1
+cmd="$1"; shift
+case "$cmd" in
+  up)     cmd_up "$@";;
+  add)    cmd_add "$@";;
+  pause)  cmd_pause "$@";;
+  resume) cmd_resume "$@";;
+  down)   cmd_down "$@";;
+  ls)     cmd_ls "$@";;
+  status) cmd_status "$@";;
+  -h|--help|help) usage;;
+  *) die "unknown subcommand '$cmd' (up|add|pause|resume|down|ls|status)";;
+esac

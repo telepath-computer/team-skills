@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Topical pull request review</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #101417;
+  --panel: #171d21;
+  --panel-2: #1d252a;
+  --panel-3: #242e34;
+  --line: #334149;
+  --line-soft: #29343a;
+  --text: #e7edf0;
+  --muted: #9fadb5;
+  --faint: #71818b;
+  --accent: #78c7b6;
+  --accent-2: #b5e4da;
+  --selected: #21463f;
+  --match: #263b43;
+  --exact: #72562b;
+  --add: #70c78b;
+  --mod: #e8b969;
+  --del: #e37a7a;
+  --code-bg: #0d1114;
+  --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; width: 100%; min-width: 0; background: var(--bg); color: var(--text); }
+body { font-family: var(--sans); overflow: hidden; }
+button, input { font: inherit; }
+button { color: inherit; }
+.app { width: 100%; min-width: 0; height: 100vh; display: flex; flex-direction: column; }
+.topbar { min-width: 0; padding: 13px 16px 11px; border-bottom: 1px solid var(--line); background: #12181b; }
+.title-row { min-width: 0; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+h1 { margin: 0; font-size: 17px; line-height: 1.35; font-weight: 680; overflow-wrap: anywhere; }
+.pr-tag { color: var(--accent); font: 700 12px var(--mono); }
+.meta-row { min-width: 0; margin-top: 7px; display: flex; align-items: center; gap: 7px 15px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+.meta-row code { color: var(--accent-2); font-family: var(--mono); }
+.meta-chip { white-space: nowrap; }
+.all-button { border: 1px solid var(--line); background: var(--panel-2); border-radius: 6px; padding: 3px 8px; cursor: default; }
+.all-button:hover { border-color: var(--accent); }
+.workspace { width: 100%; min-width: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 26fr) minmax(0, 28fr) minmax(0, 46fr); overflow: hidden; }
+.column { min-width: 0; min-height: 0; border-right: 1px solid var(--line); display: flex; flex-direction: column; background: var(--panel); }
+.column:last-child { border-right: 0; }
+.column-head { min-width: 0; padding: 11px 12px 9px; border-bottom: 1px solid var(--line-soft); background: var(--panel-2); }
+.column-title { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.column-title h2 { margin: 0; font-size: 13px; letter-spacing: .045em; text-transform: uppercase; }
+.column-count { color: var(--muted); font: 11px var(--mono); }
+.column-body { min-width: 0; min-height: 0; flex: 1; overflow-y: auto; overflow-x: hidden; padding: 10px; }
+.search { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; background: var(--code-bg); color: var(--text); outline: none; }
+.search:focus { border-color: var(--accent); }
+.legend { margin-top: 8px; display: flex; gap: 11px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+.status { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; flex: 0 0 18px; border-radius: 4px; border: 1px solid currentColor; font: 700 10px var(--mono); }
+.status-A { color: var(--add); }
+.status-M { color: var(--mod); }
+.status-D { color: var(--del); }
+.tree-list, .tree-list ul, .hierarchy, .hier-children { list-style: none; padding: 0; margin: 0; min-width: 0; }
+.tree-list ul { padding-left: 15px; }
+.tree-row, .hier-row, .leaf-row { min-width: 0; display: flex; align-items: flex-start; gap: 5px; }
+.tree-row { margin: 1px 0; }
+.fold-button { width: 19px; height: 23px; flex: 0 0 19px; padding: 0; border: 0; background: transparent; color: var(--faint); cursor: default; }
+.fold-button:hover { color: var(--text); }
+.folder-label, .file-button, .node-button, .leaf-button, .link-button, .crumb-button { min-width: 0; border: 0; background: transparent; text-align: left; cursor: default; }
+.folder-label { padding: 3px 3px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.file-button { flex: 1; padding: 3px 5px; border-radius: 5px; font: 11px/1.35 var(--mono); overflow-wrap: anywhere; }
+.file-button:hover, .node-button:hover, .leaf-button:hover, .link-button:hover, .crumb-button:hover { color: var(--accent-2); background: var(--match); }
+.file-button.selected { background: var(--selected); color: var(--accent-2); outline: 1px solid #3c7469; }
+.empty { padding: 18px 8px; color: var(--muted); font-size: 12px; text-align: center; }
+.hierarchy > li + li { margin-top: 9px; }
+.hier-node { min-width: 0; }
+.hier-row { border-radius: 6px; margin: 1px 0; }
+.node-button { min-width: 0; flex: 1; padding: 4px 5px; border-radius: 5px; font-size: 12px; line-height: 1.3; font-weight: 610; overflow-wrap: anywhere; }
+.kind-change > .hier-row .node-button { color: var(--accent-2); font-size: 12.5px; }
+.kind-subtheme > .hier-row .node-button { color: #c8d3d8; font-weight: 540; }
+.hier-row.match .node-button { background: var(--match); box-shadow: inset 3px 0 0 #668895; }
+.hier-row.exact-lineage .node-button { background: #493d29; box-shadow: inset 3px 0 0 var(--mod); }
+.hier-row.exact-node .node-button { background: var(--selected); box-shadow: inset 3px 0 0 var(--accent); color: var(--accent-2); }
+.hier-children { padding-left: 14px; }
+.leaf-row { margin: 1px 0 1px 19px; border-radius: 5px; }
+.leaf-button { min-width: 0; flex: 1; padding: 3px 5px; border-radius: 5px; display: flex; gap: 6px; align-items: flex-start; font: 10.5px/1.35 var(--mono); overflow-wrap: anywhere; }
+.leaf-row.match .leaf-button { background: var(--match); box-shadow: inset 3px 0 0 #668895; }
+.leaf-row.exact-path .leaf-button { background: var(--exact); box-shadow: inset 3px 0 0 var(--mod); color: #fff2d7; }
+.right-body { padding: 15px 16px 24px; }
+.right-title { margin: 0; font-size: 19px; line-height: 1.3; overflow-wrap: anywhere; }
+.right-sub { margin: 7px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.explanation { max-width: 82ch; margin: 15px 0; color: #d3dde1; font-size: 14px; line-height: 1.56; overflow-wrap: anywhere; }
+.summary-grid { margin: 15px 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 8px; }
+.summary-card { min-width: 0; border: 1px solid var(--line-soft); border-radius: 7px; padding: 9px; background: var(--panel-2); }
+.summary-number { font: 700 17px var(--mono); color: var(--accent-2); }
+.summary-label { margin-top: 3px; color: var(--muted); font-size: 11px; }
+.child-links { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 13px; }
+.link-button { max-width: 100%; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); font-size: 11px; overflow-wrap: anywhere; }
+.path-cards { margin: 15px 0; display: grid; gap: 9px; }
+.path-card { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 10px 11px; background: var(--panel-2); }
+.path-card.exact { border-color: var(--mod); box-shadow: inset 4px 0 0 var(--mod); background: #2a2720; }
+.breadcrumb { min-width: 0; display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap; color: var(--muted); font-size: 11px; }
+.crumb-button { max-width: 100%; padding: 1px 3px; border-radius: 4px; color: var(--accent-2); overflow-wrap: anywhere; }
+.crumb-sep { color: var(--faint); }
+.impact { margin: 8px 0 0; font-size: 13px; line-height: 1.48; color: #d8e0e4; overflow-wrap: anywhere; }
+.diff-details { min-width: 0; margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--code-bg); overflow: hidden; }
+.diff-summary { padding: 9px 11px; background: var(--panel-2); cursor: default; font-size: 12px; color: var(--accent-2); }
+.diff-scroll { width: 100%; min-width: 0; max-width: 100%; max-height: 66vh; overflow-x: auto; overflow-y: auto; }
+.diff-table { border-collapse: collapse; width: max-content; min-width: 100%; font: 11px/1.48 var(--mono); }
+.diff-table td { padding: 0; vertical-align: top; }
+.line-no { position: sticky; left: 0; z-index: 1; width: 44px; min-width: 44px; padding: 0 7px !important; text-align: right; user-select: none; color: #65747d; background: #101619; border-right: 1px solid #202b31; }
+.line-no.new { left: 44px; }
+.line-code { white-space: pre; padding: 0 10px !important; }
+.diff-add .line-code { background: #14271b; color: #bde8c8; }
+.diff-del .line-code { background: #2a1719; color: #f0b6bb; }
+.diff-hunk .line-code { background: #182631; color: #9fc8e6; }
+.diff-meta .line-code { color: #9aaab3; }
+.diff-add .line-no { background: #132219; }
+.diff-del .line-no { background: #251619; }
+.diff-hunk .line-no { background: #16232c; }
+.overview-list { display: grid; gap: 8px; margin-top: 16px; }
+.overview-button { width: 100%; min-width: 0; text-align: left; padding: 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); color: var(--text); cursor: default; }
+.overview-button:hover { border-color: var(--accent); }
+.overview-button strong { display: block; color: var(--accent-2); overflow-wrap: anywhere; }
+.overview-button span { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+@media (max-width: 850px) {
+  body { overflow-x: hidden; overflow-y: auto; }
+  .app { height: auto; min-height: 100vh; }
+  .workspace { display: block; overflow: visible; }
+  .column { width: 100%; min-width: 0; min-height: 300px; max-height: none; border-right: 0; border-bottom: 1px solid var(--line); }
+  .column-body { max-height: 58vh; }
+  .right-column .column-body { max-height: none; overflow: visible; }
+  .diff-scroll { max-height: 60vh; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="title-row"><span class="pr-tag" id="review-label">Review</span><h1 id="review-title">Topical pull request review</h1></div>
+    <div class="meta-row">
+      <button class="all-button" id="show-all" type="button">All changes</button>
+      <span class="meta-chip"><strong id="header-files"></strong> files</span>
+      <span class="meta-chip"><strong id="header-nodes"></strong> shared nodes</span>
+      <span class="meta-chip"><strong id="header-paths"></strong> paths</span>
+      <span class="meta-chip">depth <strong id="header-depth"></strong></span>
+      <span class="meta-chip"><span class="status status-A">A</span> <strong id="header-added"></strong></span>
+      <span class="meta-chip"><span class="status status-M">M</span> <strong id="header-modified"></strong></span>
+      <span class="meta-chip"><span class="status status-D">D</span> <strong id="header-deleted"></strong></span>
+      <span class="meta-chip"><code id="base-hash"></code> → <code id="head-hash"></code></span>
+    </div>
+  </header>
+  <main class="workspace">
+    <section class="column" aria-label="Changed files">
+      <div class="column-head">
+        <div class="column-title"><h2>Files</h2><span class="column-count" id="file-scope-count"></span></div>
+        <input class="search" id="path-search" type="search" placeholder="Search changed paths" aria-label="Search changed paths">
+        <div class="legend"><span><span class="status status-A">A</span> Added</span><span><span class="status status-M">M</span> Modified</span><span><span class="status status-D">D</span> Deleted</span></div>
+      </div>
+      <div class="column-body"><ul class="tree-list" id="file-tree"></ul></div>
+    </section>
+    <section class="column" aria-label="Topical change hierarchy">
+      <div class="column-head"><div class="column-title"><h2>Change hierarchy</h2><span class="column-count" id="hierarchy-count"></span></div></div>
+      <div class="column-body"><ul class="hierarchy" id="hierarchy"></ul></div>
+    </section>
+    <section class="column right-column" aria-label="Explanation and diff">
+      <div class="column-head"><div class="column-title"><h2>Explanation + diff</h2><span class="column-count" id="selection-kind">Overview</span></div></div>
+      <div class="column-body right-body" id="detail"></div>
+    </section>
+  </main>
+</div>
+<script id="review-data" type="application/json">__REVIEW_DATA__</script>
+<script>
+(() => {
+  'use strict';
+  const data = JSON.parse(document.getElementById('review-data').textContent);
+  const nodeById = new Map(data.nodes.map(node => [node.id, node]));
+  const fileByPath = new Map(data.files.map(file => [file.path, file]));
+  const pathById = new Map(data.paths.map(path => [path.id, path]));
+  const revisionKey = `${data.meta.mergeBase}:${data.meta.analyzedHead}`;
+  const keys = {
+    folders: `pr-review:folders:${revisionKey}`,
+    hierarchy: `pr-review:hierarchy:${revisionKey}`,
+    diff: `pr-review:diff:${revisionKey}`,
+  };
+  function loadJSON(key, fallback) {
+    try { const value = localStorage.getItem(key); return value === null ? fallback : JSON.parse(value); }
+    catch { return fallback; }
+  }
+  function saveJSON(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} }
+  const state = {
+    selectedFile: null,
+    selectedNode: null,
+    selectedPath: null,
+    search: '',
+    folderFolds: loadJSON(keys.folders, {}),
+    hierarchyFolds: loadJSON(keys.hierarchy, {}),
+    diffOpen: loadJSON(keys.diff, true),
+  };
+  const roots = data.nodes.filter(node => node.kind === 'change');
+  const nodeOrder = new Map(data.nodes.map((node, index) => [node.id, index]));
+
+  function setText(id, value) { document.getElementById(id).textContent = String(value); }
+  document.title = `${data.meta.pullRequest ? `PR #${data.meta.pullRequest} · ` : ''}${data.meta.title}`;
+  setText('review-label', data.meta.pullRequest ? `PR #${data.meta.pullRequest}` : 'Review');
+  setText('review-title', data.meta.title);
+  setText('header-files', data.meta.fileCount);
+  setText('header-nodes', data.meta.hierarchyNodeCount);
+  setText('header-paths', data.meta.hierarchyPathCount);
+  setText('header-depth', data.meta.hierarchyDepth);
+  setText('header-added', data.meta.statusCounts.A);
+  setText('header-modified', data.meta.statusCounts.M);
+  setText('header-deleted', data.meta.statusCounts.D);
+  setText('base-hash', data.meta.mergeBase.slice(0, 9));
+  setText('head-hash', data.meta.analyzedHead.slice(0, 9));
+  setText('hierarchy-count', `${data.meta.hierarchyNodeCount} nodes · ${data.meta.hierarchyPathCount} paths`);
+
+  function statusBadge(status) {
+    const span = document.createElement('span');
+    span.className = `status status-${status}`;
+    span.textContent = status;
+    span.title = status === 'A' ? 'Added' : status === 'M' ? 'Modified' : 'Deleted';
+    return span;
+  }
+  function button(text, className, onClick) {
+    const element = document.createElement('button');
+    element.type = 'button';
+    element.className = className;
+    element.textContent = text;
+    element.addEventListener('click', onClick);
+    return element;
+  }
+  function pathsForFile(filePath) { return data.paths.filter(path => path.filePath === filePath); }
+  function pathsForNode(nodeId) { return data.paths.filter(path => path.ancestorIds.includes(nodeId)); }
+  function filesForNode(nodeId) { return new Set(pathsForNode(nodeId).map(path => path.filePath)); }
+  function writeHash(kind, value) {
+    const hash = value === null ? '' : `#${kind}:${encodeURIComponent(value)}`;
+    if (location.hash !== hash) history.replaceState(null, '', `${location.pathname}${location.search}${hash}`);
+  }
+  function occurrencePrefixes(path) {
+    return path.ancestorIds.map((_, index) => path.ancestorIds.slice(0, index + 1).join('>'));
+  }
+  function revealPath(path, everyPrefix = true) {
+    const prefixes = occurrencePrefixes(path);
+    const limit = everyPrefix ? prefixes.length : Math.max(0, prefixes.length - 1);
+    for (let index = 0; index < limit; index += 1) state.hierarchyFolds[prefixes[index]] = true;
+    saveJSON(keys.hierarchy, state.hierarchyFolds);
+  }
+  function selectOverview(updateHash = true) {
+    state.selectedFile = null; state.selectedNode = null; state.selectedPath = null;
+    if (updateHash) writeHash(null, null);
+    renderAll();
+  }
+  function selectNode(nodeId, updateHash = true) {
+    if (!nodeById.has(nodeId)) return;
+    state.selectedNode = nodeId; state.selectedFile = null; state.selectedPath = null;
+    for (const path of pathsForNode(nodeId)) {
+      const index = path.ancestorIds.indexOf(nodeId);
+      const prefixes = occurrencePrefixes(path);
+      for (let i = 0; i <= index; i += 1) state.hierarchyFolds[prefixes[i]] = true;
+    }
+    saveJSON(keys.hierarchy, state.hierarchyFolds);
+    if (updateHash) writeHash('node', nodeId);
+    renderAll();
+  }
+  function selectFile(filePath, exactPathId = null, updateHash = true, revealAll = true) {
+    if (!fileByPath.has(filePath)) return;
+    state.selectedFile = filePath; state.selectedNode = null; state.selectedPath = exactPathId;
+    const matching = exactPathId ? [pathById.get(exactPathId)].filter(Boolean) : pathsForFile(filePath);
+    for (const path of matching) revealPath(path, true);
+    if (!exactPathId && revealAll) for (const path of pathsForFile(filePath)) revealPath(path, true);
+    if (updateHash) writeHash(exactPathId ? 'path' : 'file', exactPathId || filePath);
+    renderAll();
+  }
+  function selectPath(pathId, updateHash = true) {
+    const path = pathById.get(pathId);
+    if (path) selectFile(path.filePath, pathId, updateHash, false);
+  }
+
+  function currentFileScope() {
+    let allowed;
+    if (state.selectedFile) allowed = new Set([state.selectedFile]);
+    else if (state.selectedNode) allowed = filesForNode(state.selectedNode);
+    else allowed = new Set(data.files.map(file => file.path));
+    const query = state.search.trim().toLowerCase();
+    return data.files.filter(file => allowed.has(file.path) && (!query || file.path.toLowerCase().includes(query)));
+  }
+  function makeFileTree(files) {
+    const root = { folders: new Map(), files: [] };
+    for (const file of files) {
+      const parts = file.path.split('/');
+      let cursor = root;
+      for (const part of parts.slice(0, -1)) {
+        if (!cursor.folders.has(part)) cursor.folders.set(part, { folders: new Map(), files: [] });
+        cursor = cursor.folders.get(part);
+      }
+      cursor.files.push({ file, name: parts.at(-1) });
+    }
+    return root;
+  }
+  function renderFileTree() {
+    const container = document.getElementById('file-tree');
+    container.replaceChildren();
+    const scoped = currentFileScope();
+    setText('file-scope-count', `${scoped.length} / ${data.meta.fileCount}`);
+    if (!scoped.length) {
+      const item = document.createElement('li'); item.className = 'empty'; item.textContent = 'No changed paths match this view.'; container.append(item); return;
+    }
+    const tree = makeFileTree(scoped);
+    function renderLevel(branch, list, parentPath) {
+      const folders = [...branch.folders.entries()].sort(([a], [b]) => a.localeCompare(b));
+      for (const [name, child] of folders) {
+        const fullPath = parentPath ? `${parentPath}/${name}` : name;
+        const item = document.createElement('li');
+        const row = document.createElement('div'); row.className = 'tree-row';
+        const isOpen = state.folderFolds[fullPath] !== false;
+        const toggle = button(isOpen ? '▾' : '▸', 'fold-button', () => {
+          state.folderFolds[fullPath] = !isOpen; saveJSON(keys.folders, state.folderFolds); renderFileTree();
+        });
+        toggle.dataset.folder = fullPath;
+        row.append(toggle);
+        const label = document.createElement('span'); label.className = 'folder-label'; label.textContent = name; row.append(label);
+        item.append(row);
+        if (isOpen) { const nested = document.createElement('ul'); renderLevel(child, nested, fullPath); item.append(nested); }
+        list.append(item);
+      }
+      for (const entry of branch.files.sort((a, b) => a.name.localeCompare(b.name))) {
+        const item = document.createElement('li');
+        const row = document.createElement('div'); row.className = 'tree-row';
+        row.append(statusBadge(entry.file.status));
+        const fileButton = button(entry.name, `file-button${state.selectedFile === entry.file.path ? ' selected' : ''}`, () => selectFile(entry.file.path));
+        fileButton.title = entry.file.path; fileButton.dataset.filePath = entry.file.path;
+        row.append(fileButton); item.append(row); list.append(item);
+      }
+    }
+    renderLevel(tree, container, '');
+  }
+
+  function buildHierarchyOccurrences() {
+    const virtual = { children: new Map(), leaves: [] };
+    for (const path of data.paths) {
+      let cursor = virtual;
+      const prefix = [];
+      for (const nodeId of path.ancestorIds) {
+        prefix.push(nodeId);
+        const key = prefix.join('>');
+        if (!cursor.children.has(nodeId)) cursor.children.set(nodeId, { nodeId, key, children: new Map(), leaves: [] });
+        cursor = cursor.children.get(nodeId);
+      }
+      cursor.leaves.push(path);
+    }
+    return virtual;
+  }
+  const hierarchyTree = buildHierarchyOccurrences();
+  function renderHierarchy() {
+    const container = document.getElementById('hierarchy'); container.replaceChildren();
+    const selectedFilePaths = state.selectedFile ? pathsForFile(state.selectedFile) : [];
+    const matchedNodes = new Set(selectedFilePaths.flatMap(path => path.ancestorIds));
+    const exactPath = state.selectedPath ? pathById.get(state.selectedPath) : null;
+    const exactNodes = new Set(exactPath?.ancestorIds || []);
+    function renderOccurrence(occurrence, list, depth) {
+      const node = nodeById.get(occurrence.nodeId);
+      const item = document.createElement('li'); item.className = `hier-node kind-${node.kind}`;
+      const row = document.createElement('div'); row.className = 'hier-row';
+      if (state.selectedNode === node.id) row.classList.add('exact-node');
+      else if (exactNodes.has(node.id)) row.classList.add('exact-lineage');
+      else if (matchedNodes.has(node.id)) row.classList.add('match');
+      const hasChildren = occurrence.children.size || occurrence.leaves.length;
+      const defaultOpen = depth === 0;
+      const isOpen = state.hierarchyFolds[occurrence.key] ?? defaultOpen;
+      const toggle = button(hasChildren ? (isOpen ? '▾' : '▸') : '·', 'fold-button', () => {
+        if (!hasChildren) return;
+        state.hierarchyFolds[occurrence.key] = !isOpen; saveJSON(keys.hierarchy, state.hierarchyFolds); renderHierarchy();
+      });
+      toggle.dataset.foldKey = occurrence.key;
+      row.append(toggle);
+      const nodeButton = button(node.name, 'node-button', () => selectNode(node.id));
+      nodeButton.dataset.nodeId = node.id; nodeButton.title = node.explanation;
+      row.append(nodeButton); item.append(row);
+      if (isOpen && hasChildren) {
+        const children = document.createElement('ul'); children.className = 'hier-children';
+        const childNodes = [...occurrence.children.values()].sort((a, b) => nodeOrder.get(a.nodeId) - nodeOrder.get(b.nodeId));
+        for (const child of childNodes) renderOccurrence(child, children, depth + 1);
+        for (const path of occurrence.leaves.slice().sort((a, b) => a.filePath.localeCompare(b.filePath))) {
+          const leafItem = document.createElement('li'); leafItem.className = 'leaf-row';
+          if (state.selectedPath === path.id) leafItem.classList.add('exact-path');
+          else if (state.selectedFile === path.filePath) leafItem.classList.add('match');
+          const leafButton = button('', 'leaf-button', () => selectPath(path.id));
+          leafButton.dataset.pathId = path.id;
+          leafButton.append(statusBadge(path.status));
+          const label = document.createElement('span'); label.textContent = path.filePath; leafButton.append(label);
+          leafItem.append(leafButton); children.append(leafItem);
+        }
+        item.append(children);
+      }
+      list.append(item);
+    }
+    const rootOccurrences = [...hierarchyTree.children.values()].sort((a, b) => nodeOrder.get(a.nodeId) - nodeOrder.get(b.nodeId));
+    for (const root of rootOccurrences) renderOccurrence(root, container, 0);
+  }
+
+  function childLinksForNode(nodeId) {
+    const links = new Map();
+    for (const path of pathsForNode(nodeId)) {
+      const index = path.ancestorIds.indexOf(nodeId);
+      const next = path.ancestorIds[index + 1];
+      if (next) links.set(`node:${next}`, { kind: 'node', id: next, label: nodeById.get(next).name });
+      else links.set(`path:${path.id}`, { kind: 'path', id: path.id, label: path.filePath });
+    }
+    return [...links.values()].sort((a, b) => a.label.localeCompare(b.label));
+  }
+  function renderOverview(detail) {
+    setText('selection-kind', 'Overview');
+    const title = document.createElement('h2'); title.className = 'right-title'; title.textContent = data.meta.title; detail.append(title);
+    const sub = document.createElement('p'); sub.className = 'right-sub'; sub.textContent = `${data.meta.mergeBase.slice(0, 9)} → ${data.meta.analyzedHead.slice(0, 9)} · exact squash-merge diff`; detail.append(sub);
+    const prose = document.createElement('p'); prose.className = 'explanation'; prose.textContent = data.meta.summary || 'Choose a change in the hierarchy to understand its purpose, or select a file to see every explanation path and its exact diff.'; detail.append(prose);
+    const grid = document.createElement('div'); grid.className = 'summary-grid';
+    for (const [number, label] of [[data.meta.fileCount, 'changed files'], [data.meta.hierarchyNodeCount, 'shared topic nodes'], [data.meta.hierarchyPathCount, 'topic-to-file paths'], [data.meta.hierarchyDepth, 'maximum hierarchy depth']]) {
+      const card = document.createElement('div'); card.className = 'summary-card';
+      const value = document.createElement('div'); value.className = 'summary-number'; value.textContent = number;
+      const caption = document.createElement('div'); caption.className = 'summary-label'; caption.textContent = label;
+      card.append(value, caption); grid.append(card);
+    }
+    detail.append(grid);
+    const list = document.createElement('div'); list.className = 'overview-list';
+    for (const root of roots) {
+      const control = button('', 'overview-button', () => selectNode(root.id));
+      const strong = document.createElement('strong'); strong.textContent = root.name;
+      const span = document.createElement('span'); span.textContent = root.explanation;
+      control.append(strong, span); list.append(control);
+    }
+    detail.append(list);
+  }
+  function renderNodeDetail(detail, nodeId) {
+    const node = nodeById.get(nodeId); setText('selection-kind', node.kind);
+    const title = document.createElement('h2'); title.className = 'right-title'; title.textContent = node.name; detail.append(title);
+    const files = filesForNode(nodeId);
+    const sub = document.createElement('p'); sub.className = 'right-sub'; sub.textContent = `${files.size} changed file${files.size === 1 ? '' : 's'} below this ${node.kind}`; detail.append(sub);
+    const prose = document.createElement('p'); prose.className = 'explanation'; prose.textContent = node.explanation; detail.append(prose);
+    const links = childLinksForNode(nodeId);
+    if (links.length) {
+      const heading = document.createElement('div'); heading.className = 'right-sub'; heading.textContent = 'Continue into'; detail.append(heading);
+      const list = document.createElement('div'); list.className = 'child-links';
+      for (const link of links) {
+        const control = button(link.label, 'link-button', () => link.kind === 'node' ? selectNode(link.id) : selectPath(link.id));
+        list.append(control);
+      }
+      detail.append(list);
+    }
+  }
+  function renderBreadcrumb(path, card) {
+    const crumb = document.createElement('div'); crumb.className = 'breadcrumb';
+    path.ancestorIds.forEach((nodeId, index) => {
+      if (index) { const sep = document.createElement('span'); sep.className = 'crumb-sep'; sep.textContent = '›'; crumb.append(sep); }
+      const node = nodeById.get(nodeId);
+      const control = button(node.name, 'crumb-button', () => selectNode(nodeId));
+      control.dataset.crumbNodeId = nodeId; crumb.append(control);
+    });
+    const sep = document.createElement('span'); sep.className = 'crumb-sep'; sep.textContent = '›'; crumb.append(sep);
+    const leaf = document.createElement('span'); leaf.textContent = path.filePath; crumb.append(leaf);
+    card.append(crumb);
+  }
+  function renderDiff(diff, scroll) {
+    if (scroll.dataset.rendered === 'true') return;
+    scroll.dataset.rendered = 'true';
+    const table = document.createElement('table'); table.className = 'diff-table';
+    const body = document.createElement('tbody');
+    const lines = diff.endsWith('\n') ? diff.slice(0, -1).split('\n') : diff.split('\n');
+    let oldLine = null, newLine = null;
+    for (const line of lines) {
+      const row = document.createElement('tr');
+      if (line.startsWith('@@')) {
+        row.className = 'diff-hunk';
+        const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+        if (match) { oldLine = Number(match[1]); newLine = Number(match[2]); }
+      } else if (line.startsWith('+') && !line.startsWith('+++')) row.className = 'diff-add';
+      else if (line.startsWith('-') && !line.startsWith('---')) row.className = 'diff-del';
+      else if (/^(diff --git|index |--- |\+\+\+ |new file mode|deleted file mode|old mode|new mode)/.test(line)) row.className = 'diff-meta';
+      let oldValue = '', newValue = '';
+      if (oldLine !== null && newLine !== null && !line.startsWith('@@')) {
+        if (line.startsWith('+') && !line.startsWith('+++')) { newValue = newLine++; }
+        else if (line.startsWith('-') && !line.startsWith('---')) { oldValue = oldLine++; }
+        else if (!line.startsWith('\\ No newline')) { oldValue = oldLine++; newValue = newLine++; }
+      }
+      for (const [value, extra] of [[oldValue, ''], [newValue, ' new']]) {
+        const cell = document.createElement('td'); cell.className = `line-no${extra}`; cell.textContent = value; row.append(cell);
+      }
+      const code = document.createElement('td'); code.className = 'line-code'; code.textContent = line; row.append(code);
+      body.append(row);
+    }
+    table.append(body); scroll.append(table);
+  }
+  function renderFileDetail(detail, filePath) {
+    const file = fileByPath.get(filePath); setText('selection-kind', 'File');
+    const title = document.createElement('h2'); title.className = 'right-title'; title.textContent = file.path; detail.append(title);
+    const sub = document.createElement('p'); sub.className = 'right-sub'; sub.append(statusBadge(file.status), document.createTextNode(file.status === 'A' ? ' Added file' : file.status === 'M' ? ' Modified file' : ' Deleted file')); detail.append(sub);
+    const paths = pathsForFile(filePath).sort((a, b) => a.ancestorIds.map(id => nodeById.get(id).name).join('\0').localeCompare(b.ancestorIds.map(id => nodeById.get(id).name).join('\0')));
+    const intro = document.createElement('p'); intro.className = 'explanation'; intro.textContent = `${paths.length} explanation path${paths.length === 1 ? '' : 's'} connect this file to the pull request. Each card describes the same raw diff through that path’s specific concern.`; detail.append(intro);
+    const cards = document.createElement('div'); cards.className = 'path-cards';
+    for (const path of paths) {
+      const card = document.createElement('article'); card.className = `path-card${state.selectedPath === path.id ? ' exact' : ''}`; card.dataset.cardPathId = path.id;
+      renderBreadcrumb(path, card);
+      const impact = document.createElement('p'); impact.className = 'impact'; impact.textContent = path.leafExplanation; card.append(impact); cards.append(card);
+    }
+    detail.append(cards);
+    const details = document.createElement('details'); details.className = 'diff-details'; details.open = state.diffOpen;
+    const summary = document.createElement('summary'); summary.className = 'diff-summary'; summary.textContent = `Unified diff · ${file.diff.split('\n').length - 1} lines`;
+    const scroll = document.createElement('div'); scroll.className = 'diff-scroll'; scroll.dataset.fileDiff = file.path;
+    details.append(summary, scroll); detail.append(details);
+    if (details.open) renderDiff(file.diff, scroll);
+    details.addEventListener('toggle', () => {
+      state.diffOpen = details.open; saveJSON(keys.diff, state.diffOpen);
+      if (details.open) renderDiff(file.diff, scroll);
+    });
+  }
+  function renderDetail() {
+    const detail = document.getElementById('detail'); detail.replaceChildren();
+    if (state.selectedFile) renderFileDetail(detail, state.selectedFile);
+    else if (state.selectedNode) renderNodeDetail(detail, state.selectedNode);
+    else renderOverview(detail);
+  }
+  function renderAll() { renderFileTree(); renderHierarchy(); renderDetail(); }
+
+  document.getElementById('show-all').addEventListener('click', () => selectOverview());
+  document.getElementById('path-search').addEventListener('input', event => { state.search = event.target.value; renderFileTree(); });
+  function restoreHash() {
+    const match = /^#(file|node|path):(.*)$/.exec(location.hash);
+    if (!match) { selectOverview(false); return; }
+    let value;
+    try { value = decodeURIComponent(match[2]); } catch { selectOverview(false); return; }
+    if (match[1] === 'node' && nodeById.has(value)) selectNode(value, false);
+    else if (match[1] === 'file' && fileByPath.has(value)) selectFile(value, null, false);
+    else if (match[1] === 'path' && pathById.has(value)) selectPath(value, false);
+    else selectOverview(false);
+  }
+  window.addEventListener('hashchange', restoreHash);
+  restoreHash();
+})();
+</script>
+</body>
+</html>
