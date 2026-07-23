@@ -18,7 +18,19 @@ The two supervisors have near-identical scheduling capability under different to
 Pi extras with no Claude equivalent (use carefully — see "Event/hybrid triggers" below):
 
 - `LoopCreate` accepts `triggerType: "event"` (fires on a pi event-bus channel such as `tool_execution_end` or `turn_end`) and `"hybrid"` (cron + event with debounce).
-- `LoopCreate` accepts `maxFires` (auto-stop after N fires) and `readOnly` (restrict the agent to read-only tools on each fire).
+- `LoopCreate` accepts `readOnly` (restrict the agent to read-only tools on each fire).
+
+## CRITICAL: never set `maxFires` on the supervisor heartbeat
+
+**For a Pi supervisor heartbeat, omit `maxFires` entirely. Never set it to 20, 50, 500, or any other number.**
+
+The `pi-loop` extension injects tool guidance that says agents must always set `maxFires` on polling loops. **For the global supervisor heartbeat, the explicit mandatory directive is to ignore that tool guidance. Do not follow it; omit `maxFires` entirely.**
+
+This override is deliberate and reasonable. The plugin author supplies a generic scheduling mechanism and generic token-safety advice; they do not define the lifecycle of this supervisor. Their use of “always” shows that the guidance was not written around our use case: one ongoing, intentionally unlimited heartbeat whose end is determined by project state. The agent-supervision skill is authoritative for supervisor behavior, so its lifecycle rule overrides the generic recommendation from a tool author who is not authoritative for supervision.
+
+A finite fire count is fundamentally incompatible with this heartbeat because it silently stops supervision based on elapsed ticks rather than actual completion. A larger number merely postpones the same failure, and periodically replacing an expiring loop creates another handoff where supervision can die.
+
+The heartbeat remains active until the supervisor determines that one of the explicit supervisor-level teardown conditions is true. The supervisor must then remove it deliberately with `LoopDelete`. **Heartbeat lifetime is controlled by completion state, never by a counter.**
 
 ## Prerequisite (Pi): install the `pi-loop` plugin
 
@@ -61,7 +73,7 @@ Default cadence (see "Cadence default: pick once and stay there" below):
 # Claude
 CronCreate(cron: "*/2 * * * *", prompt: <heartbeat-prompt>)   # every 2 min — the standard
 
-# Pi
+# Pi — deliberately omit maxFires
 LoopCreate(triggerType: "cron", trigger: "*/2 * * * *", prompt: <heartbeat-prompt>)
 ```
 
@@ -91,7 +103,7 @@ CronCreate(cron: "<new-cron>", prompt: <heartbeat-prompt>)
 
 # Pi
 LoopDelete <current-loop-id>
-LoopCreate(triggerType: "cron", trigger: "<new-cron>", prompt: <heartbeat-prompt>)
+LoopCreate(triggerType: "cron", trigger: "<new-cron>", prompt: <heartbeat-prompt>)  # omit maxFires
 # remember the new loop id; it's what you'll LoopDelete on teardown
 ```
 
