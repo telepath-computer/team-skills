@@ -42,7 +42,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # -- paths --------------------------------------------------------------------
 
-STATE_ROOT = Path.home() / ".agent-supervision"
+# AGENT_SUPERVISION_ROOT relocates all superv state (registry, cursors, notes,
+# heartbeats). Tests and throwaway supervision sandboxes point it at a temp
+# dir so they never touch the live registry.
+STATE_ROOT = Path(os.environ.get("AGENT_SUPERVISION_ROOT") or (Path.home() / ".agent-supervision"))
 WORKERS_DIR = STATE_ROOT / "workers"
 CURSORS_DIR = STATE_ROOT / "cursors"
 NOTES_DIR = STATE_ROOT / "notes"
@@ -403,27 +406,124 @@ def pi_path_key_for_cwd(cwd: str) -> str:
     return f"--{trimmed.replace('/', '-')}--"
 
 
-def pi_resolve_session(cwd: Optional[str], hint: Optional[str]) -> Path:
-    if hint:
-        p = Path(hint).expanduser()
-        if p.exists():
-            return p
-        if PI_SESSIONS_ROOT.exists():
-            matches = [c for c in PI_SESSIONS_ROOT.rglob("*.jsonl") if hint in c.name]
-            if len(matches) == 1:
-                return matches[0]
-            if len(matches) > 1:
-                raise ValueError(f"Ambiguous pi session hint '{hint}'")
-        raise ValueError(f"pi session not found: {hint}")
-    if not cwd:
-        raise ValueError("pi: need cwd to resolve session")
-    target_dir = PI_SESSIONS_ROOT / pi_path_key_for_cwd(cwd)
-    if not target_dir.exists():
-        raise ValueError(f"pi: no sessions dir for cwd {cwd}")
-    files = sorted(target_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        raise ValueError(f"pi: no jsonl files in {target_dir}")
-    return files[0]
+def pi_filename_session_id(path: Path) -> Optional[str]:
+    """Session id embedded in a pi session filename (<timestamp>_<id>.jsonl)."""
+    stem = path.stem
+    if "_" not in stem:
+        return None
+    return stem.split("_", 1)[1]
+
+
+def pi_read_session_header(path: Path) -> Optional[Dict[str, Any]]:
+    """First line of a pi session JSONL if it is a valid session header."""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            first = f.readline()
+        header = json.loads(first)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(header, dict) or header.get("type") != "session":
+        return None
+    return header
+
+
+def pi_find_sessions_by_id(session_id: str, session_dir: Optional[str] = None) -> List[Path]:
+    """All session files whose identity is exactly `session_id`.
+
+    Identity requires BOTH the filename-embedded id and the header id to equal
+    `session_id` — the glob alone would false-match ids that are suffixes of
+    other ids. Searches the flat `session_dir` when given (pi --session-dir),
+    else every project dir under the default sessions root.
+    """
+    if session_dir:
+        base = Path(session_dir).expanduser()
+        candidates = list(base.glob(f"*_{session_id}.jsonl")) if base.is_dir() else []
+    elif PI_SESSIONS_ROOT.is_dir():
+        candidates = list(PI_SESSIONS_ROOT.glob(f"*/*_{session_id}.jsonl"))
+    else:
+        candidates = []
+    out = []
+    for c in candidates:
+        if pi_filename_session_id(c) != session_id:
+            continue
+        header = pi_read_session_header(c)
+        if header is None or header.get("id") != session_id:
+            continue
+        out.append(c)
+    return sorted(out)
+
+
+def pi_candidate_lines(cwd: Optional[str], session_dir: Optional[str] = None) -> List[str]:
+    """Human-readable candidate list for fail-closed diagnostics (never auto-picked)."""
+    if session_dir:
+        d = Path(session_dir).expanduser()
+    elif cwd:
+        d = PI_SESSIONS_ROOT / pi_path_key_for_cwd(cwd)
+    else:
+        return []
+    if not d.is_dir():
+        return []
+    lines = []
+    for p in sorted(d.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True)[:10]:
+        age_min = (time.time() - p.stat().st_mtime) / 60
+        sid = pi_filename_session_id(p) or "?"
+        lines.append(f"    id={sid}  age={age_min:.1f}m  {p}")
+    return lines
+
+
+def pi_resolve_by_session_id(session_id: str, pane_cwd: Optional[str],
+                             session_dir: Optional[str] = None) -> Path:
+    """Resolve a session id to exactly one session file, or raise.
+
+    Never considers mtime. Ambiguity (the same id under several project dirs)
+    is resolved only by the pane's cwd matching the session header cwd.
+    """
+    matches = pi_find_sessions_by_id(session_id, session_dir)
+    if not matches:
+        where = f"session dir {session_dir}" if session_dir else f"sessions root {PI_SESSIONS_ROOT}"
+        raise ValueError(
+            f"no session file found for session id '{session_id}' under {where}\n"
+            f"  pi persists a session on its first assistant reply — a freshly launched worker\n"
+            f"  has no JSONL yet. Wait for the worker's first turn, then retry.\n"
+            f"  Also verify the id matches the one given to `pi --session-id` at launch\n"
+            f"  (or the uuid in `pi --session <uuid>` for a resumed worker)."
+        )
+    if len(matches) > 1:
+        if pane_cwd:
+            pane_real = os.path.realpath(pane_cwd)
+            cwd_matches = [
+                m for m in matches
+                if os.path.realpath(str((pi_read_session_header(m) or {}).get("cwd", ""))) == pane_real
+            ]
+            if len(cwd_matches) == 1:
+                return cwd_matches[0]
+        listing = "\n".join(f"    {m}" for m in matches)
+        raise ValueError(
+            f"session id '{session_id}' matches multiple session files:\n{listing}\n"
+            f"  pass --path <file> to pick one explicitly (or --session-dir to scope the search)"
+        )
+    match = matches[0]
+    if pane_cwd and not session_dir:
+        header_cwd = str((pi_read_session_header(match) or {}).get("cwd", ""))
+        if os.path.realpath(header_cwd) != os.path.realpath(pane_cwd):
+            raise ValueError(
+                f"session '{session_id}' belongs to cwd {header_cwd}, but the tmux pane is in {pane_cwd}\n"
+                f"  this usually means the wrong pane target was given, or the worker was launched\n"
+                f"  in a different directory. Verify the pane, or pass --path to override deliberately."
+            )
+    return match
+
+
+def find_record_bound_to(path: Path, exclude_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Registered worker already bound to this transcript, if any."""
+    real = os.path.realpath(str(path))
+    for rec in list_records():
+        if exclude_id is not None and rec.get("id") == exclude_id:
+            continue
+        other = (rec.get("persisted") or {}).get("path")
+        if other and os.path.realpath(str(other)) == real:
+            return rec
+    return None
 
 
 def pi_load_active(path: Path) -> List[Dict[str, Any]]:
@@ -560,11 +660,20 @@ class PiAdapter:
 
     @staticmethod
     def session_path(rec: Dict[str, Any]) -> Path:
+        # The registered path is the worker's identity. If the file is gone,
+        # fail loudly — re-resolving "some other file" here (e.g. by recency)
+        # would silently attach another agent's transcript.
         path = rec.get("persisted", {}).get("path")
         if path and Path(path).exists():
             return Path(path)
-        cwd = rec.get("persisted", {}).get("cwd") or rec.get("extra", {}).get("cwd")
-        return pi_resolve_session(cwd, None)
+        sid = rec.get("extra", {}).get("session_id")
+        raise ValueError(
+            f"registered session file is gone: {path or '(none recorded)'}\n"
+            f"  worker '{rec.get('id')}'"
+            + (f" was bound to session id '{sid}'" if sid else "")
+            + " — if the session still exists, re-register (or pass --path); "
+            "superv never re-binds by recency."
+        )
 
     @classmethod
     def read_persisted(cls, rec: Dict[str, Any], count: Optional[int] = None,
@@ -1638,6 +1747,10 @@ def cmd_register(args: argparse.Namespace) -> int:
             )
         if args.oc_session:
             raise ValueError(f"--oc-session is only valid for kind=opencode, not kind={args.kind}")
+        if args.kind != "pi" and (args.session_id or args.session_dir):
+            raise ValueError(
+                f"--session-id/--session-dir are only valid for kind=pi, not kind={args.kind}"
+            )
     elif args.kind == "opencode":
         if not args.oc_session:
             raise ValueError(
@@ -1647,6 +1760,8 @@ def cmd_register(args: argparse.Namespace) -> int:
             )
         if args.tmux:
             raise ValueError("--tmux is not valid for kind=opencode (opencode uses HTTP transport)")
+        if args.session_id or args.session_dir:
+            raise ValueError("--session-id/--session-dir are only valid for kind=pi")
 
     rec: Dict[str, Any] = {
         "id": args.id,
@@ -1701,20 +1816,72 @@ def cmd_register(args: argparse.Namespace) -> int:
                 rec["extra"]["session_id"] = sid
                 rec["persisted"] = {"type": "jsonl", "path": str(candidate), "cwd": cwd2}
         elif args.kind == "pi":
+            # Pi panes carry no recoverable session identity (pi rewrites its
+            # process title, erasing launch flags from /proc), and several pi
+            # agents may share one cwd, so the session file must be named
+            # explicitly — via the launch-seeded --session-id or via --path.
+            # Recency never decides; without an exact identity we fail closed.
             if args.path:
-                if not Path(args.path).exists():
+                p = Path(args.path).expanduser()
+                if not p.exists():
                     raise ValueError(f"--path does not exist: {args.path}")
-                rec["persisted"] = {"type": "jsonl", "path": args.path, "cwd": cwd}
-            else:
-                try:
-                    p = pi_resolve_session(cwd, None)
-                except ValueError as e:
+                header = pi_read_session_header(p)
+                if header is None:
                     raise ValueError(
-                        f"could not auto-resolve pi session for cwd={cwd}: {e}\n"
-                        f"  hint: send the worker at least one message so it writes its JSONL, then re-register;\n"
-                        f"  or pass --path /home/user/.pi/agent/sessions/<dir>/<file>.jsonl explicitly"
+                        f"--path is not a pi session file (first line must be a session header): {p}"
+                    )
+                header_id = header.get("id")
+                if args.session_id and header_id != args.session_id:
+                    raise ValueError(
+                        f"--path and --session-id disagree: {p} has session id '{header_id}', "
+                        f"not '{args.session_id}'"
+                    )
+                bound = find_record_bound_to(p)
+                if bound is not None:
+                    raise ValueError(
+                        f"session file {p} is already bound to registered worker '{bound.get('id')}'\n"
+                        f"  two supervision handles on one transcript means one of them is misbound.\n"
+                        f"  If '{bound.get('id')}' is stale, run: superv unregister {bound.get('id')}"
                     )
                 rec["persisted"] = {"type": "jsonl", "path": str(p), "cwd": cwd}
+                if args.session_dir:
+                    rec["persisted"]["session_dir"] = args.session_dir
+                if header_id:
+                    rec["extra"]["session_id"] = header_id
+            elif args.session_id:
+                p = pi_resolve_by_session_id(args.session_id, cwd, args.session_dir)
+                bound = find_record_bound_to(p)
+                if bound is not None:
+                    raise ValueError(
+                        f"session file {p} is already bound to registered worker '{bound.get('id')}'\n"
+                        f"  two supervision handles on one transcript means one of them is misbound.\n"
+                        f"  If '{bound.get('id')}' is stale, run: superv unregister {bound.get('id')}"
+                    )
+                rec["persisted"] = {"type": "jsonl", "path": str(p), "cwd": cwd}
+                if args.session_dir:
+                    rec["persisted"]["session_dir"] = args.session_dir
+                rec["extra"]["session_id"] = args.session_id
+            else:
+                candidates = pi_candidate_lines(cwd, args.session_dir)
+                candidate_block = (
+                    "  session files in the pane's cwd (NOT auto-selected):\n" + "\n".join(candidates) + "\n"
+                    if candidates else
+                    "  (no session files found in the pane's cwd session directory)\n"
+                )
+                raise ValueError(
+                    "pi registration needs an exact session identity: --session-id <id> or --path <file>\n"
+                    "  why: a pane's pi process cannot be matched to a session file after launch\n"
+                    "  (pi rewrites its process title, erasing launch flags), and picking the newest\n"
+                    "  JSONL misbinds whenever several pi agents share a cwd or a stale transcript\n"
+                    "  sits next to a fresh worker that has not flushed its file yet.\n"
+                    + candidate_block +
+                    "  remedies:\n"
+                    "    - launch workers with an explicit id:  pi --session-id <id> ...\n"
+                    "      then:  superv register <name> --kind pi --tmux <target> --session-id <id>\n"
+                    "    - for a worker resumed with `pi --session <uuid>`, register with --session-id <uuid>\n"
+                    "    - for an already-running worker without an id: run /session inside its TUI to see\n"
+                    "      its session file, then pass --path <file>"
+                )
         elif args.kind == "codex":
             if args.path:
                 if not Path(args.path).exists():
@@ -1859,6 +2026,9 @@ def extract_session_id(rec: Dict[str, Any]) -> str:
             return Path(path).stem
         raise ValueError("no claude session_id available (registry missing extra.session_id and persisted.path)")
     if kind == "pi":
+        sid = (rec.get("extra") or {}).get("session_id")
+        if sid:
+            return sid
         path = (rec.get("persisted") or {}).get("path") or ""
         stem = Path(path).stem
         if "_" in stem:
@@ -1895,7 +2065,15 @@ def build_resume_cmd(rec: Dict[str, Any], extra_flags: str = "") -> str:
             parts.extend(shlex.split(extra_flags))
         return " ".join(parts)
     if kind == "pi":
-        parts = ["pi", "--session", sid]
+        # A worker launched with a custom --session-dir keeps its session file
+        # outside pi's default lookup root, so resume must address the file by
+        # path (and re-supply --session-dir for consistent in-session behavior).
+        session_dir = (rec.get("persisted") or {}).get("session_dir")
+        if session_dir:
+            path = (rec.get("persisted") or {}).get("path") or ""
+            parts = ["pi", "--session", shlex.quote(path), "--session-dir", shlex.quote(session_dir)]
+        else:
+            parts = ["pi", "--session", sid]
         if base:
             parts.extend(base.split())
         if extra_flags:
@@ -2372,16 +2550,22 @@ state location: ~/.agent-supervision/{workers,cursors,notes,heartbeats}/
         description="Register a new worker. Fails if the id is already taken — unregister first to re-use an id. Auto-resolves session/transcript path from the transport.",
         epilog="""\
 required flags by kind:
-  --kind pi      requires --tmux T:W.P                (auto-resolves cwd → JSONL)
+  --kind pi      requires --tmux T:W.P and an exact session identity:
+                   --session-id <id>   the id the worker was launched with
+                                       (pi --session-id <id>, or the uuid in pi --session <uuid>)
+                   or --path <file>    explicit session JSONL
+                 pi sessions are never auto-resolved by recency — several pi agents may
+                 share one cwd, so registration fails closed without an exact identity.
   --kind claude  requires --tmux T:W.P                (auto-resolves PID → sessionId → JSONL)
   --kind codex   requires --tmux T:W.P                (auto-resolves cwd → rollout JSONL)
   --kind opencode requires --oc-session ses_...       (auto-resolves directory via http)
 
-if auto-resolution fails (e.g. JSONL doesn't exist yet), the command fails with a hint.
-pass --path explicitly to override.
+pi timing note: pi writes its session file on its first assistant reply. Registering
+--session-id before the worker's first turn fails with "no session file found ... yet";
+retry after the first turn (the triad launcher polls for this automatically).
 
 examples:
-  superv register tv-pi   --kind pi   --tmux 0:pi-worker.0
+  superv register tv-pi   --kind pi   --tmux 0:pi-worker.0 --session-id tv-pi-01983c
   superv register c-acp   --kind claude --tmux 0:claude.0
   superv register oc-impl --kind opencode --oc-session ses_29ab1c5e...
 """,
@@ -2391,6 +2575,8 @@ examples:
     sp.add_argument("--tmux", help="tmux target for tmux-backed kinds, e.g. 0:my-window.0")
     sp.add_argument("--oc-session", help="opencode session id, e.g. ses_29ab...; only valid for --kind opencode")
     sp.add_argument("--path", help="explicit session/JSONL path override (skips auto-resolution)")
+    sp.add_argument("--session-id", help="pi only: exact session id the worker was launched with (pi --session-id)")
+    sp.add_argument("--session-dir", help="pi only: custom session directory the worker was launched with (pi --session-dir)")
     sp.set_defaults(func=cmd_register)
 
     # name
