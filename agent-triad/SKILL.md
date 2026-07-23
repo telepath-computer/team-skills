@@ -157,8 +157,8 @@ Before launching agents:
 
 1. Call `superv name` to get the first available name.
 2. Create tmux window with that name (lowercase).
-3. Launch agent in the window.
-4. `superv register <name> --kind <kind> --tmux <session>:<name>.0`
+3. Launch agent in the window. **pi-kind agents must be launched with an explicit `--session-id`** (the `triad` CLI generates `<name>-<uuid>` automatically) — registration binds on that id and refuses to guess by recency, since several pi agents may share one worktree.
+4. `superv register <name> --kind <kind> --tmux <session>:<name>.0` — for pi, add `--session-id <the id from step 3>`.
 5. Repeat for the second agent.
 
 `superv register` will reject the name if another supervisor registered it between your `superv name` call and your register call — in that case, kill the unregistered orphan window and call `superv name` again for the next available. The `triad` CLI does this retry/cleanup automatically.
