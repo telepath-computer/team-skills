@@ -243,6 +243,8 @@ The tell: **if a worker needs a timer, or is waiting on another agent, supervisi
 
 **Never block your own turn waiting for a worker to reach a condition.** You already have a loop. Use it, and do not try to optimize around it.
 
+The explicitly opt-in experimental event-driven mode defines one narrow override in `supervisors/experimental-event-driven.md`: `superv await` may run through a host's background-command facility while a recurring heartbeat remains active as a monitoring backstop. That overlay does not permit a foreground wait that holds the supervisor's active turn open.
+
 This rule is about the *mechanism*, not any one tool. All of these are the same anti-pattern:
 
 - A `Monitor` script polling for a worker condition.

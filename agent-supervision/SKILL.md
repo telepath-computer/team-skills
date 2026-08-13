@@ -23,6 +23,8 @@ core.md  +  supervisors/<scheduled|polled>.md  +  workers/<worker>.md  +  (trans
 
 Worker docs declare their transports — the reader doesn't pick.
 
+When the user explicitly selects **experimental event-driven supervision**, add `supervisors/experimental-event-driven.md` after the ordinary composition chain. It is a narrow opt-in overlay; standard supervision does not load it.
+
 | You are supervising → | Claude | Pi | Codex | OpenCode |
 |---|---|---|---|---|
 | **As Claude or Pi** (scheduled) | + scheduled + workers/claude + transports/jsonl | + scheduled + workers/pi + transports/{tmux, jsonl} | + scheduled + workers/codex + transports/{tmux, jsonl} | + scheduled + workers/opencode + transports/http |
@@ -55,7 +57,9 @@ The chain:
    - `workers/<kind>.md` declares its transports at the top. Each transport is a separate file under `transports/`. Read each one declared.
    - Skip-cost: you send multi-line messages that get split into multiple submissions because you didn't read tmux paste-buffer behavior; you re-read full session histories to "get oriented" and destroy your context window because you didn't read JSONL cursor discipline.
 
-5. **Only then** allocate a name with `superv name`, launch the worker, and register with `superv register`, unless the only action being taken is the `triad up` exception described above.
+5. **If the user selected experimental event-driven supervision, read `supervisors/experimental-event-driven.md` in full.** Its await override applies only within that explicitly selected mode.
+
+6. **Only then** allocate a name with `superv name`, launch the worker, and register with `superv register`, unless the only action being taken is the `triad up` exception described above.
 
 ### Verification gate
 

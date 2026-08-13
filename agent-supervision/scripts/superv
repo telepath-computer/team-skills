@@ -14,6 +14,7 @@ Subcommands:
   send <id> "<msg>"            Send a message to the worker (any text, single or multi-line).
   send <id> --file <path>      Send a message read from a file (convenience).
   status <id>                  One-line state, context, and unread count.
+  await <id>                   Experimental: block until the worker needs attention.
   sweep [id ...]               Concise status plus latest intent across workers.
   note <id> "<obs>" --tag T    Append a timestamped tagged entry to the notes file.
   heartbeat <id> --bump|--reset|--teardown|--show
@@ -2275,6 +2276,216 @@ def adapter_for(rec: Dict[str, Any]):
     return ADAPTERS[kind]
 
 
+# -- experimental attention await --------------------------------------------
+
+def await_entries(rec: Dict[str, Any]) -> Tuple[Path, List[Dict[str, Any]]]:
+    """Current ordered event stream for file-backed experimental await."""
+    kind = rec.get("kind")
+    if kind == "pi":
+        path = PiAdapter.session_path(rec)
+        return path, pi_load_active(path)
+    if kind == "claude":
+        path = ClaudeAdapter.session_path(rec)
+        return path, claude_load_entries(path)
+    if kind == "codex":
+        path = CodexAdapter.session_path(rec)
+        return path, codex_load_entries(path)
+    if kind == "opencode":
+        raise ValueError(
+            "await is experimental and does not yet support opencode; its compaction event "
+            "shape must be established before it can safely act as an attention notifier"
+        )
+    raise ValueError(f"await: unsupported worker kind: {kind}")
+
+
+def await_event_kind(kind: str, entry: Dict[str, Any]) -> Optional[str]:
+    """Classify only structural attention events; never return message content."""
+    if kind == "pi":
+        if entry.get("type") == "compaction":
+            return "compaction"
+        if entry.get("type") != "message":
+            return None
+        msg = entry.get("message", {})
+        if msg.get("role") != "assistant":
+            return None
+        content = msg.get("content", [])
+        has_tool_call = any(
+            isinstance(block, dict) and block.get("type") == "toolCall"
+            for block in content if isinstance(content, list)
+        )
+        stop = str(msg.get("stopReason") or msg.get("stop_reason") or "").lower()
+        return None if has_tool_call or stop in {"tooluse", "tool_use", "tool-use"} else "idle"
+
+    if kind == "claude":
+        if entry.get("type") == "system" and entry.get("subtype") == "compact_boundary":
+            return "compaction"
+        if entry.get("type") != "assistant":
+            return None
+        msg = entry.get("message", {})
+        content = msg.get("content", [])
+        has_tool_use = any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content if isinstance(content, list)
+        )
+        stop = str(msg.get("stop_reason") or msg.get("stopReason") or "").lower()
+        return None if has_tool_use or stop in {"tool_use", "tooluse", "tool-use"} else "idle"
+
+    if kind == "codex":
+        payload = entry.get("payload", {})
+        ptype = payload.get("type") if isinstance(payload, dict) else None
+        if entry.get("type") == "compacted" or (
+            entry.get("type") == "event_msg" and ptype == "context_compacted"
+        ):
+            return "compaction"
+        if entry.get("type") == "event_msg" and ptype == "task_complete":
+            return "idle"
+    return None
+
+
+def await_turn_state(kind: str, entries: List[Dict[str, Any]]) -> str:
+    if kind == "pi":
+        return pi_turn_state_from_entries(entries)
+    if kind == "claude":
+        return claude_turn_state_from_entries(claude_visible(entries))
+    if kind == "codex":
+        # Only task lifecycle events are authoritative here. Codex may persist
+        # assistant prose and then continue into more calls before task_complete.
+        for entry in reversed(entries):
+            payload = entry.get("payload", {})
+            if entry.get("type") != "event_msg" or not isinstance(payload, dict):
+                continue
+            ptype = payload.get("type")
+            if ptype == "task_complete":
+                return "idle"
+            if ptype in {"task_started", "user_message"}:
+                return "busy"
+        return codex_turn_state_from_entries(entries)
+    return "unknown"
+
+
+def await_unresolved_compaction(kind: str, entries: List[Dict[str, Any]]) -> bool:
+    """A compaction after the last terminal turn still needs attention."""
+    last_compaction = -1
+    last_idle = -1
+    for index, entry in enumerate(entries):
+        event = await_event_kind(kind, entry)
+        if event == "compaction":
+            last_compaction = index
+        elif event == "idle":
+            last_idle = index
+    return last_compaction > last_idle
+
+
+def await_attention(worker_id: str, reason: str) -> None:
+    print(f"ATTENTION {worker_id}: {reason}", flush=True)
+    print(f"Run: superv watch {worker_id}", flush=True)
+
+
+def await_stable_snapshot(rec: Dict[str, Any]) -> Tuple[Path, List[Dict[str, Any]], os.stat_result]:
+    """Read a snapshot whose file identity and size stayed fixed while parsing."""
+    path, _ = await_entries(rec)
+    while True:
+        before = path.stat()
+        current_path, entries = await_entries(rec)
+        after = current_path.stat()
+        if current_path != path:
+            raise ValueError(f"registered transcript path changed from {path} to {current_path}")
+        before_key = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        after_key = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if before_key == after_key:
+            return path, entries, after
+
+
+def cmd_await(args: argparse.Namespace) -> int:
+    """One-shot experimental notifier for structural worker attention events."""
+    rec = load_record(args.id)
+    kind = rec.get("kind", "")
+    try:
+        path, entries, stat = await_stable_snapshot(rec)
+    except OSError as error:
+        await_attention(args.id, "STREAM RESYNC REQUIRED")
+        eprint(f"await: cannot establish transcript snapshot: {error}")
+        return 2
+
+    if await_unresolved_compaction(kind, entries):
+        await_attention(args.id, "COMPACTION")
+        return 0
+
+    turn = await_turn_state(kind, entries)
+    if turn == "idle":
+        await_attention(args.id, "IDLE")
+        return 0
+    if turn != "busy":
+        await_attention(args.id, "STREAM RESYNC REQUIRED")
+        eprint(f"await: worker turn state is {turn!r}; refusing to wait on an unknown premise")
+        return 2
+
+    identity = (stat.st_dev, stat.st_ino)
+    last_size = stat.st_size
+    baseline_count = len(entries)
+    baseline_pi_leaf = str(entries[-1].get("id")) if kind == "pi" and entries else None
+    poll_interval = float(os.environ.get("SUPERV_AWAIT_POLL_INTERVAL", "0.25"))
+    if poll_interval <= 0:
+        raise ValueError("SUPERV_AWAIT_POLL_INTERVAL must be positive")
+
+    # Printing only after the baseline is fixed makes this line an arming
+    # handshake for background-command hosts and tests.
+    print(f"AWAIT {args.id}: CURRENTLY BUSY — waiting until the worker needs attention.", flush=True)
+
+    while True:
+        time.sleep(poll_interval)
+        try:
+            current_stat = path.stat()
+        except OSError as error:
+            await_attention(args.id, "STREAM RESYNC REQUIRED")
+            eprint(f"await: transcript disappeared: {path}: {error}")
+            return 2
+        if (current_stat.st_dev, current_stat.st_ino) != identity or current_stat.st_size < last_size:
+            await_attention(args.id, "STREAM RESYNC REQUIRED")
+            eprint(f"await: transcript identity changed or shrank: {path}")
+            return 2
+        if current_stat.st_size == last_size:
+            continue
+
+        try:
+            _, current = await_entries(rec)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            await_attention(args.id, "STREAM RESYNC REQUIRED")
+            eprint(f"await: could not read updated transcript: {error}")
+            return 2
+
+        if kind == "pi":
+            ids = [str(entry.get("id")) for entry in current]
+            if baseline_pi_leaf is not None:
+                if baseline_pi_leaf not in ids:
+                    await_attention(args.id, "STREAM RESYNC REQUIRED")
+                    eprint("await: pi active branch no longer contains the armed leaf")
+                    return 2
+                start = ids.index(baseline_pi_leaf) + 1
+            else:
+                start = 0
+            new_entries = current[start:]
+        else:
+            if len(current) < baseline_count:
+                await_attention(args.id, "STREAM RESYNC REQUIRED")
+                eprint("await: transcript entry count decreased")
+                return 2
+            new_entries = current[baseline_count:]
+
+        events = [await_event_kind(kind, entry) for entry in new_entries]
+        if "compaction" in events:
+            await_attention(args.id, "COMPACTION")
+            return 0
+        if "idle" in events:
+            await_attention(args.id, "IDLE")
+            return 0
+
+        last_size = current_stat.st_size
+        baseline_count = len(current)
+        if kind == "pi" and current:
+            baseline_pi_leaf = str(current[-1].get("id"))
+
+
 # -- subcommands --------------------------------------------------------------
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -3388,6 +3599,7 @@ typical workflows:
   classify and observe:
     superv sweep                                  # route attention across every worker
     superv status my-worker
+    superv await my-worker                        # experimental one-shot attention wait
     superv watch my-worker
     superv watch my-worker --live                 # live channel only
     superv recent my-worker --kind messages       # query without moving cursor
@@ -3671,6 +3883,30 @@ typical use: status narrows the worker-level question; the global supervisor sti
     )
     sp.add_argument("id")
     sp.set_defaults(func=cmd_status)
+
+    # await (experimental)
+    sp = sub.add_parser(
+        "await",
+        help="experimental: block until a worker needs supervisory attention",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Experimental one-shot attention notifier. Exits when the worker is idle, compacts, or its persisted stream requires resynchronization. It never prints worker message content and never moves the watch cursor.",
+        epilog="""\
+experimental event-driven supervision:
+  Dispatch and verify work, then run this command through the supervisor host's
+  background-command facility. Its completion is an alert; always run `superv watch`
+  to interpret the authoritative persisted stream. Do not rearm while the worker is idle.
+
+attention events:
+  IDLE                    the worker reached a terminal turn, or was idle at startup
+  COMPACTION              a compaction boundary appeared; continuation is unpredictable
+  STREAM RESYNC REQUIRED  the stream changed identity, shrank, branched away, or is unknown
+
+currently supported: pi, claude, codex. OpenCode is rejected until its real
+compaction event shape is established.
+""",
+    )
+    sp.add_argument("id")
+    sp.set_defaults(func=cmd_await)
 
     # sweep
     sp = sub.add_parser(
