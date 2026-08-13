@@ -101,11 +101,20 @@ If you're not sure what your environment's subagent does, find out before using 
 
 Do not tear down when a worker, task, review, slice, or phase completes, or merely because all current workers are idle. Stop nudging completed workers and continue supervising the overall assignment.
 
-Tear down only when the supervisor's overall assignment is definitively complete, progress definitively requires user input, or the user explicitly says to stop:
+Apply the steady-state test before teardown. A steady-state no-action condition exists when another heartbeat, without user input or a new assignment, would only observe and report the same state because no legitimate supervisory action remains. A temporary wait for a worker, process, build, test, review, or other already-dispatched operation is not a steady state.
 
-1. `superv heartbeat <anchor-id> --teardown` — removes the instruction file.
+Tear down only when:
+
+1. The supervisor's overall assignment is definitively complete: no implementation, dispatch, validation, review, transition, reporting, or handoff work remains.
+2. Further progress definitively requires user input, the exact question, blocker, or handoff has been stated, and no other agent-owned work can proceed. This includes a ready PR awaiting owner review or merge and an escalated blocking issue that requires the user's input.
+3. The user explicitly says to stop.
+
+Then:
+
+1. Run `superv heartbeat <anchor-id> --teardown` to remove the instruction file.
 2. Stop running `sleep && cat`. Without a re-arm, the loop ends naturally.
 3. Record the overall outcome or user-input blocker when useful.
+4. If the user later supplies the required input or resumes work, recreate the canonical heartbeat.
 
 ## Why this works
 

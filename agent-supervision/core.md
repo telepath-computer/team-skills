@@ -12,6 +12,22 @@ There are three distinct modes, and you promote between them deliberately, not b
 
 Never silently mutate the worker's environment while remaining in supervise mode. That is the source of nearly every catastrophic supervision failure.
 
+## Action requires clarity in proportion to impact — avoid the twitchy throttle
+
+A twitchy throttle turns a small or ambiguous user signal into a larger action than the user authorized. Questions, observations, preferences, tentative language, and requests to discuss a change do not by themselves authorize implementation.
+
+Match the size and consequence of the action to the explicit instruction. When the user has not clearly authorized the specific action, describe what you propose and obtain approval before you:
+
+- edit shared policy or durable instructions;
+- commit or push;
+- dispatch, cancel, or redirect substantial work;
+- start paid or broad resource-intensive operations;
+- merge, open, close, or retarget a pull request;
+- create, delete, or materially change the supervision heartbeat;
+- discard, rewrite, or clean up existing work.
+
+A request to inspect, explain, propose, compare, or discuss means do that and stop at the discussion boundary. A compound prompt may express a desired direction while asking first for current state or options; answer that question and agree on the consequential next step before acting. Do not treat your own confidence about the likely next step as permission.
+
 ## Don't perturb — the absolute rule
 
 While the worker is active, do **not** in its repo or runtime:
@@ -44,7 +60,9 @@ Keep these concepts separate:
 - **Worker completion** means one worker's current assignment is done. Stop nudging that worker about the completed assignment, verify the result, and reassess the overall goal. Worker completion may lead to review, a new dispatch, a phase transition, or eventual supervisor completion; it never by itself tears down the supervisor heartbeat.
 - **Supervisor completion** means the supervisor's overall assignment is definitively complete. This is distinct from a worker, task, review, slice, or phase being complete.
 
-The supervisor heartbeat remains alive across worker handoffs, idle periods, reviews, and task or phase transitions. Remove it only when the supervisor's overall assignment is definitively complete, progress definitively requires user input, or the user explicitly says to stop. Waiting for another worker, process, build, test, or review is not waiting for user input.
+The supervisor heartbeat remains alive across worker handoffs, idle periods, reviews, and task or phase transitions while agent-owned progress can still occur. Tear it down when supervision reaches a **steady-state no-action condition**: another heartbeat, without user input or a new assignment, would only observe and report the same state because there is no legitimate supervisory action left to take.
+
+A temporary wait is not a steady state. Keep the heartbeat active while a worker, process, build, test, review, or other already-dispatched operation can still complete and create the next supervisory action. Tear it down when the overall assignment is definitively complete, when further progress definitively requires user input and the exact blocker or handoff has been stated, or when the user explicitly says to stop. If the user later resumes the assignment, create the canonical heartbeat again.
 
 ### Canonical supervisor-heartbeat prompt
 
@@ -284,13 +302,15 @@ A worker's current assignment is **complete** when:
 
 When a worker is complete, do not keep nudging it about completed work. Verify its claims, record the result when useful, and reassess the supervisor's overall assignment. You may dispatch follow-up work or a new assignment, but that is a new supervisory decision rather than a "continue" nudge.
 
+Apply the steady-state test before teardown: if another heartbeat could still dispatch, verify, review, transition, remediate, or report new agent-produced evidence, supervision is not finished.
+
 Tear down the supervisor heartbeat only when one of these is definitively true:
 
-1. The supervisor's overall assignment is complete.
-2. Further progress requires user input; state the exact question or blocker before stopping.
-3. The user explicitly told the supervisor to stop.
+1. **The supervisor's overall assignment is definitively complete.** All implementation, dispatch, validation, review, transition, reporting, and handoff work owned by the supervisor is finished. There is no more work to dispatch or verify, and further heartbeats would continually produce the same no-action completion report.
+2. **Further progress definitively requires user input.** State the exact question, blocker, or handoff before stopping. No worker or supervisor action can advance the assignment until the user acts, so further heartbeats would only poll for that action. Examples include a ready PR awaiting owner review or merge, a requested manual test, missing credentials or access, a consequential product decision, or an escalated blocking issue that requires the user's input. This is a stop condition only when no other agent-owned work can proceed.
+3. **The user explicitly told the supervisor to stop.**
 
-A worker, review, task, slice, or phase completing is not a heartbeat teardown condition. Neither is waiting for another agent, process, build, test, or review.
+A worker, review, task, slice, or phase completing is not by itself a heartbeat teardown condition. Neither is a temporary wait for another agent, process, build, test, or review. If the user later supplies the required input or resumes the assignment, create the canonical heartbeat again.
 
 ## Pause / resume — for tmux-backed workers (pi/claude/codex)
 
