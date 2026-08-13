@@ -3189,10 +3189,12 @@ def cmd_send(args: argparse.Namespace) -> int:
             "compaction can land on an already-compacted worker and discard the context it\n"
             "just rebuilt.\n"
             "\n"
-            "Send the post-compaction orientation message in this same turn and let the\n"
-            "worker's reply be the probe. The only direct observation of compaction is the\n"
-            "harness display itself:\n"
-            f"  tmux capture-pane -p -t <target>   # target: superv show {args.id}\n"
+            "CORRECT PROCEDURE:\n"
+            "  1. Send /compact once, and send the post-compaction orientation in the same turn.\n"
+            "  2. On each SUBSEQUENT heartbeat, check whether it finished by reading the harness\n"
+            "     display. This is the normal validation step, not a last resort:\n"
+            f"       tmux capture-pane -p -t <target>   # target: superv show {args.id}\n"
+            "  3. Never re-send /compact to find out whether the first one worked.\n"
         )
         return 0
 
