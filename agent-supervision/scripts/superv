@@ -3106,6 +3106,19 @@ def _snapshot_entry_ids(adapter, rec: Dict[str, Any]) -> set:
     return {e.id for e in entries}
 
 
+def _is_compaction_command(text: str) -> bool:
+    """True if the message is a harness compaction command rather than agent input.
+
+    Compaction is a runtime operation, not an agent turn: it produces no persisted
+    entry, so --verify's polling can never observe it. See send_cmd for why that
+    matters.
+    """
+    if not text:
+        return False
+    first = text.strip().splitlines()[0].strip() if text.strip() else ""
+    return first == "/compact" or first.startswith("/compact ")
+
+
 def _verify_send_landed(adapter, rec: Dict[str, Any], pre_ids: set, timeout_s: float = 6.0) -> bool:
     """Poll persisted history until a new entry id appears (signaling our send landed)."""
     deadline = time.time() + timeout_s
@@ -3152,10 +3165,36 @@ def cmd_send(args: argparse.Namespace) -> int:
         if not text.strip():
             raise ValueError(f"--file is empty: {path}")
         adapter.send(rec, text)
+        sent_text = text
         print(f"sent {len(text)} chars from {path} via {transport}.")
     else:
         adapter.send(rec, args.message)
+        sent_text = args.message
         print(f"sent via {transport}.")
+
+    if _is_compaction_command(sent_text):
+        print(
+            "\n"
+            + ("!! VERIFY SKIPPED — A COMPACTION COMMAND CANNOT BE VERIFIED THIS WAY. !!\n"
+               if args.verify else
+               "!! COMPACTION SENT — ITS COMPLETION CANNOT BE OBSERVED FROM SUPERV. !!\n")
+            + "\n"
+            "Compaction is a harness operation, not an agent turn. It writes no persisted\n"
+            "entry, so polling for one proves nothing: a worker that compacted successfully\n"
+            "and is now waiting looks exactly like one that never received the command.\n"
+            "The same is true of `ctx=`, `persisted_age` and `unread` in `superv status` —\n"
+            "all three are absences of output, and a healthy compacted worker produces them.\n"
+            "\n"
+            "DO NOT re-send /compact to find out whether the first one worked. A second\n"
+            "compaction can land on an already-compacted worker and discard the context it\n"
+            "just rebuilt.\n"
+            "\n"
+            "Send the post-compaction orientation message in this same turn and let the\n"
+            "worker's reply be the probe. The only direct observation of compaction is the\n"
+            "harness display itself:\n"
+            f"  tmux capture-pane -p -t <target>   # target: superv show {args.id}\n"
+        )
+        return 0
 
     if args.verify:
         landed = _verify_send_landed(adapter, rec, pre_ids, timeout_s=args.verify_timeout)
