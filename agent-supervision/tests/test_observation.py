@@ -113,7 +113,10 @@ class ObservationIntegrationTest(unittest.TestCase):
             if "INCOMPLETE OBSERVATION" not in result.stdout:
                 self.assertIn("OBSERVATION COMPLETE", result.stdout)
                 break
-            self.assertIn("You MUST run this command again", result.stdout)
+            self.assertRegex(result.stdout, r"INCOMPLETE OBSERVATION — \d+/\d+ unread entries shown; \d+ remain")
+            self.assertIn("Cursor advanced through shown entries only.", result.stdout)
+            self.assertIn("Run again: superv watch pi-worker", result.stdout)
+            self.assertIn("discards unread remainder", result.stdout)
         else:
             self.fail("overflow pagination never reached OBSERVATION COMPLETE")
 
@@ -147,37 +150,104 @@ class ObservationIntegrationTest(unittest.TestCase):
         cursor = json.loads((self.state / "cursors" / "pi-reset.json").read_text())
         self.assertEqual(cursor["last_entry_id"], "0000005a")
 
-    def write_claude_fixture(self):
+    def test_pi_detailed_watch_uses_resolvable_locators_without_protocol_ids(self):
+        path = self.root / "pi-detailed.jsonl"
+        ids = [f"12345678-{number}111-4111-8111-{number * 111111111111:012d}" for number in range(1, 6)]
+        tool_ids = [
+            "toolu_01ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ONE",
+            "toolu_01ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789TWO",
+        ]
+        entries = [
+            {"type": "session", "version": 3, "id": "pi-detailed",
+             "timestamp": "2026-08-10T00:00:00Z", "cwd": str(self.root)},
+            {"type": "message", "id": ids[0], "parentId": None, "timestamp": "2026-08-10T00:00:01Z",
+             "message": {"role": "user", "content": [{"type": "text", "text": "Inspect the renderer."}]}},
+            {"type": "message", "id": ids[1], "parentId": ids[0], "timestamp": "2026-08-10T00:00:02Z",
+             "message": {"role": "assistant", "stopReason": "toolUse", "content": [
+                 {"type": "toolCall", "id": tool_ids[0], "name": "read", "arguments": {"path": "/tmp/a"}},
+                 {"type": "toolCall", "id": tool_ids[1], "name": "bash", "arguments": {"command": "python3 focused.py"}},
+             ]}},
+            {"type": "message", "id": ids[2], "parentId": ids[1], "timestamp": "2026-08-10T00:00:03Z",
+             "message": {"role": "toolResult", "toolCallId": tool_ids[0], "toolName": "read",
+                         "content": [{"type": "text", "text": "source"}], "isError": False}},
+            {"type": "message", "id": ids[3], "parentId": ids[2], "timestamp": "2026-08-10T00:00:04Z",
+             "message": {"role": "toolResult", "toolCallId": tool_ids[1], "toolName": "bash",
+                         "content": [{"type": "text", "text": "focused failure"}], "isError": True}},
+            {"type": "message", "id": ids[4], "parentId": ids[3], "timestamp": "2026-08-10T00:00:05Z",
+             "message": {"role": "assistant", "stopReason": "length",
+                         "content": [{"type": "text", "text": "Partial response"}]}},
+        ]
+        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+        self.register_path("pi-detailed", "pi", path, session_id="pi-detailed")
+
+        result = self.run_superv("watch", "pi-detailed", "--count", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("id=12345678-2", result.stdout)
+        self.assertIn("read path=\"/tmp/a\" [12345678-2/tool/1]", result.stdout)
+        self.assertIn("id=12345678-3 tool=read for=12345678-2/tool/1", result.stdout)
+        self.assertIn("[result ERROR] 00:00:04", result.stdout)
+        self.assertIn("focused failure", result.stdout)
+        self.assertIn("stop: length", result.stdout)
+        self.assertNotIn("stopReason", result.stdout)
+        self.assertNotIn("stop: toolUse", result.stdout)
+        for protocol_id in ids + tool_ids:
+            self.assertNotIn(protocol_id, result.stdout)
+
+        detail = self.run_superv("detail", "pi-detailed", "12345678-2/tool/1")
+        self.assertEqual(detail.returncode, 0, detail.stderr)
+        self.assertIn('"path": "/tmp/a"', detail.stdout)
+        result_detail = self.run_superv("detail", "pi-detailed", "12345678-3")
+        self.assertEqual(result_detail.returncode, 0, result_detail.stderr)
+        self.assertIn("source", result_detail.stdout)
+
+    def write_claude_fixture(self, long_result=True):
         path = self.root / "claude.jsonl"
         shared = "aaaaaaaa"
         ids = [shared + "-1111-4111-8111-111111111111", shared + "-2222-4222-8222-222222222222"]
+        tool_ids = [
+            "toolu_01ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ONE",
+            "toolu_01ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789TWO",
+        ]
+        first_result = "x" * (100_000 if long_result else 80)
         entries = [
             {"type": "assistant", "uuid": ids[0], "timestamp": "2026-08-10T01:00:00Z",
              "message": {"role": "assistant", "stop_reason": "tool_use",
                          "usage": {"input_tokens": 100000, "cache_read_input_tokens": 20000,
                                    "cache_creation_input_tokens": 30000}, "content": [
                  {"type": "thinking", "thinking": "", "signature": "opaque"},
-                 {"type": "tool_use", "id": "tool-a", "name": "Read", "input": {"file_path": "/tmp/a"}},
-                 {"type": "tool_use", "id": "tool-b", "name": "Grep", "input": {"pattern": "ledger"}},
+                 {"type": "tool_use", "id": tool_ids[0], "name": "Read", "input": {"file_path": "/tmp/a"}},
+                 {"type": "tool_use", "id": tool_ids[1], "name": "Grep", "input": {"pattern": "ledger"}},
              ]}},
             {"type": "user", "uuid": ids[1], "timestamp": "2026-08-10T01:00:01Z",
              "message": {"role": "user", "content": [
-                 {"type": "tool_result", "tool_use_id": "tool-a", "content": "x" * 100_000},
-                 {"type": "tool_result", "tool_use_id": "tool-b", "content": "found ledger"},
+                 {"type": "tool_result", "tool_use_id": tool_ids[0], "content": first_result},
+                 {"type": "tool_result", "tool_use_id": tool_ids[1], "content": "found ledger"},
              ]}},
         ]
         path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
-        return path, ids
+        return path, ids, tool_ids
 
-    def test_claude_empty_thinking_is_hidden_and_multiple_tools_are_enumerated(self):
-        path, _ = self.write_claude_fixture()
+    def test_claude_detailed_watch_uses_resolvable_locators_without_protocol_ids(self):
+        path, ids, tool_ids = self.write_claude_fixture(long_result=False)
         self.register_path("claude-worker", "claude", path)
         result = self.run_superv("watch", "claude-worker", "--count", "2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("intent:", result.stdout)
-        self.assertEqual(result.stdout.count("toolUse:"), 2)
-        self.assertIn("Read", result.stdout)
-        self.assertIn("Grep", result.stdout)
+        self.assertEqual(result.stdout.count("  tool:"), 2)
+        self.assertIn("Read file_path=\"/tmp/a\" [aaaaaaaa-1/tool/1]", result.stdout)
+        self.assertIn("Grep pattern=\"ledger\" [aaaaaaaa-1/tool/2]", result.stdout)
+        self.assertIn("id=aaaaaaaa-2/result/1 for=aaaaaaaa-1/tool/1", result.stdout)
+        self.assertIn("found ledger", result.stdout)
+        self.assertNotIn("stopReason", result.stdout)
+        self.assertNotIn("stop: tool_use", result.stdout)
+        for protocol_id in ids + tool_ids:
+            self.assertNotIn(protocol_id, result.stdout)
+        detail = self.run_superv("detail", "claude-worker", "aaaaaaaa-1/tool/1")
+        self.assertEqual(detail.returncode, 0, detail.stderr)
+        self.assertIn('"file_path": "/tmp/a"', detail.stdout)
+        result_detail = self.run_superv("detail", "claude-worker", "aaaaaaaa-2/result/2")
+        self.assertEqual(result_detail.returncode, 0, result_detail.stderr)
+        self.assertIn("found ledger", result_detail.stdout)
 
     def test_claude_overflow_pages_advance_without_skipping_parallel_calls(self):
         path = self.root / "claude-overflow.jsonl"
@@ -204,8 +274,10 @@ class ObservationIntegrationTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             combined.append(result.stdout)
             if "INCOMPLETE OBSERVATION" not in result.stdout:
-                self.assertIn("OBSERVATION COMPLETE", result.stdout)
+                self.assertRegex(result.stdout, r"OBSERVATION COMPLETE — \d+/\d+ unread entries shown \(compact\); cursor advanced through all")
                 break
+            self.assertRegex(result.stdout, r"INCOMPLETE OBSERVATION — \d+/\d+ unread entries shown; \d+ remain")
+            self.assertIn("Run again: superv watch claude-pages", result.stdout)
         else:
             self.fail("claude overflow pagination never completed")
         output = "\n".join(combined)
@@ -215,20 +287,20 @@ class ObservationIntegrationTest(unittest.TestCase):
         self.assertEqual(cursor["last_entry_id"], entries[-1]["uuid"])
 
     def test_claude_ambiguous_prefix_fails_loudly(self):
-        path, _ = self.write_claude_fixture()
+        path, _, _ = self.write_claude_fixture()
         self.register_path("claude-detail", "claude", path)
         result = self.run_superv("detail", "claude-detail", "aaaaaaaa")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ambiguous claude entry id prefix", result.stderr)
 
     def test_claude_detail_is_bounded_and_omits_opaque_thinking_signature(self):
-        path, ids = self.write_claude_fixture()
+        path, ids, _ = self.write_claude_fixture()
         self.register_path("claude-bounded", "claude", path)
-        result = self.run_superv("detail", "claude-bounded", ids[0])
+        result = self.run_superv("detail", "claude-bounded", "aaaaaaaa-1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(len(result.stdout), 12_500)
         self.assertNotIn("opaque", result.stdout)
-        result2 = self.run_superv("detail", "claude-bounded", ids[1] + "/result/1")
+        result2 = self.run_superv("detail", "claude-bounded", "aaaaaaaa-2/result/1")
         self.assertEqual(result2.returncode, 0, result2.stderr)
         self.assertLess(len(result2.stdout), 12_500)
         self.assertIn("content shortened", result2.stdout)
@@ -317,7 +389,7 @@ class ObservationIntegrationTest(unittest.TestCase):
         self.assertEqual(pi_result.returncode, 0, pi_result.stderr)
         self.assertIn("unread=90", pi_result.stdout)
 
-        claude_path, ids = self.write_claude_fixture()
+        claude_path, ids, _ = self.write_claude_fixture()
         self.register_path("claude-unread", "claude", claude_path)
         self.set_cursor("claude-unread", {"session_path": str(claude_path), "last_entry_id": ids[0]})
         claude_result = self.run_superv("status", "claude-unread")
@@ -353,7 +425,7 @@ class ObservationIntegrationTest(unittest.TestCase):
         self.register_path("pi-sweep", "pi", path, session_id="pi-test")
         original = {"session_path": str(path), "last_entry_id": first_id}
         self.set_cursor("pi-sweep", original)
-        claude_path, _ = self.write_claude_fixture()
+        claude_path, _, _ = self.write_claude_fixture()
         self.register_path("claude-sweep", "claude", claude_path)
         result = self.run_superv("sweep")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -366,7 +438,7 @@ class ObservationIntegrationTest(unittest.TestCase):
         self.assertFalse((self.state / "cursors" / "claude-sweep.json").exists())
 
     def test_raw_detail_requires_explicit_double_override(self):
-        path, ids = self.write_claude_fixture()
+        path, ids, _ = self.write_claude_fixture()
         self.register_path("claude-raw", "claude", path)
         refused = self.run_superv("detail", "claude-raw", ids[0], "--raw")
         self.assertNotEqual(refused.returncode, 0)
