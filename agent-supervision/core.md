@@ -303,6 +303,22 @@ The supervisor's biggest risk is destroying its own context by ingesting the ful
 - **CRITICAL — do not substitute `tmux capture-pane` for `watch` on routine sweeps.** This is the single largest avoidable drain on a supervisor's context, it compounds every heartbeat, and it is invisible while it happens. Measured on a real session: `superv status` costs 66 bytes for an idle worker, `superv watch` with a current cursor costs **17** — literally `(no new entries)` — and `capture-pane` of the same idle worker costs **~3,600 bytes of identical, unchanged tail, every single time**. Across six workers on a two-minute heartbeat that is roughly 160k tokens an hour of pure duplication. The cursor exists precisely so an idle worker is nearly free to observe; a raw pane read throws that away and re-ingests the same screen.
 - **When `watch` prints a compact overview, follow its completion instruction — don't reach for the pane.** Every tool call remains visible on its own bounded line. If the output says `INCOMPLETE OBSERVATION`, run `superv watch <id>` again before judging the worker; the cursor advanced only through the entries shown. Repeat until it says `OBSERVATION COMPLETE`. A line ending in `…` has shortened content available through `superv detail <id> <locator>`. Use `superv watch <id> --reset --count N` only when deliberately discarding unread history to inspect a recent tail.
 - **`capture-pane` is for the live channel, not the transcript.** It is the right tool for the few things the persisted log cannot show: whether a compaction indicator is on screen, whether a sent message is sitting unconsumed in the steering queue, whether a retry is in progress. Reach for it deliberately for those, not as the default way to see what a worker is doing.
+- **Read the work product before reading the transcript.** When the supervised work lands in a
+  repository, `git log --oneline`, `git diff --shortstat` against the integration branch, and the
+  contents of committed working notes answer *where is everyone* exactly, for almost nothing. One pass
+  across four branches can tell you that one worker has already merged and run its verification, that
+  another acted on a correction you sent, and that a third has produced only a plan — none of which
+  the status verdict shows and all of which the transcript would cost thousands of tokens to extract.
+  **The transcript is where reasoning and false starts live; go there when the diff raises a question,
+  not to find out what happened.** This also means a broken, changing, or unavailable observation tool
+  never blinds you.
+
+- **A mechanical status verdict is cheap, not reliable.** Observed in one session: *running/busy*
+  reported for a worker sitting at an empty prompt; a context figure with no denominator, so a number
+  that looked unremarkable was 83% of the window; and a stale context figure carried across a
+  compaction, so a completed compaction read as a hang for several minutes. Use the verdict to decide
+  **who to look at**, then look. Never build a conclusion on it alone.
+
 - **Truncation defaults are tuned for survival.** Use bounded `superv detail <id> <locator>` when one overview line needs inspection. Unbounded JSON requires the deliberate `--raw --force` double override.
 - **Notes file is outside the repo.** So the worker doesn't read your meta-commentary about it.
 
