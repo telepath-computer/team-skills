@@ -99,13 +99,7 @@ NAME_POOL = [
 HEARTBEAT_START = 30
 HEARTBEAT_STEP = 30
 HEARTBEAT_CAP = 240
-CANONICAL_HEARTBEAT_PROMPT = (
-    "You are a supervisor agent. Reassess the current project using conversation context and durable supervision state. "
-    "Observe and interpret whatever currently needs attention, then continue your supervisor duties as appropriate—wait, "
-    "nudge, correct, dispatch, review, transition, or escalate—following the agent-supervision skill. This heartbeat does not "
-    "define or limit task scope. Preserve this prompt in this generic form: do not rewrite it around a specific worker, task, "
-    "phase, or current state. Keep project details in conversation, session files, or supervision notes rather than this prompt."
-)
+CANONICAL_HEARTBEAT_PROMPT = "Heartbeat: perform your supervision duties if applicable in this moment."
 
 
 # -- utilities ----------------------------------------------------------------

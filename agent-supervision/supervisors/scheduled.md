@@ -63,7 +63,7 @@ If you do use the one-shot re-arm path, you must state the re-arm explicitly in 
 
 ## Canonical loop prompt
 
-Use the canonical supervisor-heartbeat prompt from `core.md` **verbatim** — including its first line, which orders a full re-read of this skill into the current context window if it has not happened since the last compaction. **That line is not project state and is not optional; a loop prompt without it lets a compacted supervisor run indefinitely on a summary of the manual instead of the manual.** It is intentionally generic and already tells future fires to preserve it in that form. Do not rewrite, replace, or enrich it with a worker ID, task goal, phase name, current constraint, notes path, teardown rule, or status snapshot. The loop prompt is only a self-nudge to resume dynamic supervisor duties; conversation context and durable supervision state carry the work.
+Use the canonical supervisor-heartbeat prompt from `core.md` verbatim. It is only a self-nudge; procedures and current state remain in conversation context and their durable authorities.
 
 There is one scheduled loop for the supervisor's overall assignment, not one loop per worker, task, review, slice, or phase. Recreating it at ordinary workflow boundaries introduces a handoff where supervision can silently stop.
 
