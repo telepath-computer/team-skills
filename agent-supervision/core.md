@@ -294,6 +294,38 @@ The submission must contain no prefix, suffix, explanation, or follow-up instruc
 
 The same boundary applies to other host-level slash commands: model prose cannot operate the TUI that contains the model.
 
+## Send a post-compaction orientation message — in the same turn as the compact
+
+**A compacted worker comes back at an empty prompt with a summary of its history and no reliable sense
+of what it is doing now.** It does not come back neutral: it fills the gap with whatever the remaining
+evidence suggests. Observed failures include a worker returning convinced it was the supervisor, and a
+worker about to resume implementing while a dozen remediation items sat unread in its own notes.
+
+**Write the orientation message in the same turn as the `/compact`, not the next cycle.** A queued
+message waits harmlessly; an unwritten one does not get written. Treating it as later work has left
+workers sitting at empty prompts for many minutes while the mechanical status verdict reported them
+busy — invisible unless the supervisor looks past the verdict.
+
+**What it contains:**
+
+- **Who the worker is and what its role is**, stated plainly, including the boundaries — it is not the
+  supervisor, it does not contact other workers, it does not pace itself.
+- **The assignment**, and where the work lives: branch, worktree, the commit its work is banked at.
+- **What phase it is in.** This is the highest-value line and the easiest to omit. "Mid-remediation
+  with N items in your notes" and "starting implementation" produce completely different next actions
+  from the same worker, and the evidence in a half-finished tree looks the same either way.
+- **Anything it discovered before compacting that is written nowhere it will look.** Facts recorded
+  only in the lost conversation are the part a summary reliably drops.
+- **A pointer to its own durable notes, with the instruction to read them rather than trust
+  recollection.** Its notes are the state; its memory is not.
+
+**Keep it short and make it pointers.** The orientation is not a re-briefing: it says where the worker
+is and what to read, not what the work means.
+
+**The corollary for how work should be arranged**: if a worker's memory is load-bearing, compaction is
+dangerous and orientation cannot fix it. Durable task state on disk, commits pushed as they are made,
+and briefs re-seeded from files are what make both compaction and replacement cheap.
+
 ## Context budget — cursor discipline
 
 The supervisor's biggest risk is destroying its own context by ingesting the full contents of the worker's session.
