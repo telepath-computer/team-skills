@@ -123,15 +123,15 @@ Busy/idle comes from rollout turn-state (`superv status <id>` prints `turn=busy|
 - `type=response_item` with `payload.type` ∈ {`message`, `reasoning`, `function_call`, `function_call_output`}.
 - `type=turn_context` — turn metadata (cwd, approval policy).
 
-Display surface: user messages (`event_msg.user_message` and `response_item.message` with role=user), assistant messages (`response_item.message` role=assistant, content array of `output_text`), tool calls (`response_item.function_call`), tool outputs (`response_item.function_call_output`). Reasoning is skipped by default (analogous to Claude's `thinking`).
+Display surface: user and assistant messages; the function, custom-tool, local-shell, and web-search call/output families; compaction markers; and readable plaintext reasoning summaries as `intent` lines. Empty or opaque reasoning payloads are omitted.
 
 ## 6b. Measure context fill
 
-`superv status <id>` prints `ctx=Nk/Mk(P%)` for Codex — both the prompt token count and the percentage of the model's context window consumed. Codex's JSONL conveniently includes both numbers, so you get the percentage automatically (Claude and Pi only get raw tokens because their JSONLs don't include the model window).
+`superv status <id>` prints the unread-entry count plus `ctx=Nk/Mk(P%)` for Codex. The rollout JSONL includes both the prompt token count and model context window, so the percentage needs no registration-time cache.
 
 ```
 $ superv status codex-worker
-id=codex-worker kind=codex status=running turn=busy persisted_age=0.4m ctx=25k/258k(10%)
+id=codex-worker kind=codex status=running turn=busy persisted_age=0.4m unread=3 ctx=25k/258k(10%)
 ```
 
 Internally that reads the most recent `event_msg` of `payload.type=token_count`:

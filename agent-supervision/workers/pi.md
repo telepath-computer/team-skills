@@ -114,28 +114,20 @@ Busy/idle comes from transcript turn-state in the JSONL (`superv status <id>` pr
 
 Entry types displayed: `message`, `model_change`, `thinking_level_change`, `compaction`, `branch_summary`, `session_info`, `custom_message`, `label`. Within a `message`, roles include `user`, `assistant`, `toolResult`, `bashExecution`, `custom`.
 
-`superv detail <id> <entry-or-toolcall-id>` shows full content.
+`superv detail <id> <entry-or-toolcall-id>` shows bounded supervisor-oriented content. Use the explicit `--raw --force` double override only when the persisted JSON itself is necessary.
 
 ## 7. Context-window observation and `/compact`
 
-`superv status <id>` prints `ctx=Nk` — the prompt token count for the most recent assistant turn (the next turn's prompt size). Use it for context-pressure decisions.
+`superv status <id>` reports the exact unread-entry count and the most recent prompt size against the active model's context window. Use the percentage for context-pressure decisions and `unread` to decide which workers need `watch` during a sweep.
 
 ```
 $ superv status dave
-id=dave kind=pi status=running turn=busy persisted_age=0.5m ctx=271k
+id=dave kind=pi status=running turn=busy persisted_age=0.5m unread=14 ctx=143k/272k(52%)
 ```
 
-Internally that reads `input + cacheRead` from the most recent assistant turn's `message.usage` block in the JSONL (verified additive: `totalTokens = input + cacheRead + output`).
+The prompt size is `input + cacheRead` from the most recent assistant turn's `message.usage` block in the JSONL (verified additive: `totalTokens = input + cacheRead + output`). The same persisted history identifies the current provider and model. `superv` resolves that model's `contextWindow` from Pi's local model registry on every status read, so a model change or compaction is reflected without capturing the pane or re-registering the worker.
 
-Pi's JSONL doesn't include the model context window, but Pi's TUI status bar does. `superv register --kind pi` parses the `46.8%/1.0M` fragment from a tmux capture and caches the window in the registry — so subsequent `superv status` calls show the percentage automatically:
-
-```
-↑11M ↓1.2M R806M $255.445 (sub) 46.8%/1.0M (auto)                                                       (openai-codex) gpt-5.4 • medium
-$ superv status dave
-id=dave kind=pi status=running turn=busy persisted_age=0.5m ctx=271k/1000k(27%)
-```
-
-If Pi switches model mid-session to one with a different window (`/model`), the cached value goes stale until you re-register. If the parse fails at register (status bar not yet rendered, unusual layout), superv just stores no window and falls back to printing raw tokens.
+The tmux status bar remains a registration-time fallback for context-window metadata. If no denominator can be resolved, status says so explicitly, for example `ctx=143k/?`.
 
 ### Which regime applies to which model
 

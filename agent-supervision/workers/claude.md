@@ -133,15 +133,15 @@ The dim SGR (`2m`) is the reliable marker — `\e[0;2m` is "reset all attributes
 
 `superv watch <id>` (no `--live` flag) reads the JSONL via the Claude adapter. Entry types: `user`, `assistant`, `progress` (skipped), `file-history-snapshot` (skipped). Each entry is keyed by `uuid`, with `timestamp`, `message.role`, and `message.content` (an array of `text` / `tool_use` / `tool_result` blocks).
 
-`superv detail <id> <uuid-or-tool-id>` drills into one entry — full text, full tool args, full tool result.
+`superv detail <id> <uuid-or-tool-id>` renders bounded supervisor-oriented content for one entry or child. Unbounded persisted JSON requires both `--raw` and `--force`.
 
 ## 6b. Measure context fill
 
-`superv status <id>` prints `ctx=Nk` — the prompt token count for the most recent assistant turn, which is what the next turn will read. Use it for any decision keyed on context pressure (compaction staging, reflection cadence, etc.).
+`superv status <id>` reports the unread-entry count and the prompt token count for the most recent assistant turn, which is what the next turn will read. Use `unread` to route observation and `ctx` for decisions keyed on context pressure.
 
 ```
 $ superv status rover
-id=rover kind=claude status=running turn=busy persisted_age=0.5m ctx=405k
+id=rover kind=claude status=running turn=busy persisted_age=0.5m unread=7 ctx=405k/?
 ```
 
 Internally that reads `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` from the most recent assistant turn's `message.usage` block in the JSONL (those three fields are additive in the Claude schema). Equivalent to:
@@ -159,12 +159,12 @@ $ superv install-claude-statusline       # one-time per machine
 $ superv register rover --kind claude --tmux main:rover
    ... rec.extra.context_window_tokens = 1000000
 $ superv status rover
-id=rover kind=claude status=running turn=busy persisted_age=0.5m ctx=405k/1000k(41%)
+id=rover kind=claude status=running turn=busy persisted_age=0.5m unread=7 ctx=405k/1000k(41%)
 ```
 
 The install command refuses to overwrite an existing statusLine entry; pass `--force` to replace, or hand-edit `~/.claude/settings.json` to merge (the script needs to emit a `ctx:<n>k` fragment somewhere in its output for the parser to pick it up).
 
-If install isn't done, superv still works — it just prints raw tokens (`ctx=405k`) and the supervisor divides by the model's context size: 1M for 1M-context variants (Opus 4.7 1M), 200k for default Claude. Codex sessions get the percentage automatically because their JSONL includes `model_context_window` per turn; Claude's doesn't.
+If the context window was not captured during registration, status prints `ctx=405k/?` so the unknown denominator is explicit. Codex sessions carry `model_context_window` in each turn; Claude uses the cached registration value.
 
 **Do NOT use as fill:**
 - **tmux task-pane per-turn token numbers** (`↑ 32k tokens`, `↓ 19.9k tokens`). Those are per-turn input/output deltas for the active thinking burst, not cumulative session size. They are per-turn UI telemetry and consistently undershoot when read as fill.

@@ -19,6 +19,8 @@ superv watch <id>                       # incremental — entries past cursor
 superv watch <id> --reset               # discard cursor, re-bootstrap from recent tail
 superv watch <id> --full                # read from the start; cursor advances only through shown entries
 superv watch <id> --count N             # bootstrap tail, or oldest N unread with a cursor
+superv status <id>                      # includes the exact unread count when the cursor is valid
+superv sweep [id ...]                   # route attention without moving any cursor
 superv recent <id> --kind messages      # historical query; does not move cursor
 superv detail <id> <entry-or-tool-id>   # bounded content for one entry or child
 ```
@@ -91,3 +93,5 @@ Bounded supervisor-oriented content for one entry or child locator. It omits opa
 - Inspecting one tool call through a locator such as `<entry>/tool/1`.
 - Inspecting a tool result when verifying a worker claim.
 - Reading a persisted plaintext intent summary.
+
+Unbounded persisted JSON is available only through the explicit double override `superv detail <id> <locator> --raw --force`. Both flags are required so a routine detail lookup cannot accidentally inject a very large entry into the supervisor's context.

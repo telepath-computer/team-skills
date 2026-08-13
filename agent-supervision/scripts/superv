@@ -13,7 +13,8 @@ Subcommands:
   detail <id> <entry-id>       Bounded detail for one persisted entry.
   send <id> "<msg>"            Send a message to the worker (any text, single or multi-line).
   send <id> --file <path>      Send a message read from a file (convenience).
-  status <id>                  One-line mechanical classification: running/idle/stalled/broken.
+  status <id>                  One-line state, context, and unread count.
+  sweep [id ...]               Concise status plus latest intent across workers.
   note <id> "<obs>" --tag T    Append a timestamped tagged entry to the notes file.
   heartbeat <id> --bump|--reset|--teardown|--show
                                Manage the polled-supervisor heartbeat instruction file.
@@ -509,6 +510,33 @@ def render_overview(entries: List[Entry]) -> str:
     return "\n".join(e.render_overview() for e in entries)
 
 
+def latest_supervisory_marker(entries: List[Entry]) -> Optional[Tuple[str, str]]:
+    """Most recent readable intent or conversation text, excluding tool traffic."""
+    for entry in reversed(entries):
+        intents = [line for line in entry.overview if line.kind == "intent" and line.text]
+        if intents:
+            return "intent", intents[-1].text
+        messages = [line for line in entry.overview
+                    if line.kind in {"assistant", "user"} and line.text]
+        if messages:
+            return messages[-1].kind, messages[-1].text
+    return None
+
+
+def unread_after_id(cursor: Optional[Dict[str, Any]], *, identity_key: str,
+                    identity_value: str, last_key: str, ids: List[Any]) -> Optional[int]:
+    """Exact unread count for an id-addressed cursor, or None if it is stale."""
+    if cursor is None:
+        return len(ids)
+    if cursor.get(identity_key) != identity_value:
+        return None
+    try:
+        index = ids.index(cursor.get(last_key))
+    except ValueError:
+        return None
+    return len(ids) - index - 1
+
+
 # -- adapter: pi --------------------------------------------------------------
 
 def pi_path_key_for_cwd(cwd: str) -> str:
@@ -872,7 +900,8 @@ class PiAdapter:
         entries = pi_load_active(path)
         parent_target = target.split("/", 1)[0]
         ids = [str(entry.get("id")) for entry in entries if entry.get("id")]
-        parent_id = resolve_unique_prefix(ids, parent_target, "pi entry id") if "/" in target or parent_target in ids else None
+        parent_id = (resolve_unique_prefix(ids, parent_target, "pi entry id")
+                     if "/" in target or any(value.startswith(parent_target) for value in ids) else None)
         for entry in entries:
             eid = str(entry.get("id", "?"))
             if entry.get("type") == "message":
@@ -880,6 +909,11 @@ class PiAdapter:
                 content = msg.get("content", []) if isinstance(msg.get("content", []), list) else []
                 if parent_id == eid and "/" in target:
                     suffix = target[len(parent_target):]
+                    if msg.get("role") == "bashExecution":
+                        if suffix != "/tool/1":
+                            raise ValueError(f"pi child locator not found: {target}")
+                        command, cut = clip_overview(msg.get("command", ""), DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                        return f"[tool] id={target} name=bash\n  command: {command}" + ("\n  (command shortened)" if cut else "")
                     match = re.fullmatch(r"/(tool|thinking)/(\d+)", suffix)
                     if not match:
                         raise ValueError(f"invalid pi child locator: {target}")
@@ -911,6 +945,49 @@ class PiAdapter:
         raise ValueError(f"id not found on active branch: {target}")
 
     @classmethod
+    def raw_detail(cls, rec: Dict[str, Any], target: str) -> Any:
+        entries = pi_load_active(cls.session_path(rec))
+        ids = [str(entry.get("id")) for entry in entries if entry.get("id")]
+        parent_target = target.split("/", 1)[0]
+        parent_id = (resolve_unique_prefix(ids, parent_target, "pi entry id")
+                     if "/" in target or any(value.startswith(parent_target) for value in ids) else None)
+        for entry in entries:
+            eid = str(entry.get("id", "?"))
+            if parent_id == eid and "/" in target:
+                suffix = target[len(parent_target):]
+                match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+                if not match:
+                    raise ValueError(f"invalid pi child locator: {target}")
+                kind, number_text = match.groups()
+                msg = entry.get("message", {}) if entry.get("type") == "message" else {}
+                if msg.get("role") == "bashExecution":
+                    if kind == "tool" and number_text == "1":
+                        return {"type": "toolCall", "name": "bash", "command": msg.get("command", "")}
+                    if kind == "result" and number_text == "1":
+                        return {"type": "toolResult", "output": msg.get("output", ""),
+                                "exitCode": msg.get("exitCode")}
+                    raise ValueError(f"pi child locator not found: {target}")
+                content = msg.get("content", []) if isinstance(msg.get("content", []), list) else []
+                block_type = {"tool": "toolCall", "thinking": "thinking", "result": "toolResult"}[kind]
+                blocks = [block for block in content
+                          if isinstance(block, dict) and block.get("type") == block_type]
+                number = int(number_text)
+                if number < 1 or number > len(blocks):
+                    raise ValueError(f"pi child locator not found: {target}")
+                return blocks[number - 1]
+            if eid == parent_id and "/" not in target:
+                return entry
+            if entry.get("type") == "message":
+                msg = entry.get("message", {})
+                content = msg.get("content", []) if isinstance(msg.get("content", []), list) else []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "toolCall" and block.get("id") == target:
+                        return block
+                if msg.get("role") == "toolResult" and msg.get("toolCallId") == target:
+                    return entry
+        raise ValueError(f"id not found on active branch: {target}")
+
+    @classmethod
     def read_live(cls, rec: Dict[str, Any]) -> str:
         target = rec.get("live", {}).get("target")
         if not target:
@@ -927,43 +1004,55 @@ class PiAdapter:
     @classmethod
     def turn_state(cls, rec: Dict[str, Any]) -> str:
         try:
-            entries = pi_load_active(cls.session_path(rec))
+            return pi_turn_state_from_entries(pi_load_active(cls.session_path(rec)))
         except Exception:
             return "unknown"
-        for entry in reversed(entries):
-            if entry.get("type") != "message":
-                continue
-            msg = entry.get("message", {})
-            role = msg.get("role")
-            if role == "assistant":
-                content = msg.get("content", [])
-                has_tool_call = any(isinstance(b, dict) and b.get("type") == "toolCall" for b in content if isinstance(content, list))
-                stop = str(msg.get("stopReason") or msg.get("stop_reason") or "").lower()
-                if has_tool_call or stop in {"tooluse", "tool_use", "tool-use"}:
-                    return "busy"
-                return "idle"
-            if role in {"user", "toolResult", "bashExecution"}:
-                return "busy"
-            return "unknown"
-        return "unknown"
 
     @classmethod
     def status_signals(cls, rec: Dict[str, Any]) -> Dict[str, Any]:
         try:
             path = cls.session_path(rec)
-            mtime = path.stat().st_mtime
-            age = time.time() - mtime
+            age = time.time() - path.stat().st_mtime
+            active = pi_load_active(path)
+            visible = pi_displayable(active)
         except Exception:
-            path = None
-            age = float("inf")
-        ctx = pi_last_context_tokens(path) if path else None
-        window = pi_context_window_tokens(path) if path else None
+            return {
+                "turn": "unknown", "persisted_age_s": float("inf"),
+                "context_input_tokens": None, "context_window_tokens": None,
+                "unread_count": None, "latest_marker": None,
+            }
+        ids = [entry.get("id") for entry in visible]
+        unread = unread_after_id(load_cursor(rec["id"]), identity_key="session_path",
+                                 identity_value=str(path), last_key="last_entry_id", ids=ids)
+        recent = [pi_format(entry) for entry in visible[-50:]]
         return {
-            "turn": cls.turn_state(rec),
+            "turn": pi_turn_state_from_entries(active),
             "persisted_age_s": age,
-            "context_input_tokens": ctx,
-            "context_window_tokens": window,
+            "context_input_tokens": pi_last_context_tokens_from_entries(active),
+            "context_window_tokens": pi_context_window_tokens_from_entries(active),
+            "unread_count": unread,
+            "latest_marker": latest_supervisory_marker(recent),
         }
+
+
+def pi_turn_state_from_entries(entries: List[Dict[str, Any]]) -> str:
+    for entry in reversed(entries):
+        if entry.get("type") != "message":
+            continue
+        msg = entry.get("message", {})
+        role = msg.get("role")
+        if role == "assistant":
+            content = msg.get("content", [])
+            has_tool_call = any(
+                isinstance(block, dict) and block.get("type") == "toolCall"
+                for block in content if isinstance(content, list)
+            )
+            stop = str(msg.get("stopReason") or msg.get("stop_reason") or "").lower()
+            return "busy" if has_tool_call or stop in {"tooluse", "tool_use", "tool-use"} else "idle"
+        if role in {"user", "toolResult", "bashExecution"}:
+            return "busy"
+        return "unknown"
+    return "unknown"
 
 
 def _find_model_context_window(value: Any, provider: str, model: str,
@@ -994,12 +1083,7 @@ def _find_model_context_window(value: Any, provider: str, model: str,
     return None
 
 
-def pi_context_window_tokens(path: Path) -> Optional[int]:
-    """Current Pi model's context window from persisted model identity + local registry."""
-    try:
-        entries = pi_load_active(path)
-    except Exception:
-        return None
+def pi_context_window_tokens_from_entries(entries: List[Dict[str, Any]]) -> Optional[int]:
     provider = ""
     model = ""
     for entry in reversed(entries):
@@ -1026,20 +1110,11 @@ def pi_context_window_tokens(path: Path) -> Optional[int]:
     return None
 
 
-def pi_last_context_tokens(path: Path) -> Optional[int]:
-    """Most recent assistant turn's prompt token count.
-
-    Pi message.usage shape:
-      {"input": N, "output": M, "cacheRead": K, "cacheWrite": L, "totalTokens": ...}
-    Pi treats input and cacheRead as ADDITIVE (verified: totalTokens = input + cacheRead + output).
-    Total prompt = input + cacheRead.
-    Returns None when no usage block is found.
-    """
-    try:
-        entries = pi_load_active(path)
-    except Exception:
-        return None
+def pi_last_context_tokens_from_entries(entries: List[Dict[str, Any]]) -> Optional[int]:
+    """Pi prompt tokens are input plus cacheRead; cacheRead is additive."""
     for entry in reversed(entries):
+        if entry.get("type") == "compaction":
+            return None
         if entry.get("type") != "message":
             continue
         msg = entry.get("message", {})
@@ -1338,6 +1413,42 @@ class ClaudeAdapter:
         raise ValueError(f"id not found: {target}")
 
     @classmethod
+    def raw_detail(cls, rec, target):
+        entries = claude_visible(claude_load_entries(cls.session_path(rec)))
+        ids = [str(entry.get("uuid")) for entry in entries if entry.get("uuid")]
+        parent_target = target.split("/", 1)[0]
+        parent_id = (resolve_unique_prefix(ids, parent_target, "claude entry id")
+                     if "/" in target or any(value.startswith(parent_target) for value in ids) else None)
+        for entry in entries:
+            entry_id = str(entry.get("uuid", "?"))
+            msg = entry.get("message", {})
+            content = msg.get("content")
+            blocks = content if isinstance(content, list) else []
+            if parent_id == entry_id and "/" in target:
+                suffix = target[len(parent_target):]
+                match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+                if not match:
+                    raise ValueError(f"invalid claude child locator: {target}")
+                kind, number_text = match.groups()
+                block_type = {"tool": "tool_use", "thinking": "thinking", "result": "tool_result"}[kind]
+                selected = [block for block in blocks
+                            if isinstance(block, dict) and block.get("type") == block_type]
+                number = int(number_text)
+                if number < 1 or number > len(selected):
+                    raise ValueError(f"claude child locator not found: {target}")
+                return selected[number - 1]
+            if entry_id == parent_id and "/" not in target:
+                return entry
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use" and block.get("id") == target:
+                    return block
+                if block.get("type") == "tool_result" and block.get("tool_use_id") == target:
+                    return block
+        raise ValueError(f"id not found: {target}")
+
+    @classmethod
     def read_live(cls, rec):
         target = rec.get("live", {}).get("target")
         if not target:
@@ -1354,61 +1465,61 @@ class ClaudeAdapter:
     @classmethod
     def turn_state(cls, rec) -> str:
         try:
-            entries = claude_visible(claude_load_entries(cls.session_path(rec)))
+            return claude_turn_state_from_entries(claude_visible(claude_load_entries(cls.session_path(rec))))
         except Exception:
             return "unknown"
-        if not entries:
-            return "unknown"
-        last = entries[-1]
-        etype = last.get("type")
-        msg = last.get("message", {})
-        if etype == "assistant":
-            content = msg.get("content", [])
-            has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content if isinstance(content, list))
-            stop = str(msg.get("stop_reason") or msg.get("stopReason") or "").lower()
-            if has_tool_use or stop in {"tool_use", "tooluse", "tool-use"}:
-                return "busy"
-            return "idle"
-        if etype == "user":
-            return "busy"
-        return "unknown"
 
     @classmethod
     def status_signals(cls, rec):
         try:
             path = cls.session_path(rec)
             age = time.time() - path.stat().st_mtime
+            visible = claude_visible(claude_load_entries(path))
         except Exception:
-            path = None
-            age = float("inf")
-        ctx = claude_last_context_tokens(path) if path else None
-        return {"turn": cls.turn_state(rec), "persisted_age_s": age, "context_input_tokens": ctx}
+            return {
+                "turn": "unknown", "persisted_age_s": float("inf"),
+                "context_input_tokens": None, "unread_count": None, "latest_marker": None,
+            }
+        ids = [entry.get("uuid") for entry in visible]
+        unread = unread_after_id(load_cursor(rec["id"]), identity_key="session_path",
+                                 identity_value=str(path), last_key="last_entry_id", ids=ids)
+        recent = [claude_format(entry) for entry in visible[-50:]]
+        return {
+            "turn": claude_turn_state_from_entries(visible),
+            "persisted_age_s": age,
+            "context_input_tokens": claude_last_context_tokens_from_entries(visible),
+            "unread_count": unread,
+            "latest_marker": latest_supervisory_marker(recent),
+        }
 
 
-def claude_last_context_tokens(path: Path) -> Optional[int]:
-    """Most recent assistant turn's prompt token count.
-
-    Claude message.usage shape:
-      {"input_tokens": N, "cache_read_input_tokens": K, "cache_creation_input_tokens": L, "output_tokens": M}
-    Where input_tokens, cache_read_input_tokens, and cache_creation_input_tokens
-    are SEPARATE (additive). Total prompt = sum of the three.
-    Returns None when no usage block is found in the tail.
-    """
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 50000))
-            tail_lines = f.read().splitlines()
-    except Exception:
-        return None
-    for line in reversed(tail_lines):
-        if not line.strip():
+def claude_turn_state_from_entries(entries: List[Dict[str, Any]]) -> str:
+    for last in reversed(entries):
+        etype = last.get("type")
+        if etype == "system" and last.get("subtype") == "compact_boundary":
             continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
+        msg = last.get("message", {})
+        break
+    else:
+        return "unknown"
+    if etype == "assistant":
+        content = msg.get("content", [])
+        has_tool_use = any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content if isinstance(content, list)
+        )
+        stop = str(msg.get("stop_reason") or msg.get("stopReason") or "").lower()
+        return "busy" if has_tool_use or stop in {"tool_use", "tooluse", "tool-use"} else "idle"
+    if etype == "user":
+        return "busy"
+    return "unknown"
+
+
+def claude_last_context_tokens_from_entries(entries: List[Dict[str, Any]]) -> Optional[int]:
+    """Claude prompt tokens sum input, cache-read input, and cache-creation input."""
+    for obj in reversed(entries):
+        if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
+            return None
         usage = (obj.get("message") or {}).get("usage")
         if not isinstance(usage, dict):
             continue
@@ -1669,6 +1780,29 @@ class CodexAdapter:
         raise ValueError(f"id not found: {target}")
 
     @classmethod
+    def raw_detail(cls, rec, target):
+        entries = codex_load_entries(cls.session_path(rec))
+        raw_match = re.fullmatch(r"codex-r(\d+)", target)
+        if raw_match:
+            raw_index = int(raw_match.group(1))
+            if 0 <= raw_index < len(entries):
+                return entries[raw_index]
+        legacy_match = re.fullmatch(r"codex-(\d+)", target)
+        if legacy_match:
+            legacy = codex_visible_indexed(entries, legacy=True)
+            visible_index = int(legacy_match.group(1))
+            if 0 <= visible_index < len(legacy):
+                return legacy[visible_index][1]
+        matches = [entry for entry in entries
+                   if (entry.get("payload") or {}).get("call_id") == target
+                   or (entry.get("payload") or {}).get("id") == target]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return matches
+        raise ValueError(f"id not found: {target}")
+
+    @classmethod
     def read_live(cls, rec):
         target = rec.get("live", {}).get("target")
         if not target:
@@ -1684,80 +1818,94 @@ class CodexAdapter:
 
     @classmethod
     def turn_state(cls, rec) -> str:
-        # KNOWN-ISSUE (status accuracy, informational only): unrecognized entries are silently
-        # skipped, falling through to an older (often idle-looking) entry — response_item types
-        # local_shell_call / custom_tool_call / web_search_call have no branch, so a rollout that
-        # records shell work that way reads idle for the whole exec. Fix sketch: map the
-        # *_call/*_call_output families -> busy; return unknown for unrecognized response_item types.
         try:
-            entries = codex_load_entries(cls.session_path(rec))
+            return codex_turn_state_from_entries(codex_load_entries(cls.session_path(rec)))
         except Exception:
             return "unknown"
-        for last in reversed(entries):
-            payload = last.get("payload", {})
-            ptype = payload.get("type")
-            etype = last.get("type")
-            if etype in {"session_meta", "turn_context"} or ptype in {"token_count", "reasoning"}:
-                continue
-            if etype == "event_msg":
-                if ptype == "task_complete":
-                    return "idle"
-                if ptype in {"task_started", "user_message"}:
-                    return "busy"
-                if ptype == "agent_message":
-                    return "idle"
-                continue
-            if etype == "response_item":
-                if codex_is_call_type(ptype) or codex_is_output_type(ptype):
-                    return "busy"
-                if ptype == "message":
-                    role = payload.get("role")
-                    if role == "assistant":
-                        return "idle"
-                    if role == "user":
-                        return "busy"
-                    if role == "developer":
-                        continue
-                if ptype == "reasoning":
-                    return "busy"
-                return "unknown"
-        return "unknown"
 
     @classmethod
     def status_signals(cls, rec):
         try:
             path = cls.session_path(rec)
             age = time.time() - path.stat().st_mtime
+            raw_entries = codex_load_entries(path)
+            indexed = codex_visible_indexed(raw_entries)
         except Exception:
-            path = None
-            age = float("inf")
-        ctx, window = codex_last_context_tokens(path) if path else (None, None)
+            return {
+                "turn": "unknown", "persisted_age_s": float("inf"),
+                "context_input_tokens": None, "context_window_tokens": None,
+                "unread_count": None, "latest_marker": None,
+            }
+        cursor = load_cursor(rec["id"])
+        if cursor is None:
+            unread = len(indexed)
+        elif cursor.get("session_path") != str(path):
+            unread = None
+        else:
+            try:
+                if "last_raw_idx" in cursor:
+                    last_raw_idx = int(cursor.get("last_raw_idx", -1))
+                else:
+                    legacy = codex_visible_indexed(raw_entries, legacy=True)
+                    old_idx = int(cursor.get("last_idx", -1))
+                    last_raw_idx = legacy[old_idx][0] if 0 <= old_idx < len(legacy) else -1
+                unread = sum(raw_index > last_raw_idx for raw_index, _ in indexed)
+            except (TypeError, ValueError):
+                unread = None
+        recent = [codex_format(entry, raw_index) for raw_index, entry in indexed[-50:]]
+        ctx, window = codex_last_context_tokens_from_entries(raw_entries)
         return {
-            "turn": cls.turn_state(rec),
+            "turn": codex_turn_state_from_entries(raw_entries),
             "persisted_age_s": age,
             "context_input_tokens": ctx,
             "context_window_tokens": window,
+            "unread_count": unread,
+            "latest_marker": latest_supervisory_marker(recent),
         }
 
 
-def codex_last_context_tokens(path: Path) -> Tuple[Optional[int], Optional[int]]:
-    """Return (last-turn input token count, model context window) from the
-    most recent token_count event in the JSONL.
+def codex_turn_state_from_entries(entries: List[Dict[str, Any]]) -> str:
+    for last in reversed(entries):
+        payload = last.get("payload", {})
+        ptype = payload.get("type")
+        etype = last.get("type")
+        if etype in {"session_meta", "turn_context"} or ptype in {"token_count", "reasoning"}:
+            continue
+        if etype == "event_msg":
+            if ptype == "task_complete":
+                return "idle"
+            if ptype in {"task_started", "user_message"}:
+                return "busy"
+            if ptype == "agent_message":
+                return "idle"
+            continue
+        if etype == "response_item":
+            if codex_is_call_type(ptype) or codex_is_output_type(ptype):
+                return "busy"
+            if ptype == "message":
+                role = payload.get("role")
+                if role == "assistant":
+                    return "idle"
+                if role == "user":
+                    return "busy"
+                if role == "developer":
+                    continue
+            if ptype == "reasoning":
+                return "busy"
+            return "unknown"
+    return "unknown"
 
-    Codex emits event_msg entries of type token_count with:
-      info.last_token_usage.input_tokens     — most recent prompt size
-      info.total_token_usage.input_tokens    — cumulative across turns
-      info.model_context_window              — model's context window
-    Codex semantics: input_tokens INCLUDES cached_input_tokens (subset, not additive).
-    """
-    try:
-        entries = codex_load_entries(path)
-    except Exception:
-        return (None, None)
+
+def codex_last_context_tokens_from_entries(entries: List[Dict[str, Any]]) -> Tuple[Optional[int], Optional[int]]:
+    """Codex input_tokens includes cached_input_tokens rather than adding it."""
     for entry in reversed(entries):
+        payload = entry.get("payload", {})
+        if entry.get("type") == "compacted" or (
+            entry.get("type") == "event_msg" and payload.get("type") == "context_compacted"
+        ):
+            return (None, None)
         if entry.get("type") != "event_msg":
             continue
-        payload = entry.get("payload", {})
         if payload.get("type") != "token_count":
             continue
         info = payload.get("info", {})
@@ -1859,6 +2007,35 @@ class OpenCodeAdapter:
         return f"[{kind}] id={target}\n  {shown}" + (f"\n  ({kind} content shortened)" if cut else "")
 
     @classmethod
+    def raw_detail(cls, rec, target):
+        sid = cls.session_id(rec)
+        messages = http_get(f"/session/{sid}/message", directory=cls.directory(rec))
+        ids = [str(message.get("id") or message.get("info", {}).get("id") or f"oc-{index}")
+               for index, message in enumerate(messages)]
+        parent_target = target.split("/", 1)[0]
+        parent_id = resolve_unique_prefix(ids, parent_target, "opencode message id")
+        message = messages[ids.index(parent_id)]
+        if "/" not in target:
+            return message
+        suffix = target[len(parent_target):]
+        match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+        if not match:
+            raise ValueError(f"invalid opencode child locator: {target}")
+        kind, number_text = match.groups()
+        part_type = {"tool": "tool", "thinking": "reasoning", "result": "tool"}[kind]
+        parts = [part for part in message.get("parts", [])
+                 if isinstance(part, dict) and part.get("type") == part_type]
+        if kind == "result":
+            parts = [part for part in parts if isinstance(part.get("state"), dict) and (
+                part["state"].get("output") is not None or part["state"].get("error") is not None or
+                part["state"].get("status") in {"completed", "done", "success", "error", "failed"}
+            )]
+        number = int(number_text)
+        if number < 1 or number > len(parts):
+            raise ValueError(f"opencode child locator not found: {target}")
+        return parts[number - 1]
+
+    @classmethod
     def read_live(cls, rec):
         try:
             status = http_get("/session/status", directory=cls.directory(rec))
@@ -1892,70 +2069,88 @@ class OpenCodeAdapter:
 
     @classmethod
     def turn_state(cls, rec) -> str:
-        # KNOWN-ISSUE (status accuracy, informational only — turn= drives no decisions):
-        # - ignores info.time.completed, so an in-flight assistant turn that has not yet
-        #   emitted a tool part (or is generating text after tools finished) reads idle mid-turn.
-        # - the part scan treats any errored tool in the final message as busy, so a session
-        #   whose last turn had one failed tool reads busy forever; 'error' should be terminal.
-        # Fix sketch: info.time.completed == null -> busy (primary); treat error states as terminal.
         try:
             sid = cls.session_id(rec)
             messages = http_get(f"/session/{sid}/message", directory=cls.directory(rec))
         except Exception:
             return "unknown"
-        if not isinstance(messages, list) or not messages:
-            return "unknown"
-        last = messages[-1]
-        info = last.get("info", last) if isinstance(last, dict) else {}
-        role = info.get("role")
-        if role == "user":
-            return "busy"
-        if role == "assistant":
-            time_info = info.get("time") if isinstance(info.get("time"), dict) else {}
-            if "completed" in time_info and time_info.get("completed") is None:
-                return "busy"
-            parts = last.get("parts", []) if isinstance(last, dict) else []
-            for part in parts if isinstance(parts, list) else []:
-                if part.get("type") != "tool":
-                    continue
-                state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
-                status = state.get("status")
-                if status and status not in {"completed", "done", "success", "error", "failed"}:
-                    return "busy"
-            return "idle"
-        return "unknown"
+        return oc_turn_state_from_messages(messages)
 
     @classmethod
     def status_signals(cls, rec):
         try:
             sid = cls.session_id(rec)
-            meta = http_get(f"/session/{sid}", directory=cls.directory(rec))
+            directory = cls.directory(rec)
+        except Exception:
+            return {
+                "turn": "unknown", "persisted_age_s": float("inf"),
+                "context_input_tokens": None, "unread_count": None, "latest_marker": None,
+            }
+        try:
+            messages = http_get(f"/session/{sid}/message", directory=directory)
+            if not isinstance(messages, list):
+                raise ValueError("opencode: unexpected /message response")
+        except Exception:
+            messages = None
+        try:
+            meta = http_get(f"/session/{sid}", directory=directory)
             updated_ms = (meta.get("time", {}) or {}).get("updated") or 0
             age = (time.time() - updated_ms / 1000) if updated_ms else float("inf")
         except Exception:
             age = float("inf")
-        ctx = oc_last_context_tokens(rec)
-        return {"turn": cls.turn_state(rec), "persisted_age_s": age, "context_input_tokens": ctx}
+        if messages is None:
+            return {
+                "turn": "unknown", "persisted_age_s": age, "context_input_tokens": None,
+                "unread_count": None, "latest_marker": None,
+            }
+        cursor = load_cursor(rec["id"])
+        if cursor is None:
+            unread = len(messages)
+        elif cursor.get("session_id") != sid:
+            unread = None
+        else:
+            try:
+                position = int(cursor.get("last_msg_count", 0))
+                unread = max(0, len(messages) - position) if position <= len(messages) else None
+            except (TypeError, ValueError):
+                unread = None
+        recent = [oc_format_message(message, index)
+                  for index, message in list(enumerate(messages))[-50:]]
+        return {
+            "turn": oc_turn_state_from_messages(messages),
+            "persisted_age_s": age,
+            "context_input_tokens": oc_last_context_tokens_from_messages(messages),
+            "unread_count": unread,
+            "latest_marker": latest_supervisory_marker(recent),
+        }
 
 
-def oc_last_context_tokens(rec: Dict[str, Any]) -> Optional[int]:
-    """Most recent assistant message's prompt token count.
+def oc_turn_state_from_messages(messages: Any) -> str:
+    if not isinstance(messages, list) or not messages:
+        return "unknown"
+    last = messages[-1]
+    info = last.get("info", last) if isinstance(last, dict) else {}
+    role = info.get("role")
+    if role == "user":
+        return "busy"
+    if role != "assistant":
+        return "unknown"
+    time_info = info.get("time") if isinstance(info.get("time"), dict) else {}
+    if "completed" in time_info and time_info.get("completed") is None:
+        return "busy"
+    parts = last.get("parts", []) if isinstance(last, dict) else []
+    for part in parts if isinstance(parts, list) else []:
+        if part.get("type") != "tool":
+            continue
+        state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
+        status = state.get("status")
+        if status and status not in {"completed", "done", "success", "error", "failed"}:
+            return "busy"
+    return "idle"
 
-    OpenCode message info.tokens shape:
-      {"total": N, "input": K, "output": M, "reasoning": R, "cache": {"read": C, "write": W}}
-    Verified additive: total = input + cache.read + output (cache.read is NOT a subset of input).
-    Total prompt = input + cache.read.
 
-    The model context window is available via /provider but it's expensive to call
-    on every status check (~3MB response, ~200ms), so we emit raw tokens. Look up
-    the window separately if you need a percentage.
-    """
-    try:
-        sid = OpenCodeAdapter.session_id(rec)
-        directory = OpenCodeAdapter.directory(rec)
-        messages = http_get(f"/session/{sid}/message", directory=directory)
-    except Exception:
-        return None
+def oc_last_context_tokens_from_messages(messages: Any) -> Optional[int]:
+    """OpenCode prompt tokens are input plus cache.read; cache.read is additive."""
     if not isinstance(messages, list):
         return None
     for m in reversed(messages):
@@ -2100,14 +2295,16 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def acquire_context_window(rec: Dict[str, Any]) -> Optional[int]:
-    """One-time per-kind context window acquisition.
+    """Registration-time context-window fallback.
 
-    Stashed in rec["extra"]["context_window_tokens"] at register time so cmd_status
-    can compute a percentage. Returns None if the window can't be determined; that's
-    not fatal — status falls back to printing raw token counts.
+    The value is stashed in rec["extra"]["context_window_tokens"]. Pi status
+    normally resolves the active model through persisted history and its local
+    model registry; this cache covers cases where that lookup is unavailable.
+    Other adapters use the cache as described below. An unresolved window is
+    not fatal: status prints an explicit unknown denominator.
 
     Per-kind sources:
-      pi:       tmux status bar (look for `46.8%/1.0M` style fragment)
+      pi:       tmux status bar (fallback; look for `46.8%/1.0M` style fragment)
       claude:   tmux status bar after the agent-supervision statusLine script is wired in
                 (look for `ctx:1000k` fragment); requires `superv install-claude-statusline`
       codex:    None — Codex publishes the window per turn in the JSONL token_count event,
@@ -2424,7 +2621,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         if ctx_window:
             rec["extra"]["context_window_tokens"] = ctx_window
     except Exception as e:
-        eprint(f"warning: context-window acquisition failed ({e!r}); status will report raw tokens only")
+        eprint(f"warning: context-window acquisition failed ({e!r}); status will report an unknown denominator")
 
     save_record(rec)
     print(json.dumps(rec, indent=2))
@@ -2838,7 +3035,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def cmd_detail(args: argparse.Namespace) -> int:
     rec = load_record(args.id)
     adapter = adapter_for(rec)
+    if args.raw != args.force:
+        raise ValueError("unbounded raw detail requires both --raw and --force")
     try:
+        if args.raw:
+            print(json.dumps(adapter.raw_detail(rec, args.entry_id), indent=2, ensure_ascii=False))
+            return 0
         rendered = adapter.detail(rec, args.entry_id)
         if len(rendered) <= MAX_RENDERED_CHARS:
             print(rendered)
@@ -2961,20 +3163,13 @@ def cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_status(args: argparse.Namespace) -> int:
-    rec = load_record(args.id)
-    adapter = adapter_for(rec)
-    sig = adapter.status_signals(rec)
-
+def status_line(rec: Dict[str, Any], sig: Dict[str, Any], *, include_latest: bool = False) -> str:
     turn = sig.get("turn", "unknown")
     age = sig.get("persisted_age_s", float("inf"))
     broken = sig.get("broken", False)
 
-    # KNOWN-ISSUE (status accuracy, informational only): an agent that dies mid-turn reads
-    # 'running' forever — a trailing user/tool entry never expires and tmux kinds never set
-    # 'broken' (nothing checks pane/process reachability here). Operator sees persisted_age
-    # climbing as the tell. Fix sketch: busy + persisted_age above a generous cap (~60 min,
-    # clears worst-case pi thinking) -> stalled; optionally a cheap tmux-target-exists check -> broken.
+    # A trailing busy entry can outlive a dead process. persisted_age remains
+    # visible so the supervisor can distinguish fresh work from that condition.
     if broken or turn == "unknown":
         verdict = "broken"
     elif turn == "busy":
@@ -2986,18 +3181,17 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     age_min = age / 60 if age != float("inf") else None
     age_str = f"{age_min:.1f}m" if age_min is not None else "?"
-
+    unread = sig.get("unread_count")
     parts = [
-        f"id={args.id}",
+        f"id={rec['id']}",
         f"kind={rec['kind']}",
         f"status={verdict}",
         f"turn={turn}",
         f"persisted_age={age_str}",
+        f"unread={unread if unread is not None else '?'}",
     ]
 
     ctx_tokens = sig.get("context_input_tokens")
-    # Prefer per-status window from adapter (Codex), else fall back to cached
-    # one-time acquisition stashed at register time.
     ctx_window = sig.get("context_window_tokens") or rec.get("extra", {}).get("context_window_tokens")
     if ctx_tokens:
         if ctx_window:
@@ -3006,8 +3200,34 @@ def cmd_status(args: argparse.Namespace) -> int:
         else:
             parts.append(f"ctx={ctx_tokens / 1000:.0f}k/?")
 
-    print(" ".join(parts))
+    if include_latest and sig.get("latest_marker"):
+        kind, text = sig["latest_marker"]
+        shown, _ = clip_overview(text, 140)
+        parts.append(f"latest_{kind}={json.dumps(shown, ensure_ascii=False)}")
+    return " ".join(parts)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    rec = load_record(args.id)
+    print(status_line(rec, adapter_for(rec).status_signals(rec)))
     return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Concise routing view across registered workers; never moves cursors."""
+    records = [load_record(worker_id) for worker_id in args.ids] if args.ids else list_records()
+    if not records:
+        print("(no registered workers)")
+        return 0
+    failed = False
+    for rec in records:
+        try:
+            print(status_line(rec, adapter_for(rec).status_signals(rec), include_latest=True))
+        except Exception as error:
+            failed = True
+            message, _ = clip_overview(str(error), 180, preserve_tail=True)
+            print(f"id={rec.get('id', '?')} kind={rec.get('kind', '?')} status=broken unread=? error={json.dumps(message)}")
+    return 1 if failed else 0
 
 
 def cmd_note(args: argparse.Namespace) -> int:
@@ -3109,6 +3329,7 @@ typical workflows:
     superv send my-worker --file /tmp/long-instruction.md
 
   classify and observe:
+    superv sweep                                  # route attention across every worker
     superv status my-worker
     superv watch my-worker
     superv watch my-worker --live                 # live channel only
@@ -3322,20 +3543,23 @@ examples:
         description="Show supervisor-oriented content for one persisted entry while omitting opaque signatures and bounding large text, tool arguments, and results.",
         epilog="""\
 entry-id formats:
-  pi      entry uuid (from watch output 'id=...') OR toolCallId
-  claude  entry uuid OR tool_use id OR tool_use_id
-  codex   the codex-N index from watch output, OR a call_id
-  opencode message id (msg_...)
+  pi       entry id, toolCallId, or displayed child locator
+  claude   unique entry prefix, tool id, or displayed child locator
+  codex    codex-rN from watch output, legacy codex-N, or a call_id
+  opencode unique message prefix or displayed child locator
 
 examples:
   superv detail tv-pi a6ca92b7
   superv detail tv-pi a6ca92b7/tool/1
   superv detail c-acp tool_01ABC
   superv detail c1 codex-r12
+  superv detail c1 codex-r12 --raw --force   # explicit unbounded JSON override
 """,
     )
     sp.add_argument("id")
     sp.add_argument("entry_id", help="entry id, tool call id, or worker-specific identifier from watch output")
+    sp.add_argument("--raw", action="store_true", help="print the persisted JSON object; requires --force")
+    sp.add_argument("--force", action="store_true", help="confirm unbounded raw output; requires --raw")
     sp.set_defaults(func=cmd_detail)
 
     # send
@@ -3390,6 +3614,15 @@ typical use: status narrows the worker-level question; the global supervisor sti
     )
     sp.add_argument("id")
     sp.set_defaults(func=cmd_status)
+
+    # sweep
+    sp = sub.add_parser(
+        "sweep",
+        help="concise status, unread count, context, and latest intent across workers",
+        description="Route attention across all registered workers, or the worker ids supplied. This reads persisted state without moving any watch cursor.",
+    )
+    sp.add_argument("ids", nargs="*", help="worker ids (default: all registered workers)")
+    sp.set_defaults(func=cmd_sweep)
 
     # note
     sp = sub.add_parser(
