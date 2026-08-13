@@ -1,6 +1,6 @@
 ---
 name: agent-supervision
-description: Supervise another coding agent — Claude Code, Pi, Codex, or OpenCode — running in a tmux pane, separate process, or HTTP port. Use when one agent is observing, nudging, or unblocking another agent's work. Covers all (supervisor × worker) combinations across the four supported agent kinds. Includes a unified `superv` CLI that handles registration, observation, message sending, status classification, notes, and heartbeats.
+description: LOAD ONLY WHEN A USER DIRECTLY TELLS YOU TO — never automatically, never on your own initiative. This skill does not add a capability, it replaces your role. Loading it narrows you to supervision and nothing else — you observe, nudge, route and unblock other agents, and you do not author code, review code, or carry any other duty. It is a highly specialized role and a supervisor has no other job. Do not load it because you are curious what another agent is doing. If you are a worker in a multi-agent system and are tempted to watch your peers, this is not your skill and it will derail you into acting as a supervisor — tell your own supervisor instead. It is also not about sub-agents inside your own harness. For a user-appointed supervisor it covers all (supervisor × worker) combinations across Claude Code, Pi, Codex and OpenCode in tmux panes, separate processes or HTTP ports, and includes the `superv` CLI for registration, observation, message sending, status classification, notes and heartbeats.
 ---
 
 # Agent Supervision
