@@ -9,7 +9,8 @@ Subcommands:
   unregister <id>              Remove a registry entry (cursor and notes are kept).
   watch <id>                   Incremental view of new persisted entries since cursor.
   watch <id> --live            Live-state probe (tmux pane / http /session/status).
-  detail <id> <entry-id>       Full content for one persisted entry.
+  recent <id>                  Non-mutating recent messages/tools/errors query.
+  detail <id> <entry-id>       Bounded detail for one persisted entry.
   send <id> "<msg>"            Send a message to the worker (any text, single or multi-line).
   send <id> --file <path>      Send a message read from a file (convenience).
   status <id>                  One-line mechanical classification: running/idle/stalled/broken.
@@ -55,6 +56,8 @@ TMUX_CURSORS_DIR = STATE_ROOT / "tmux-cursors"
 TMUX_LOCK_FILE = STATE_ROOT / "tmux.lock"
 
 PI_SESSIONS_ROOT = Path.home() / ".pi" / "agent" / "sessions"
+PI_MODELS_PATH = Path.home() / ".pi" / "agent" / "models.json"
+PI_MODELS_STORE_PATH = Path.home() / ".pi" / "agent" / "models-store.json"
 CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 CLAUDE_PID_META_DIR = Path.home() / ".claude" / "sessions"
 CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
@@ -69,6 +72,16 @@ TEXT_TRUNC = 4000
 RECENT_COUNT_DEFAULT = 6
 MAX_RENDERED_CHARS = 12000
 ESTABLISHED_THRESHOLD = 20  # entries; cursor required beyond this on bootstrap
+
+# Compact-overview budgets apply after whitespace normalization. Source line
+# breaks never decide what survives: a persisted line may be one word or many
+# thousands of characters.
+OVERVIEW_TEXT_TRUNC = 420
+OVERVIEW_INTENT_TRUNC = 220
+OVERVIEW_TOOL_TRUNC = 160
+OVERVIEW_RESULT_TRUNC = 180
+DETAIL_COMPONENT_TRUNC = 8000
+LOCATOR_PREFIX_MIN = 8
 
 # -- name pool ----------------------------------------------------------------
 
@@ -117,6 +130,69 @@ def trunc(text: str, limit: int) -> str:
 
 def single_line(text: str, limit: int) -> str:
     return trunc(str(text).replace("\n", "\\n"), limit)
+
+
+def normalize_whitespace(text: Any) -> str:
+    """Turn arbitrary persisted text into one readable display line."""
+    return re.sub(r"\s+", " ", "" if text is None else str(text)).strip()
+
+
+def clip_overview(text: Any, limit: int, *, preserve_tail: bool = False) -> Tuple[str, bool]:
+    """Character-wise clipping for compact overview lines.
+
+    Assistant prose and tool results preserve a small tail because conclusions
+    and errors often appear there. Tool-call arguments favor the leading text,
+    which identifies the command, path, pattern, query, or URL.
+    """
+    value = normalize_whitespace(text)
+    if len(value) <= limit:
+        return value, False
+    if limit <= 1:
+        return "…", True
+    if preserve_tail and limit >= 24:
+        tail = max(12, limit // 4)
+        head = limit - tail - 1
+        return f"{value[:head].rstrip()}…{value[-tail:].lstrip()}", True
+    return f"{value[:limit - 1].rstrip()}…", True
+
+
+def reasoning_labels(text: Any) -> List[str]:
+    """Readable plaintext intent labels from a persisted reasoning summary."""
+    raw = "" if text is None else str(text)
+    labels = []
+    for part in re.split(r"\n\s*\n", raw):
+        value = normalize_whitespace(part)
+        if value.startswith("**") and value.endswith("**") and len(value) >= 4:
+            value = value[2:-2].strip()
+        if value:
+            labels.append(value)
+    return labels
+
+
+def unique_prefixes(values: List[str], minimum: int = LOCATOR_PREFIX_MIN) -> Dict[str, str]:
+    """Shortest prefixes that uniquely identify each value in this collection."""
+    strings = [str(value) for value in values if value]
+    out: Dict[str, str] = {}
+    for value in strings:
+        size = min(len(value), minimum)
+        while size < len(value) and sum(other.startswith(value[:size]) for other in strings) > 1:
+            size += 1
+        out[value] = value[:size]
+    return out
+
+
+def resolve_unique_prefix(values: List[str], target: str, label: str = "id") -> str:
+    if target in values:
+        return target
+    matches = [value for value in values if value.startswith(target)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"{label} not found: {target}")
+    prefixes = unique_prefixes(matches)
+    choices = ", ".join(prefixes[value] for value in matches[:12])
+    suffix = " …" if len(matches) > 12 else ""
+    raise ValueError(f"ambiguous {label} prefix '{target}'; use one of: {choices}{suffix}")
 
 
 def fmt_ts(ts: Any) -> str:
@@ -379,24 +455,58 @@ def http_post(path: str, body: Dict[str, Any], directory: str = "/", timeout: in
 
 # -- adapters base ------------------------------------------------------------
 
-class Entry:
-    """Uniform rendered entry shape returned by adapters."""
+class OverviewLine:
+    """One bounded line in an overflow overview."""
 
-    def __init__(self, eid: str, ts: str, kind: str, header: str, body: str = ""):
+    def __init__(self, locator: str, ts: str, kind: str, text: Any = "", *,
+                 limit: int = OVERVIEW_TEXT_TRUNC, preserve_tail: bool = False):
+        self.locator = locator
+        self.ts = ts
+        self.kind = kind
+        self.text, self.truncated = clip_overview(text, limit, preserve_tail=preserve_tail)
+
+    def render(self) -> str:
+        suffix = f" {self.text}" if self.text else ""
+        return f"{self.ts} {self.locator} {self.kind}{suffix}"
+
+
+class Entry:
+    """Uniform rendered entry shape returned by adapters.
+
+    One persisted entry may contain several overview lines. In particular,
+    every tool call remains individually visible rather than being replaced by
+    an activity count.
+    """
+
+    def __init__(self, eid: str, ts: str, kind: str, header: str, body: str = "",
+                 overview: Optional[List[OverviewLine]] = None,
+                 cursor_after: Optional[Dict[str, Any]] = None):
         self.id = eid
         self.ts = ts
         self.kind = kind
         self.header = header
         self.body = body
+        self.overview = overview or [OverviewLine(eid, ts, kind, body or header)]
+        self.cursor_after = cursor_after
 
     def render(self) -> str:
         if self.body:
             return f"{self.header}\n{self.body}"
         return self.header
 
+    def render_overview(self) -> str:
+        return "\n".join(line.render() for line in self.overview)
+
+    def overview_was_truncated(self) -> bool:
+        return any(line.truncated for line in self.overview)
+
 
 def render_entries(entries: List[Entry]) -> str:
     return "\n\n".join(e.render() for e in entries)
+
+
+def render_overview(entries: List[Entry]) -> str:
+    return "\n".join(e.render_overview() for e in entries)
 
 
 # -- adapter: pi --------------------------------------------------------------
@@ -528,7 +638,18 @@ def find_record_bound_to(path: Path, exclude_id: Optional[str] = None) -> Option
 
 def pi_load_active(path: Path) -> List[Dict[str, Any]]:
     lines = path.read_text(encoding="utf-8").splitlines()
-    parsed = [json.loads(line) for line in lines if line.strip()]
+    parsed = []
+    nonempty = [(index, line) for index, line in enumerate(lines) if line.strip()]
+    for position, (line_index, line) in enumerate(nonempty):
+        try:
+            parsed.append(json.loads(line))
+        except json.JSONDecodeError:
+            if position == len(nonempty) - 1:
+                # The worker may be in the middle of appending its final JSONL
+                # record. Ignore only that incomplete tail; malformed history
+                # elsewhere remains a loud error.
+                continue
+            raise ValueError(f"malformed pi session JSONL at line {line_index + 1}: {path}")
     if not parsed or parsed[0].get("type") != "session":
         raise ValueError(f"not a pi session file: {path}")
     entries = parsed[1:]
@@ -603,56 +724,97 @@ def pi_preview_args(args: Any, limit: int) -> str:
 
 def pi_format(entry: Dict[str, Any]) -> Entry:
     etype = entry.get("type")
-    eid = entry.get("id", "?")
+    eid = str(entry.get("id", "?"))
     ts = fmt_ts(entry.get("timestamp"))
     if etype != "message":
         if etype == "model_change":
-            return Entry(eid, ts, etype, f"[model] {ts} id={eid} {entry.get('provider', '?')}/{entry.get('modelId', '?')}")
+            model = f"{entry.get('provider', '?')}/{entry.get('modelId', '?')}"
+            return Entry(eid, ts, etype, f"[model] {ts} id={eid} {model}",
+                         overview=[OverviewLine(eid, ts, "model", model, limit=OVERVIEW_TOOL_TRUNC)])
         if etype == "compaction":
-            return Entry(eid, ts, etype, f"[compaction] {ts} id={eid}", "  " + single_line(entry.get("summary", ""), RESULT_TRUNC))
+            before = entry.get("tokensBefore")
+            text = f"from={before / 1000:.0f}k tokens" if isinstance(before, (int, float)) else "conversation compacted"
+            if entry.get("fromHook"):
+                text += " automatically"
+            return Entry(eid, ts, etype, f"[compaction] {ts} id={eid} {text}",
+                         overview=[OverviewLine(eid, ts, "compaction", text, limit=OVERVIEW_TOOL_TRUNC)])
         if etype == "branch_summary":
-            return Entry(eid, ts, etype, f"[branch-summary] {ts} id={eid} from={entry.get('fromId', '?')}", "  " + single_line(entry.get("summary", ""), RESULT_TRUNC))
-        return Entry(eid, ts, etype, f"[{etype}] {ts} id={eid}")
+            text = f"from={entry.get('fromId', '?')}"
+            return Entry(eid, ts, etype, f"[branch-summary] {ts} id={eid} {text}",
+                         overview=[OverviewLine(eid, ts, "branch-summary", text, limit=OVERVIEW_TOOL_TRUNC)])
+        return Entry(eid, ts, etype, f"[{etype}] {ts} id={eid}",
+                     overview=[OverviewLine(eid, ts, str(etype), "", limit=OVERVIEW_TOOL_TRUNC)])
 
     msg = entry.get("message", {})
     role = msg.get("role", "?")
     if role == "user":
         text = pi_stringify(msg.get("content", ""))
         body = "\n".join("    " + line for line in trunc(text, TEXT_TRUNC).splitlines() or [""])
-        return Entry(eid, ts, "user", f"[user] {ts} id={eid}", "  text:\n" + body)
+        return Entry(eid, ts, "user", f"[user] {ts} id={eid}", "  text:\n" + body,
+                     overview=[OverviewLine(eid, ts, "user", text, preserve_tail=True)])
     if role == "assistant":
         content = msg.get("content", [])
         text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
         text = "\n".join(p for p in text_parts if p).strip()
         lines: List[str] = []
+        overview: List[OverviewLine] = []
         if text:
             lines.append("  text:")
             for line in trunc(text, TEXT_TRUNC).splitlines() or [""]:
                 lines.append("    " + line)
+            overview.append(OverviewLine(eid, ts, "assistant", text, preserve_tail=True))
+        thinking_number = 0
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict) or block.get("type") != "thinking":
+                continue
+            for label in reasoning_labels(block.get("thinking")):
+                thinking_number += 1
+                lines.append(f"  intent: {label}")
+                overview.append(OverviewLine(f"{eid}/thinking/{thinking_number}", ts, "intent", label,
+                                             limit=OVERVIEW_INTENT_TRUNC, preserve_tail=True))
+        tool_number = 0
         for tc in [b for b in content if isinstance(b, dict) and b.get("type") == "toolCall"]:
+            tool_number += 1
             preview = pi_preview_args(tc.get("arguments", {}), ARGS_TRUNC)
             suffix = f" {preview}" if preview else ""
             lines.append(f"  toolCall: {tc.get('name', '?')}{suffix} [{tc.get('id', '?')}]")
+            overview.append(OverviewLine(f"{eid}/tool/{tool_number}", ts, "tool",
+                                         f"{tc.get('name', '?')} {pi_preview_args(tc.get('arguments', {}), OVERVIEW_TOOL_TRUNC)}",
+                                         limit=OVERVIEW_TOOL_TRUNC))
         sr = msg.get("stopReason")
         if sr:
             lines.append(f"  stopReason: {sr}")
-        return Entry(eid, ts, "assistant", f"[assistant] {ts} id={eid}", "\n".join(lines))
+        if not overview:
+            overview.append(OverviewLine(eid, ts, "assistant", f"stopReason={sr or '?'}",
+                                         limit=OVERVIEW_TOOL_TRUNC))
+        return Entry(eid, ts, "assistant", f"[assistant] {ts} id={eid}", "\n".join(lines), overview=overview)
     if role == "toolResult":
         text = pi_stringify(msg.get("content", []))
-        err = " ERROR" if msg.get("isError") else ""
-        header = f"[toolResult{err}] {ts} id={eid} tool={msg.get('toolName', '?')} call={msg.get('toolCallId', '?')}"
+        is_error = bool(msg.get("isError"))
+        err = " ERROR" if is_error else ""
+        tool = msg.get("toolName", "?")
+        header = f"[toolResult{err}] {ts} id={eid} tool={tool} call={msg.get('toolCallId', '?')}"
         body = f"  result: {single_line(text, RESULT_TRUNC)}" if text else ""
-        return Entry(eid, ts, "tool_result", header, body)
+        status = "ERROR " if is_error else ""
+        return Entry(eid, ts, "tool_result", header, body,
+                     overview=[OverviewLine(eid, ts, "result", f"{tool} {status}{text}",
+                                            limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True)])
     if role == "bashExecution":
         out = msg.get("output", "")
-        body_lines = [f"  command: {single_line(msg.get('command', ''), ARGS_TRUNC)}"]
+        command = msg.get("command", "")
+        body_lines = [f"  command: {single_line(command, ARGS_TRUNC)}"]
         if out:
             body_lines.append(f"  output: {single_line(out, RESULT_TRUNC)}")
         ec = msg.get("exitCode")
         if ec is not None:
             body_lines.append(f"  exitCode: {ec}")
-        return Entry(eid, ts, "bash", f"[bashExecution] {ts} id={eid}", "\n".join(body_lines))
-    return Entry(eid, ts, role, f"[{role}] {ts} id={eid}")
+        overview = [OverviewLine(f"{eid}/tool/1", ts, "tool", f"bash command={command}",
+                                 limit=OVERVIEW_TOOL_TRUNC)]
+        overview.append(OverviewLine(eid, ts, "result", f"bash exit={ec} {out}",
+                                     limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True))
+        return Entry(eid, ts, "bash", f"[bashExecution] {ts} id={eid}", "\n".join(body_lines), overview=overview)
+    return Entry(eid, ts, role, f"[{role}] {ts} id={eid}",
+                 overview=[OverviewLine(eid, ts, str(role), "", limit=OVERVIEW_TOOL_TRUNC)])
 
 
 class PiAdapter:
@@ -686,7 +848,8 @@ class PiAdapter:
             ids = [e.get("id") for e in active]
             try:
                 idx = ids.index(last_id)
-                window = active[idx + 1:]
+                unread = active[idx + 1:]
+                window = unread[:count] if count is not None else unread
             except ValueError:
                 raise ValueError("cursor entry not on active branch — use 'watch --reset' to rebootstrap")
         else:
@@ -695,6 +858,8 @@ class PiAdapter:
             window = active[-(count or RECENT_COUNT_DEFAULT):]
 
         rendered = [pi_format(e) for e in window]
+        for formatted, raw in zip(rendered, window):
+            formatted.cursor_after = {"session_path": str(path), "last_entry_id": raw.get("id")}
         new_cursor = {
             "session_path": str(path),
             "last_entry_id": window[-1].get("id") if window else (active[-1].get("id") if active else None),
@@ -704,16 +869,45 @@ class PiAdapter:
     @classmethod
     def detail(cls, rec: Dict[str, Any], target: str) -> str:
         path = cls.session_path(rec)
-        for entry in pi_load_active(path):
-            if entry.get("id") == target:
-                return json.dumps(entry, indent=2, ensure_ascii=False)
+        entries = pi_load_active(path)
+        parent_target = target.split("/", 1)[0]
+        ids = [str(entry.get("id")) for entry in entries if entry.get("id")]
+        parent_id = resolve_unique_prefix(ids, parent_target, "pi entry id") if "/" in target or parent_target in ids else None
+        for entry in entries:
+            eid = str(entry.get("id", "?"))
             if entry.get("type") == "message":
                 msg = entry.get("message", {})
+                content = msg.get("content", []) if isinstance(msg.get("content", []), list) else []
+                if parent_id == eid and "/" in target:
+                    suffix = target[len(parent_target):]
+                    match = re.fullmatch(r"/(tool|thinking)/(\d+)", suffix)
+                    if not match:
+                        raise ValueError(f"invalid pi child locator: {target}")
+                    kind, number_text = match.groups()
+                    block_type = "toolCall" if kind == "tool" else "thinking"
+                    blocks = [block for block in content if isinstance(block, dict) and block.get("type") == block_type]
+                    number = int(number_text)
+                    if number < 1 or number > len(blocks):
+                        raise ValueError(f"pi child locator not found: {target}")
+                    block = blocks[number - 1]
+                    if kind == "thinking":
+                        return f"[intent] id={target}\n  " + "\n  ".join(reasoning_labels(block.get("thinking")))
+                    args = json.dumps(block.get("arguments", {}), ensure_ascii=False)
+                    shown, cut = clip_overview(args, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                    return f"[toolCall] id={target} name={block.get('name', '?')}\n  arguments: {shown}" + ("\n  (arguments shortened)" if cut else "")
                 if msg.get("role") == "toolResult" and msg.get("toolCallId") == target:
-                    return json.dumps(entry, indent=2, ensure_ascii=False)
-                for block in msg.get("content", []):
+                    return pi_format(entry).render()
+                for block in content:
                     if isinstance(block, dict) and block.get("type") == "toolCall" and block.get("id") == target:
-                        return json.dumps(block, indent=2, ensure_ascii=False)
+                        args = json.dumps(block.get("arguments", {}), ensure_ascii=False)
+                        shown, cut = clip_overview(args, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                        return f"[toolCall] id={target} name={block.get('name', '?')}\n  arguments: {shown}" + ("\n  (arguments shortened)" if cut else "")
+            if eid == target or (parent_id == eid and "/" not in target):
+                if entry.get("type") == "compaction":
+                    summary, cut = clip_overview(entry.get("summary", ""), TEXT_TRUNC, preserve_tail=True)
+                    rendered = pi_format(entry).render()
+                    return f"{rendered}\n  summary: {summary}" + ("\n  (summary shortened)" if cut else "")
+                return pi_format(entry).render()
         raise ValueError(f"id not found on active branch: {target}")
 
     @classmethod
@@ -763,7 +957,73 @@ class PiAdapter:
             path = None
             age = float("inf")
         ctx = pi_last_context_tokens(path) if path else None
-        return {"turn": cls.turn_state(rec), "persisted_age_s": age, "context_input_tokens": ctx}
+        window = pi_context_window_tokens(path) if path else None
+        return {
+            "turn": cls.turn_state(rec),
+            "persisted_age_s": age,
+            "context_input_tokens": ctx,
+            "context_window_tokens": window,
+        }
+
+
+def _find_model_context_window(value: Any, provider: str, model: str,
+                               inherited_provider: Optional[str] = None) -> Optional[int]:
+    if isinstance(value, dict):
+        current_provider = str(value.get("provider") or value.get("providerId") or inherited_provider or "")
+        current_model = str(value.get("id") or value.get("model") or value.get("modelId") or "")
+        if current_model == model and (not provider or not current_provider or current_provider == provider):
+            candidate = value.get("contextWindow") or value.get("context_window")
+            try:
+                parsed = int(candidate)
+                if parsed > 0:
+                    return parsed
+            except (TypeError, ValueError):
+                pass
+        for key, child in value.items():
+            child_provider = current_provider
+            if key == provider or (inherited_provider is None and key not in {"providers", "models", "modelOverrides"}):
+                child_provider = str(key)
+            found = _find_model_context_window(child, provider, model, child_provider)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_model_context_window(child, provider, model, inherited_provider)
+            if found:
+                return found
+    return None
+
+
+def pi_context_window_tokens(path: Path) -> Optional[int]:
+    """Current Pi model's context window from persisted model identity + local registry."""
+    try:
+        entries = pi_load_active(path)
+    except Exception:
+        return None
+    provider = ""
+    model = ""
+    for entry in reversed(entries):
+        if entry.get("type") == "message":
+            msg = entry.get("message", {})
+            if msg.get("role") == "assistant" and (msg.get("model") or msg.get("modelId")):
+                provider = str(msg.get("provider") or "")
+                model = str(msg.get("model") or msg.get("modelId"))
+                break
+        if entry.get("type") == "model_change" and entry.get("modelId"):
+            provider = str(entry.get("provider") or "")
+            model = str(entry.get("modelId"))
+            break
+    if not model:
+        return None
+    for models_path in (PI_MODELS_PATH, PI_MODELS_STORE_PATH):
+        try:
+            data = json.loads(models_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        found = _find_model_context_window(data, provider, model)
+        if found:
+            return found
+    return None
 
 
 def pi_last_context_tokens(path: Path) -> Optional[int]:
@@ -847,6 +1107,8 @@ def claude_visible(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         t = e.get("type")
         if t in {"user", "assistant"}:
             out.append(e)
+        elif t == "system" and e.get("subtype") == "compact_boundary":
+            out.append(e)
     return out
 
 
@@ -888,35 +1150,53 @@ def claude_preview_args(args: Any, limit: int) -> str:
     return f"{k}={single_line(json.dumps(args[k], ensure_ascii=False), limit)}"
 
 
-def claude_format(entry: Dict[str, Any]) -> Entry:
+def claude_format(entry: Dict[str, Any], locator: Optional[str] = None) -> Entry:
     etype = entry.get("type")
-    uuid = entry.get("uuid", "?")
+    uuid = str(entry.get("uuid", "?"))
+    loc = locator or uuid
     ts = fmt_ts(entry.get("timestamp"))
     if etype == "assistant":
         msg = entry.get("message", {})
         text_parts: List[str] = []
         tool_lines: List[str] = []
+        overview: List[OverviewLine] = []
+        thinking_number = 0
+        tool_number = 0
         for block in msg.get("content", []):
             if not isinstance(block, dict):
                 continue
             bt = block.get("type")
             if bt == "text":
                 text_parts.append(block.get("text", ""))
+            elif bt == "thinking":
+                for label in reasoning_labels(block.get("thinking")):
+                    thinking_number += 1
+                    tool_lines.append(f"  intent: {label}")
+                    overview.append(OverviewLine(f"{loc}/thinking/{thinking_number}", ts, "intent", label,
+                                                 limit=OVERVIEW_INTENT_TRUNC, preserve_tail=True))
             elif bt == "tool_use":
+                tool_number += 1
                 preview = claude_preview_args(block.get("input", {}), ARGS_TRUNC)
                 suffix = f" {preview}" if preview else ""
                 tool_lines.append(f"  toolUse: {block.get('name', '?')}{suffix} [{block.get('id', '?')}]")
+                overview.append(OverviewLine(f"{loc}/tool/{tool_number}", ts, "tool",
+                                             f"{block.get('name', '?')} {claude_preview_args(block.get('input', {}), OVERVIEW_TOOL_TRUNC)}",
+                                             limit=OVERVIEW_TOOL_TRUNC))
         text = "\n".join(p for p in text_parts if p).strip()
         body_lines = []
         if text:
             body_lines.append("  text:")
             for line in trunc(text, TEXT_TRUNC).splitlines() or [""]:
                 body_lines.append("    " + line)
+            overview.insert(0, OverviewLine(loc, ts, "assistant", text, preserve_tail=True))
         body_lines.extend(tool_lines)
         sr = msg.get("stop_reason")
         if sr:
             body_lines.append(f"  stopReason: {sr}")
-        return Entry(uuid, ts, "assistant", f"[assistant] {ts} id={uuid}", "\n".join(body_lines))
+        if not overview:
+            overview.append(OverviewLine(loc, ts, "assistant", f"stopReason={sr or '?'}",
+                                         limit=OVERVIEW_TOOL_TRUNC))
+        return Entry(uuid, ts, "assistant", f"[assistant] {ts} id={uuid}", "\n".join(body_lines), overview=overview)
     if etype == "user":
         msg = entry.get("message", {})
         content = msg.get("content", "")
@@ -924,19 +1204,37 @@ def claude_format(entry: Dict[str, Any]) -> Entry:
             tool_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
             if tool_blocks:
                 lines = []
-                for block in tool_blocks:
+                overview = []
+                for number, block in enumerate(tool_blocks, 1):
                     tool_id = block.get("tool_use_id", "?")
                     text = block.get("content", "")
                     if not isinstance(text, str):
                         text = claude_content_text(text)
-                    err = " ERROR" if block.get("is_error") else ""
+                    is_error = bool(block.get("is_error"))
+                    err = " ERROR" if is_error else ""
                     lines.append(f"[toolResult{err}] {ts} id={uuid} call={tool_id}")
                     lines.append(f"  result: {single_line(text, RESULT_TRUNC)}")
-                return Entry(uuid, ts, "tool_result", "\n".join(lines))
+                    status = "ERROR " if is_error else ""
+                    overview.append(OverviewLine(f"{loc}/result/{number}", ts, "result", f"{status}{text}",
+                                                 limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True))
+                return Entry(uuid, ts, "tool_result", "\n".join(lines), overview=overview)
         text = claude_content_text(content)
         body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
-        return Entry(uuid, ts, "user", f"[user] {ts} id={uuid}", "  text:\n" + body)
-    return Entry(uuid, ts, etype or "other", f"[{etype}] {ts} id={uuid}")
+        return Entry(uuid, ts, "user", f"[user] {ts} id={uuid}", "  text:\n" + body,
+                     overview=[OverviewLine(loc, ts, "user", text, preserve_tail=True)])
+    if etype == "system" and entry.get("subtype") == "compact_boundary":
+        meta = entry.get("compactMetadata") or {}
+        before = meta.get("preTokens")
+        after = meta.get("postTokens")
+        text = "conversation compacted"
+        if isinstance(before, (int, float)):
+            text = f"from={before / 1000:.0f}k tokens"
+            if isinstance(after, (int, float)):
+                text += f" to={after / 1000:.0f}k"
+        return Entry(uuid, ts, "compaction", f"[compaction] {ts} id={uuid} {text}",
+                     overview=[OverviewLine(loc, ts, "compaction", text, limit=OVERVIEW_TOOL_TRUNC)])
+    return Entry(uuid, ts, etype or "other", f"[{etype}] {ts} id={uuid}",
+                 overview=[OverviewLine(loc, ts, etype or "other", "", limit=OVERVIEW_TOOL_TRUNC)])
 
 
 class ClaudeAdapter:
@@ -972,14 +1270,18 @@ class ClaudeAdapter:
             ids = [e.get("uuid") for e in entries]
             try:
                 idx = ids.index(last_uuid)
-                window = entries[idx + 1:]
+                unread = entries[idx + 1:]
+                window = unread[:count] if count is not None else unread
             except ValueError:
                 raise ValueError("claude cursor not in session — use 'watch --reset' to rebootstrap")
         else:
             if cursor is None and len(entries) > ESTABLISHED_THRESHOLD and count is None:
                 raise ValueError(f"established session ({len(entries)} entries) requires a cursor")
             window = entries[-(count or RECENT_COUNT_DEFAULT):]
-        rendered = [claude_format(e) for e in window]
+        prefix_by_id = unique_prefixes([str(e.get("uuid")) for e in entries if e.get("uuid")])
+        rendered = [claude_format(e, prefix_by_id.get(str(e.get("uuid")), str(e.get("uuid", "?")))) for e in window]
+        for formatted, raw in zip(rendered, window):
+            formatted.cursor_after = {"session_path": str(path), "last_entry_id": raw.get("uuid")}
         new_cursor = {
             "session_path": str(path),
             "last_entry_id": window[-1].get("uuid") if window else (entries[-1].get("uuid") if entries else None),
@@ -989,19 +1291,50 @@ class ClaudeAdapter:
     @classmethod
     def detail(cls, rec, target):
         path = cls.session_path(rec)
-        for entry in claude_load_entries(path):
-            if entry.get("uuid") == target:
-                return json.dumps(entry, indent=2, ensure_ascii=False)
+        entries = claude_visible(claude_load_entries(path))
+        ids = [str(entry.get("uuid")) for entry in entries if entry.get("uuid")]
+        parent_target = target.split("/", 1)[0]
+        parent_id = None
+        if "/" in target or any(value.startswith(parent_target) for value in ids):
+            parent_id = resolve_unique_prefix(ids, parent_target, "claude entry id")
+        prefix_by_id = unique_prefixes(ids)
+        for entry in entries:
+            uuid = str(entry.get("uuid", "?"))
             msg = entry.get("message", {})
             content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "tool_use" and block.get("id") == target:
-                        return json.dumps(block, indent=2, ensure_ascii=False)
-                    if block.get("type") == "tool_result" and block.get("tool_use_id") == target:
-                        return json.dumps(block, indent=2, ensure_ascii=False)
+            blocks = content if isinstance(content, list) else []
+            if parent_id == uuid and "/" in target:
+                suffix = target[len(parent_target):]
+                match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+                if not match:
+                    raise ValueError(f"invalid claude child locator: {target}")
+                kind, number_text = match.groups()
+                block_type = {"tool": "tool_use", "thinking": "thinking", "result": "tool_result"}[kind]
+                selected = [block for block in blocks if isinstance(block, dict) and block.get("type") == block_type]
+                number = int(number_text)
+                if number < 1 or number > len(selected):
+                    raise ValueError(f"claude child locator not found: {target}")
+                block = selected[number - 1]
+                if kind == "thinking":
+                    return f"[intent] id={target}\n  " + "\n  ".join(reasoning_labels(block.get("thinking")))
+                value = block.get("input", {}) if kind == "tool" else block.get("content", "")
+                text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+                shown, cut = clip_overview(text, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                return f"[{kind}] id={target}\n  {shown}" + (f"\n  ({kind} content shortened)" if cut else "")
+            if uuid == parent_id and "/" not in target:
+                return claude_format(entry, prefix_by_id.get(uuid, uuid)).render()
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use" and block.get("id") == target:
+                    value = json.dumps(block.get("input", {}), ensure_ascii=False)
+                    shown, cut = clip_overview(value, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                    return f"[tool] id={target} name={block.get('name', '?')}\n  input: {shown}" + ("\n  (input shortened)" if cut else "")
+                if block.get("type") == "tool_result" and block.get("tool_use_id") == target:
+                    value = block.get("content", "")
+                    text = value if isinstance(value, str) else claude_content_text(value)
+                    shown, cut = clip_overview(text, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                    return f"[result] call={target}\n  {shown}" + ("\n  (result shortened)" if cut else "")
         raise ValueError(f"id not found: {target}")
 
     @classmethod
@@ -1132,57 +1465,89 @@ def codex_load_entries(path: Path) -> List[Dict[str, Any]]:
     return out
 
 
-def codex_visible(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Filter codex JSONL entries to a deduplicated, supervisor-relevant set.
+def codex_reasoning_text(payload: Dict[str, Any]) -> str:
+    parts = []
+    summary = payload.get("summary")
+    for item in summary if isinstance(summary, list) else []:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            value = item.get("text") or item.get("summary_text")
+            if value:
+                parts.append(str(value))
+    return "\n\n".join(parts)
 
-    Codex emits each user/assistant message twice — once as event_msg
-    (user_message / agent_message) and once as response_item.message.
-    response_item is the canonical primary record (it carries full content
-    structure including tool calls), so we surface that and drop the
-    event_msg duplicates. We keep event_msg.task_started / task_complete
-    because they have no response_item analogue and signal turn boundaries.
-    """
-    out = []
-    for e in entries:
+
+def codex_is_call_type(ptype: Any) -> bool:
+    value = str(ptype or "")
+    return value.endswith("_call") or value in {"function_call", "web_search_call", "local_shell_call"}
+
+
+def codex_is_output_type(ptype: Any) -> bool:
+    value = str(ptype or "")
+    return value.endswith("_call_output") or value in {"function_call_output"}
+
+
+def codex_visible_indexed(entries: List[Dict[str, Any]], *, legacy: bool = False) -> List[Tuple[int, Dict[str, Any]]]:
+    """Deduplicated supervisor-relevant Codex entries with stable raw indices."""
+    out: List[Tuple[int, Dict[str, Any]]] = []
+    for raw_index, e in enumerate(entries):
         t = e.get("type")
-        if t == "session_meta":
+        payload = e.get("payload", {})
+        ptype = payload.get("type")
+        if t in {"session_meta", "turn_context"}:
             continue
-        if t == "turn_context":
+        if legacy:
+            if t == "event_msg" and ptype in {"task_started", "task_complete"}:
+                out.append((raw_index, e))
+            elif t == "response_item" and ptype in {"message", "function_call", "function_call_output"}:
+                if ptype != "message" or payload.get("role") != "developer":
+                    out.append((raw_index, e))
             continue
         if t == "event_msg":
-            ptype = e.get("payload", {}).get("type")
-            # Skip user_message/agent_message — duplicated by response_item.message.
-            if ptype in {"task_started", "task_complete"}:
-                out.append(e)
+            # user_message/agent_message duplicate response_item.message.
+            if ptype in {"task_started", "task_complete", "context_compacted"}:
+                out.append((raw_index, e))
         elif t == "response_item":
-            ptype = e.get("payload", {}).get("type")
-            if ptype in {"message", "function_call", "function_call_output"}:
-                role = e.get("payload", {}).get("role")
-                if ptype == "message" and role == "developer":
-                    continue
-                out.append(e)
+            if ptype == "message":
+                if payload.get("role") != "developer":
+                    out.append((raw_index, e))
+            elif codex_is_call_type(ptype) or codex_is_output_type(ptype):
+                out.append((raw_index, e))
+            elif ptype == "reasoning" and codex_reasoning_text(payload):
+                out.append((raw_index, e))
+        elif t == "compacted":
+            out.append((raw_index, e))
     return out
+
+
+def codex_visible(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [entry for _, entry in codex_visible_indexed(entries)]
 
 
 def codex_format(entry: Dict[str, Any], idx: int) -> Entry:
     ts = fmt_ts(entry.get("timestamp"))
-    eid = f"codex-{idx}"
+    eid = f"codex-r{idx}"
     payload = entry.get("payload", {})
     ptype = payload.get("type", "?")
 
     if entry.get("type") == "event_msg":
         if ptype == "task_started":
-            return Entry(eid, ts, "system", f"[task_started] {ts} id={eid} turn={payload.get('turn_id', '?')}")
+            text = f"turn={payload.get('turn_id', '?')}"
+            return Entry(eid, ts, "system", f"[task_started] {ts} id={eid} {text}",
+                         overview=[OverviewLine(eid, ts, "task-started", text, limit=OVERVIEW_TOOL_TRUNC)])
         if ptype == "task_complete":
-            return Entry(eid, ts, "system", f"[task_complete] {ts} id={eid}")
-        if ptype == "user_message":
-            text = payload.get("message") or payload.get("text") or ""
-            body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
-            return Entry(eid, ts, "user", f"[user] {ts} id={eid}", "  text:\n" + body)
-        if ptype == "agent_message":
-            text = payload.get("message") or ""
-            body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
-            return Entry(eid, ts, "assistant", f"[assistant] {ts} id={eid}", "  text:\n" + body)
+            return Entry(eid, ts, "system", f"[task_complete] {ts} id={eid}",
+                         overview=[OverviewLine(eid, ts, "task-complete", "", limit=OVERVIEW_TOOL_TRUNC)])
+        if ptype == "context_compacted":
+            return Entry(eid, ts, "compaction", f"[compaction] {ts} id={eid}",
+                         overview=[OverviewLine(eid, ts, "compaction", "conversation compacted",
+                                                limit=OVERVIEW_TOOL_TRUNC)])
+
+    if entry.get("type") == "compacted":
+        return Entry(eid, ts, "compaction", f"[compaction] {ts} id={eid}",
+                     overview=[OverviewLine(eid, ts, "compaction", "conversation compacted",
+                                            limit=OVERVIEW_TOOL_TRUNC)])
 
     if entry.get("type") == "response_item":
         if ptype == "message":
@@ -1198,21 +1563,43 @@ def codex_format(entry: Dict[str, Any], idx: int) -> Entry:
             text = "\n".join(p for p in text_parts if p).strip()
             body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
             label = "user" if role == "user" else ("assistant" if role == "assistant" else role)
-            return Entry(eid, ts, label, f"[{label}] {ts} id={eid}", "  text:\n" + body)
-        if ptype == "function_call":
-            name = payload.get("name", "?")
-            args = payload.get("arguments", "")
-            preview = single_line(args, ARGS_TRUNC) if isinstance(args, str) else single_line(json.dumps(args), ARGS_TRUNC)
+            return Entry(eid, ts, label, f"[{label}] {ts} id={eid}", "  text:\n" + body,
+                         overview=[OverviewLine(eid, ts, label, text, preserve_tail=True)])
+        if ptype == "reasoning":
+            text = codex_reasoning_text(payload)
+            body = "\n".join(f"  intent: {label}" for label in reasoning_labels(text))
+            return Entry(eid, ts, "intent", f"[intent] {ts} id={eid}", body,
+                         overview=[OverviewLine(eid, ts, "intent", label,
+                                                limit=OVERVIEW_INTENT_TRUNC, preserve_tail=True)
+                                   for label in reasoning_labels(text)])
+        if codex_is_call_type(ptype):
+            name = payload.get("name") or str(ptype).removesuffix("_call") or "?"
+            value = payload.get("arguments")
+            if value is None:
+                value = payload.get("input")
+            if value is None:
+                value = payload.get("command")
+            if value is None:
+                value = payload.get("action", "")
+            raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            preview = single_line(raw, ARGS_TRUNC)
             call_id = payload.get("call_id", payload.get("id", "?"))
-            return Entry(eid, ts, "tool_call", f"[function_call] {ts} id={eid} call={call_id}", f"  {name}({preview})")
-        if ptype == "function_call_output":
+            return Entry(eid, ts, "tool_call", f"[{ptype}] {ts} id={eid} call={call_id}", f"  {name}({preview})",
+                         overview=[OverviewLine(eid, ts, "tool", f"{name} {raw}", limit=OVERVIEW_TOOL_TRUNC)])
+        if codex_is_output_type(ptype):
             output = payload.get("output", "")
             if isinstance(output, dict):
-                output = output.get("content", "") or json.dumps(output)
+                output = output.get("content", "") or json.dumps(output, ensure_ascii=False)
             call_id = payload.get("call_id", payload.get("id", "?"))
-            return Entry(eid, ts, "tool_result", f"[function_call_output] {ts} id={eid} call={call_id}", f"  output: {single_line(str(output), RESULT_TRUNC)}")
+            status = payload.get("status")
+            status_text = f"status={status} " if status else ""
+            return Entry(eid, ts, "tool_result", f"[{ptype}] {ts} id={eid} call={call_id}", f"  output: {single_line(str(output), RESULT_TRUNC)}",
+                         overview=[OverviewLine(eid, ts, "result", f"{status_text}{output}",
+                                                limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True)])
 
-    return Entry(eid, ts, "other", f"[{entry.get('type', '?')}/{ptype}] {ts} id={eid}")
+    return Entry(eid, ts, "other", f"[{entry.get('type', '?')}/{ptype}] {ts} id={eid}",
+                 overview=[OverviewLine(eid, ts, "other", f"{entry.get('type', '?')}/{ptype}",
+                                        limit=OVERVIEW_TOOL_TRUNC)])
 
 
 class CodexAdapter:
@@ -1234,37 +1621,51 @@ class CodexAdapter:
     @classmethod
     def read_persisted(cls, rec, count=None, use_cursor=True):
         path = cls.session_path(rec)
-        entries = codex_visible(codex_load_entries(path))
-        # Provide stable indices matching pre-cursor positions
-        indexed = list(enumerate(entries))
+        raw_entries = codex_load_entries(path)
+        indexed = codex_visible_indexed(raw_entries)
         cursor = load_cursor(rec["id"]) if use_cursor else None
         if cursor and cursor.get("session_path") == str(path):
-            last_idx = cursor.get("last_idx", -1)
-            window = [(i, e) for i, e in indexed if i > last_idx]
+            if "last_raw_idx" in cursor:
+                last_raw_idx = int(cursor.get("last_raw_idx", -1))
+            else:
+                # Migrate the previous visible-index cursor without changing its
+                # meaning when newly supported Codex tool types become visible.
+                legacy = codex_visible_indexed(raw_entries, legacy=True)
+                old_idx = int(cursor.get("last_idx", -1))
+                last_raw_idx = legacy[old_idx][0] if 0 <= old_idx < len(legacy) else -1
+            unread = [(i, e) for i, e in indexed if i > last_raw_idx]
+            window = unread[:count] if count is not None else unread
         else:
-            if cursor is None and len(entries) > ESTABLISHED_THRESHOLD and count is None:
-                raise ValueError(f"established session ({len(entries)} entries) requires a cursor")
+            if cursor is None and len(indexed) > ESTABLISHED_THRESHOLD and count is None:
+                raise ValueError(f"established session ({len(indexed)} entries) requires a cursor")
             window = indexed[-(count or RECENT_COUNT_DEFAULT):]
         rendered = [codex_format(e, i) for i, e in window]
-        last_idx = window[-1][0] if window else (len(entries) - 1 if entries else -1)
-        new_cursor = {"session_path": str(path), "last_idx": last_idx}
+        for formatted, (raw_index, _) in zip(rendered, window):
+            formatted.cursor_after = {"session_path": str(path), "cursor_version": 2, "last_raw_idx": raw_index}
+        last_raw_idx = window[-1][0] if window else (indexed[-1][0] if indexed else -1)
+        new_cursor = {"session_path": str(path), "cursor_version": 2, "last_raw_idx": last_raw_idx}
         return rendered, new_cursor
 
     @classmethod
     def detail(cls, rec, target):
         path = cls.session_path(rec)
         entries = codex_load_entries(path)
-        m = re.match(r"^codex-(\d+)$", target)
-        if m:
-            visible = codex_visible(entries)
-            i = int(m.group(1))
-            if 0 <= i < len(visible):
-                return json.dumps(visible[i], indent=2, ensure_ascii=False)
-        # try call_id match
-        for e in entries:
+        raw_match = re.fullmatch(r"codex-r(\d+)", target)
+        if raw_match:
+            raw_index = int(raw_match.group(1))
+            if 0 <= raw_index < len(entries):
+                return codex_format(entries[raw_index], raw_index).render()
+        legacy_match = re.fullmatch(r"codex-(\d+)", target)
+        if legacy_match:
+            legacy = codex_visible_indexed(entries, legacy=True)
+            visible_index = int(legacy_match.group(1))
+            if 0 <= visible_index < len(legacy):
+                raw_index, entry = legacy[visible_index]
+                return codex_format(entry, raw_index).render()
+        for raw_index, e in enumerate(entries):
             payload = e.get("payload", {})
             if payload.get("call_id") == target or payload.get("id") == target:
-                return json.dumps(e, indent=2, ensure_ascii=False)
+                return codex_format(e, raw_index).render()
         raise ValueError(f"id not found: {target}")
 
     @classmethod
@@ -1307,7 +1708,7 @@ class CodexAdapter:
                     return "idle"
                 continue
             if etype == "response_item":
-                if ptype in {"function_call", "function_call_output"}:
+                if codex_is_call_type(ptype) or codex_is_output_type(ptype):
                     return "busy"
                 if ptype == "message":
                     role = payload.get("role")
@@ -1317,6 +1718,9 @@ class CodexAdapter:
                         return "busy"
                     if role == "developer":
                         continue
+                if ptype == "reasoning":
+                    return "busy"
+                return "unknown"
         return "unknown"
 
     @classmethod
@@ -1396,14 +1800,24 @@ class OpenCodeAdapter:
             raise ValueError("opencode: unexpected /message response")
         cursor = load_cursor(rec["id"]) if use_cursor else None
         if cursor and cursor.get("session_id") == sid:
-            last_count = cursor.get("last_msg_count", 0)
-            window = messages[last_count:]
+            start = int(cursor.get("last_msg_count", 0))
+            indexed = list(enumerate(messages[start:], start))
+            window = indexed[:count] if count is not None else indexed
         else:
-            if cursor is None and len(messages) > ESTABLISHED_THRESHOLD:
+            if cursor is None and len(messages) > ESTABLISHED_THRESHOLD and count is None:
                 raise ValueError(f"established session ({len(messages)} messages) requires a cursor")
-            window = messages[-(count or RECENT_COUNT_DEFAULT):] if count is not None or cursor is None else messages
-        rendered = [oc_format_message(m, idx + (len(messages) - len(window))) for idx, m in enumerate(window)]
-        new_cursor = {"session_id": sid, "last_msg_count": len(messages)}
+            start = max(0, len(messages) - (count or RECENT_COUNT_DEFAULT))
+            window = list(enumerate(messages[start:], start))
+        message_ids = [str(m.get("id") or m.get("info", {}).get("id") or f"oc-{i}") for i, m in enumerate(messages)]
+        prefix_by_id = unique_prefixes(message_ids)
+        rendered = []
+        for index, message in window:
+            message_id = message_ids[index]
+            formatted = oc_format_message(message, index, prefix_by_id.get(message_id, message_id))
+            formatted.cursor_after = {"session_id": sid, "last_msg_count": index + 1}
+            rendered.append(formatted)
+        last_count = window[-1][0] + 1 if window else len(messages)
+        new_cursor = {"session_id": sid, "last_msg_count": last_count}
         return rendered, new_cursor
 
     @classmethod
@@ -1411,11 +1825,38 @@ class OpenCodeAdapter:
         sid = cls.session_id(rec)
         directory = cls.directory(rec)
         messages = http_get(f"/session/{sid}/message", directory=directory)
-        for i, m in enumerate(messages):
-            mid = m.get("id") or m.get("info", {}).get("id") or f"oc-{i}"
-            if mid == target or f"oc-{i}" == target:
-                return json.dumps(m, indent=2, ensure_ascii=False)
-        raise ValueError(f"opencode message not found: {target}")
+        ids = [str(m.get("id") or m.get("info", {}).get("id") or f"oc-{i}") for i, m in enumerate(messages)]
+        parent_target = target.split("/", 1)[0]
+        parent_id = resolve_unique_prefix(ids, parent_target, "opencode message id")
+        index = ids.index(parent_id)
+        message = messages[index]
+        locator = unique_prefixes(ids).get(parent_id, parent_id)
+        if "/" not in target:
+            return oc_format_message(message, index, locator).render()
+        suffix = target[len(parent_target):]
+        match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+        if not match:
+            raise ValueError(f"invalid opencode child locator: {target}")
+        kind, number_text = match.groups()
+        part_type = {"tool": "tool", "thinking": "reasoning", "result": "tool"}[kind]
+        parts = [part for part in message.get("parts", []) if isinstance(part, dict) and part.get("type") == part_type]
+        if kind == "result":
+            parts = [part for part in parts if isinstance(part.get("state"), dict) and (
+                part["state"].get("output") is not None or part["state"].get("error") is not None or
+                part["state"].get("status") in {"completed", "done", "success", "error", "failed"}
+            )]
+        number = int(number_text)
+        if number < 1 or number > len(parts):
+            raise ValueError(f"opencode child locator not found: {target}")
+        part = parts[number - 1]
+        if kind == "thinking":
+            text = part.get("text") or part.get("content") or ""
+        else:
+            state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
+            value = state.get("input") if kind == "tool" else (state.get("output") or state.get("error"))
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        shown, cut = clip_overview(text, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+        return f"[{kind}] id={target}\n  {shown}" + (f"\n  ({kind} content shortened)" if cut else "")
 
     @classmethod
     def read_live(cls, rec):
@@ -1470,13 +1911,16 @@ class OpenCodeAdapter:
         if role == "user":
             return "busy"
         if role == "assistant":
+            time_info = info.get("time") if isinstance(info.get("time"), dict) else {}
+            if "completed" in time_info and time_info.get("completed") is None:
+                return "busy"
             parts = last.get("parts", []) if isinstance(last, dict) else []
             for part in parts if isinstance(parts, list) else []:
                 if part.get("type") != "tool":
                     continue
                 state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
                 status = state.get("status")
-                if status and status not in {"completed", "done", "success"}:
+                if status and status not in {"completed", "done", "success", "error", "failed"}:
                     return "busy"
             return "idle"
         return "unknown"
@@ -1533,10 +1977,11 @@ def oc_last_context_tokens(rec: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def oc_format_message(m: Dict[str, Any], idx: int) -> Entry:
+def oc_format_message(m: Dict[str, Any], idx: int, locator: Optional[str] = None) -> Entry:
     info = m.get("info", m)
     role = info.get("role", "?")
-    mid = info.get("id") or m.get("id") or f"oc-{idx}"
+    mid = str(info.get("id") or m.get("id") or f"oc-{idx}")
+    loc = locator or mid
     ts_raw = info.get("time", {}).get("created") if isinstance(info.get("time"), dict) else info.get("created")
     ts = fmt_ts(ts_raw)
 
@@ -1546,28 +1991,60 @@ def oc_format_message(m: Dict[str, Any], idx: int) -> Entry:
 
     if role == "assistant":
         body_lines: List[str] = []
-        text_parts = [p.get("text", "") for p in parts if p.get("type") == "text"]
+        overview: List[OverviewLine] = []
+        text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") == "text"]
         text = "\n".join(t for t in text_parts if t).strip()
         if text:
             body_lines.append("  text:")
             for line in trunc(text, TEXT_TRUNC).splitlines() or [""]:
                 body_lines.append("    " + line)
-        for p in parts:
-            if p.get("type") == "tool":
-                tool = p.get("tool", "?")
-                state = p.get("state", {}).get("status", "?") if isinstance(p.get("state"), dict) else "?"
-                args = p.get("state", {}).get("input") if isinstance(p.get("state"), dict) else p.get("input", {})
+            overview.append(OverviewLine(loc, ts, "assistant", text, preserve_tail=True))
+        thinking_number = 0
+        tool_number = 0
+        result_number = 0
+        for part in parts if isinstance(parts, list) else []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "reasoning":
+                value = part.get("text") or part.get("content") or ""
+                for label in reasoning_labels(value):
+                    thinking_number += 1
+                    body_lines.append(f"  intent: {label}")
+                    overview.append(OverviewLine(f"{loc}/thinking/{thinking_number}", ts, "intent", label,
+                                                 limit=OVERVIEW_INTENT_TRUNC, preserve_tail=True))
+            if part.get("type") == "tool":
+                tool_number += 1
+                tool = part.get("tool", "?")
+                state_obj = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
+                status = state_obj.get("status", "?")
+                args = state_obj.get("input", part.get("input", {}))
                 preview = claude_preview_args(args, ARGS_TRUNC)
-                body_lines.append(f"  tool: {tool} state={state} {preview}")
-        return Entry(mid, ts, "assistant", f"[assistant] {ts} id={mid}", "\n".join(body_lines))
+                body_lines.append(f"  tool: {tool} state={status} {preview}")
+                overview.append(OverviewLine(f"{loc}/tool/{tool_number}", ts, "tool",
+                                             f"{tool} {claude_preview_args(args, OVERVIEW_TOOL_TRUNC)}",
+                                             limit=OVERVIEW_TOOL_TRUNC))
+                output = state_obj.get("output")
+                error = state_obj.get("error")
+                if output is not None or error is not None or status in {"completed", "done", "success", "error", "failed"}:
+                    result_number += 1
+                    value = error if error is not None else output
+                    value_text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                    prefix = f"{tool} status={status} "
+                    overview.append(OverviewLine(f"{loc}/result/{result_number}", ts, "result", prefix + value_text,
+                                                 limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True))
+        if not overview:
+            overview.append(OverviewLine(loc, ts, "assistant", "", limit=OVERVIEW_TOOL_TRUNC))
+        return Entry(mid, ts, "assistant", f"[assistant] {ts} id={mid}", "\n".join(body_lines), overview=overview)
 
     if role == "user":
-        text_parts = [p.get("text", "") for p in parts if p.get("type") == "text"]
+        text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") == "text"]
         text = "\n".join(t for t in text_parts if t).strip()
         body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
-        return Entry(mid, ts, "user", f"[user] {ts} id={mid}", "  text:\n" + body)
+        return Entry(mid, ts, "user", f"[user] {ts} id={mid}", "  text:\n" + body,
+                     overview=[OverviewLine(loc, ts, "user", text, preserve_tail=True)])
 
-    return Entry(mid, ts, role, f"[{role}] {ts} id={mid}")
+    return Entry(mid, ts, role, f"[{role}] {ts} id={mid}",
+                 overview=[OverviewLine(loc, ts, str(role), "", limit=OVERVIEW_TOOL_TRUNC)])
 
 
 # -- adapter dispatch ---------------------------------------------------------
@@ -1648,14 +2125,14 @@ def acquire_context_window(rec: Dict[str, Any]) -> Optional[int]:
         live = tmux_capture(target, lines=120)
         if kind == "pi":
             # Pi status bar: "...46.8%/1.0M (auto)..."
-            m = re.search(r"(\d+(?:\.\d+)?)%/(\d+(?:\.\d+)?)([KMG])\b", live)
+            m = re.search(r"(\d+(?:\.\d+)?)%/(\d+(?:\.\d+)?)([kKmMgG])\b", live)
             if not m:
                 return None
             try:
                 value = float(m.group(2))
             except ValueError:
                 return None
-            unit = {"K": 1000, "M": 1_000_000, "G": 1_000_000_000}[m.group(3)]
+            unit = {"K": 1000, "M": 1_000_000, "G": 1_000_000_000}[m.group(3).upper()]
             return int(value * unit)
         else:  # claude
             # Our statusline script emits `ctx:1000k` — see scripts/claude-statusline.sh
@@ -2265,23 +2742,27 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-def _enforce_safety_caps(entries: List[Entry], force: bool) -> int:
-    # Gate only on total rendered size, not entry count. Individual entries are
-    # short (tool args/results are truncated when rendered), so a high entry
-    # count is fine as long as the rendered text stays under the char cap.
-    rendered = render_entries(entries)
-    if len(rendered) > MAX_RENDERED_CHARS and not force:
-        eprint(f"refusing to print {len(rendered)} chars from {len(entries)} entries (max {MAX_RENDERED_CHARS}). use --count to scope down, detail for one entry, or --force.")
-        return 1
-    return 0
+def _overview_page(entries: List[Entry]) -> List[Entry]:
+    """Largest oldest contiguous entry page whose compact overview fits."""
+    page: List[Entry] = []
+    for entry in entries:
+        candidate = page + [entry]
+        if page and len(render_overview(candidate)) > MAX_RENDERED_CHARS:
+            break
+        page.append(entry)
+        # A single persisted message can contain several calls. Keep it
+        # atomic so advancing the entry cursor never hides an unrendered call.
+        if len(render_overview(page)) > MAX_RENDERED_CHARS:
+            break
+    return page
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
     # Flag interactions:
     #   --live alone         → read live channel only; cursor flags are nonsensical here
-    #   --reset              → delete cursor before reading; persisted read uses tail
-    #   --full               → ignore cursor for this read; cursor still updates
-    #   --count N            → read tail of N (implies bootstrap if no cursor)
+    #   --reset              → delete cursor before reading; persisted read uses recent tail
+    #   --full               → read from the start; cursor advances only through represented entries
+    #   --count N            → bootstrap tail, or oldest N unread when a cursor exists
     if args.live:
         for flag in ("reset", "full", "count", "force"):
             if getattr(args, flag):
@@ -2298,22 +2779,58 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(adapter.read_live(rec))
         return 0
 
+    if args.count is not None and args.count <= 0:
+        raise ValueError("watch --count must be a positive integer")
+
     if args.reset:
         reset_cursor(args.id)
 
     use_cursor = not args.full
-    entries, new_cursor = adapter.read_persisted(rec, count=args.count, use_cursor=use_cursor)
+    # --reset without an explicit count deliberately reboots from the normal
+    # recent tail instead of asking an established session to dump its history.
+    read_count = args.count if args.count is not None else (RECENT_COUNT_DEFAULT if args.reset else None)
+    if args.full and args.count is None:
+        read_count = sys.maxsize
+    entries, new_cursor = adapter.read_persisted(rec, count=read_count, use_cursor=use_cursor)
 
     if not entries:
         print("(no new entries)")
         save_cursor(args.id, new_cursor)
         return 0
 
-    if _enforce_safety_caps(entries, args.force):
-        return 1
+    detailed = render_entries(entries)
+    if len(detailed) <= MAX_RENDERED_CHARS or args.force:
+        print(detailed)
+        save_cursor(args.id, new_cursor)
+        if args.count is None and not args.reset:
+            print(f"\nOBSERVATION COMPLETE — all {len(entries)} unread entries were shown.")
+        print(f"\n(cursor: {cursor_path(args.id)})")
+        return 0
 
-    print(render_entries(entries))
-    save_cursor(args.id, new_cursor)
+    page = _overview_page(entries)
+    complete = len(page) == len(entries)
+    print(f"COMPACT OVERVIEW — detailed content shortened ({len(entries)} unread entries)\n")
+    print(render_overview(page))
+    if any(entry.overview_was_truncated() for entry in page):
+        print(f"\nLines ending in … were shortened. Use `superv detail {args.id} <locator>` to inspect one entry.")
+
+    cursor_to_save = new_cursor if complete else page[-1].cursor_after
+    if cursor_to_save is None:
+        raise ValueError("internal error: overview page has no cursor boundary")
+    save_cursor(args.id, cursor_to_save)
+
+    if complete:
+        print(f"\nOBSERVATION COMPLETE — all {len(entries)} unread entries were represented in compact form.")
+    else:
+        remaining = len(entries) - len(page)
+        print(f"\n⚠ INCOMPLETE OBSERVATION — shown {len(page)} of {len(entries)} unread entries; {remaining} remain.")
+        print("You do not yet have the worker's full recent context.")
+        print("You MUST run this command again before judging the worker's status:")
+        print(f"  superv watch {args.id}")
+        print("Repeat until watch reports OBSERVATION COMPLETE.")
+        print("To deliberately discard the unread remainder and inspect only a recent tail:")
+        print(f"  superv watch {args.id} --reset --count <N>")
+        print("That reset skips unread history; use it only when losing those entries is intentional.")
     print(f"\n(cursor: {cursor_path(args.id)})")
     return 0
 
@@ -2322,10 +2839,43 @@ def cmd_detail(args: argparse.Namespace) -> int:
     rec = load_record(args.id)
     adapter = adapter_for(rec)
     try:
-        print(adapter.detail(rec, args.entry_id))
+        rendered = adapter.detail(rec, args.entry_id)
+        if len(rendered) <= MAX_RENDERED_CHARS:
+            print(rendered)
+        else:
+            shown, _ = clip_overview(rendered, MAX_RENDERED_CHARS, preserve_tail=True)
+            print(shown)
+            print(f"\nDETAIL SHORTENED — original rendered content was {len(rendered)} characters.")
+            print("Use a child tool/result locator when available to inspect that component directly.")
     except ValueError as e:
         eprint(f"error: {e}")
         return 1
+    return 0
+
+
+def cmd_recent(args: argparse.Namespace) -> int:
+    """Non-mutating query over recent persisted content."""
+    if args.count <= 0:
+        raise ValueError("recent --count must be a positive integer")
+    rec = load_record(args.id)
+    adapter = adapter_for(rec)
+    entries, _ = adapter.read_persisted(rec, count=sys.maxsize, use_cursor=False)
+    lines = [line for entry in entries for line in entry.overview]
+    if args.kind == "messages":
+        lines = [line for line in lines if line.kind in {"assistant", "user", "intent"}]
+    elif args.kind == "tools":
+        lines = [line for line in lines if line.kind in {"tool", "result"}]
+    elif args.kind == "errors":
+        pattern = re.compile(r"\b(error|failed|failure)\b|\bexit=[1-9]\d*", re.I)
+        lines = [line for line in lines if pattern.search(line.text)]
+    selected = lines[-args.count:]
+    if not selected:
+        print("(no matching recent entries)")
+        return 0
+    print("\n".join(line.render() for line in selected))
+    if any(line.truncated for line in selected):
+        print(f"\nLines ending in … were shortened. Use `superv detail {args.id} <locator>` to inspect one entry.")
+    print("\n(recent query did not move the watch cursor)")
     return 0
 
 
@@ -2454,7 +3004,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             pct = (ctx_tokens / ctx_window) * 100
             parts.append(f"ctx={ctx_tokens / 1000:.0f}k/{ctx_window / 1000:.0f}k({pct:.0f}%)")
         else:
-            parts.append(f"ctx={ctx_tokens / 1000:.0f}k")
+            parts.append(f"ctx={ctx_tokens / 1000:.0f}k/?")
 
     print(" ".join(parts))
     return 0
@@ -2562,7 +3112,8 @@ typical workflows:
     superv status my-worker
     superv watch my-worker
     superv watch my-worker --live                 # live channel only
-    superv detail my-worker <entry-id>            # full content of one entry
+    superv recent my-worker --kind messages       # query without moving cursor
+    superv detail my-worker <entry-id>            # bounded content for one entry
 
   heartbeat (polled supervisors only — codex/opencode):
     superv heartbeat my-worker --reset            # initial 30s
@@ -2723,10 +3274,15 @@ examples:
         epilog="""\
 modes:
   default              read entries past the cursor (cursor advances)
-  --reset              delete cursor before reading; persisted read uses tail
-  --full               ignore cursor for this read (cursor still updates)
-  --count N            read tail of N entries (implies bootstrap if no cursor)
+  --reset              discard cursor and rebootstrap from the recent tail
+  --full               read from the start; partial overview pages advance only through shown entries
+  --count N            bootstrap tail, or oldest N unread when a cursor exists
   --live               read the live channel only (tmux pane / http status); cursor flags forbidden
+
+overflow:
+  detailed output that exceeds 12000 characters becomes a compact chronological overview.
+  every tool call remains on its own line. INCOMPLETE OBSERVATION means you must run watch
+  again before judging the worker; repeat until OBSERVATION COMPLETE.
 
 bootstrap rule:
   on a session with >20 entries and no cursor, watch refuses unless --count or --reset is given.
@@ -2734,8 +3290,8 @@ bootstrap rule:
 
 examples:
   superv watch tv-pi                  # incremental: only new entries since cursor
-  superv watch tv-pi --count 8        # initial bootstrap, show last 8
-  superv watch tv-pi --reset          # discard cursor and rebootstrap with default tail
+  superv watch tv-pi --count 8        # bootstrap tail, or next 8 unread with a cursor
+  superv watch tv-pi --reset          # deliberately discard unread history; show default tail
   superv watch tv-pi --live           # current tmux pane / http status
 """,
     )
@@ -2747,12 +3303,23 @@ examples:
     sp.add_argument("--force", action="store_true", help="bypass the safety cap (max 12000 rendered chars)")
     sp.set_defaults(func=cmd_watch)
 
+    # recent
+    sp = sub.add_parser(
+        "recent",
+        help="query recent persisted content without moving the watch cursor",
+        description="Show recent compact messages, tool activity, errors, or all content. This is a read-only historical query and never updates the watch cursor.",
+    )
+    sp.add_argument("id")
+    sp.add_argument("--kind", choices=["messages", "tools", "errors", "all"], default="messages")
+    sp.add_argument("--count", type=int, default=3, help="number of matching compact lines to show (default: 3)")
+    sp.set_defaults(func=cmd_recent)
+
     # detail
     sp = sub.add_parser(
         "detail",
-        help="full content for one entry (use when watch's truncation is too aggressive)",
+        help="bounded content for one entry (use when watch's overview is shortened)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Show full original content for one persisted entry — full text, full tool args, full tool result.",
+        description="Show supervisor-oriented content for one persisted entry while omitting opaque signatures and bounding large text, tool arguments, and results.",
         epilog="""\
 entry-id formats:
   pi      entry uuid (from watch output 'id=...') OR toolCallId
@@ -2762,8 +3329,9 @@ entry-id formats:
 
 examples:
   superv detail tv-pi a6ca92b7
+  superv detail tv-pi a6ca92b7/tool/1
   superv detail c-acp tool_01ABC
-  superv detail c1 codex-12
+  superv detail c1 codex-r12
 """,
     )
     sp.add_argument("id")

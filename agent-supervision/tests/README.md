@@ -3,10 +3,10 @@
 Run:
 
 ```bash
-python3 skills/agent-supervision/tests/test_pi_session_discovery.py
+python3 -m unittest discover -s skills/agent-supervision/tests -p 'test_*.py' -v
 ```
 
-Stdlib-only (`unittest`); no pytest, no network, no real agents.
+Stdlib-only (`unittest`); no pytest, network service, or real agents. Observation tests cover Pi, Claude, Codex, and OpenCode using temporary session fixtures and an in-process OpenCode response stub.
 
 ## Isolation model — and a hard rule about tmux
 

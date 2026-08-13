@@ -16,10 +16,11 @@ Use tmux pane capture only for liveness/anomaly context (current screen, permiss
 
 ```bash
 superv watch <id>                       # incremental — entries past cursor
-superv watch <id> --reset               # discard cursor, re-bootstrap
-superv watch <id> --full                # one-shot full snapshot, also resets
-superv watch <id> --count N             # for fresh bootstrap, show last N
-superv detail <id> <entry-or-tool-id>   # full content for one entry
+superv watch <id> --reset               # discard cursor, re-bootstrap from recent tail
+superv watch <id> --full                # read from the start; cursor advances only through shown entries
+superv watch <id> --count N             # bootstrap tail, or oldest N unread with a cursor
+superv recent <id> --kind messages      # historical query; does not move cursor
+superv detail <id> <entry-or-tool-id>   # bounded content for one entry or child
 ```
 
 The same flags work regardless of worker kind — the adapter under the hood handles each format's specifics.
@@ -28,6 +29,8 @@ The same flags work regardless of worker kind — the adapter under the hood han
 
 - `superv watch <id>` requires an existing cursor on established sessions (>20 entries). It will refuse otherwise. This is intentional protection against context destruction.
 - To bootstrap an established session, use `--reset` (or `--count N` for a tail) once. Subsequent calls work normally.
+- With an established cursor, `--count N` returns the oldest N unread entries. Repeating it drains a backlog without skipping the middle.
+- `--reset --count N` deliberately discards unread history and starts from the latest N entries.
 - Cursor files: `~/.agent-supervision/cursors/<id>.json`. Survives compaction and reboots.
 
 ## Per-worker session file locations
@@ -51,13 +54,19 @@ The adapters render with these caps:
 - **Tool args**: 140 chars (you care *what* tool, not the full args).
 - **Tool results**: 220 chars (file contents are not for the supervisor).
 
-Override with `--text-trunc / --args-trunc / --result-trunc` if needed. For full content of one entry, use `superv detail`.
+For more content from one entry, use `superv detail` with the locator shown by `watch`.
 
-## Refusal limit on `watch`
+## Overflow behavior on `watch`
 
-- Refuses to print more than 12000 chars rendered at once (`MAX_RENDERED_CHARS`). Entry **count** is not capped — individual entries are short (args/results are truncated when rendered), so only the total rendered size matters. In practice ~30+ short entries fit under the cap; a large new-entry count is fine as long as the rendered text stays under it.
+`watch` prints the detailed rendering when it fits under 12,000 characters. When it does not fit, it prints a compact chronological overview:
 
-Override with `--force` only when you've genuinely decided the cost is worth it. The normal path: scope down with `--count N` or use `superv detail` for one entry at a time.
+- Every tool call remains present on its own bounded line. Calls are never replaced with a count.
+- Source whitespace is normalized before character-wise truncation; source line breaks do not decide what survives.
+- A final `…` marks shortened content. One footer explains how to use `detail` for a locator.
+- If all unread entries fit in compact form, `watch` reports `OBSERVATION COMPLETE` and advances through all of them.
+- If only an oldest prefix fits, `watch` reports `INCOMPLETE OBSERVATION`, advances only through represented entries, and explicitly directs the supervisor to run `watch` again before judging worker status.
+
+Repeat `watch` until it reports completion. Use `--reset --count N` only to deliberately discard the unread remainder and inspect a recent tail. `--force` remains an explicit bypass for the detailed-output cap.
 
 ## Active-branch handling (Pi only)
 
@@ -69,16 +78,16 @@ Claude and Codex sessions are linear — no branch handling needed.
 
 - **User and assistant turns** — always.
 - **Tool calls / tool results** — yes, but with truncated args/results.
-- **Reasoning / thinking blocks** — skipped by default (internal chain-of-thought, not actionable for supervision). `superv detail` shows them when needed.
+- **Reasoning / thinking blocks** — readable plaintext intent summaries are shown; empty, signed, or encrypted reasoning payloads are omitted.
 - **Hook progress, file-history snapshots** (Claude) — skipped.
 - **Compaction / branch_summary / model_change** (Pi) — surfaced with brief metadata.
 - **session_meta, turn_context, token_count** (Codex) — skipped or summarized.
 
 ## What `detail` returns
 
-Full original content for one entry. Use for:
+Bounded supervisor-oriented content for one entry or child locator. It omits opaque signatures and encrypted reasoning payloads, bounds large text and results, and says when content was shortened. Use it for:
 
-- Reading full assistant explanations that were truncated.
-- Inspecting tool arguments (e.g., the exact patch a worker applied).
-- Inspecting tool results when verifying a worker claim.
-- Reading reasoning blocks when diagnosing why a worker chose an approach.
+- Reading more of an assistant explanation marked with `…`.
+- Inspecting one tool call through a locator such as `<entry>/tool/1`.
+- Inspecting a tool result when verifying a worker claim.
+- Reading a persisted plaintext intent summary.
