@@ -207,26 +207,45 @@ The tell: **if a worker needs a timer, or is waiting on another agent, supervisi
 
 **Draw the read line and the act line, and issue both as instructions.** On shared-user machines every agent can technically read this skill and run `superv` — file permissions cannot confine them, so the boundary only exists if you state it in kickoffs. The calibrated rule: *awareness* of this skill via the harness's skill listing is unavoidable and fine; *reading* its contents is off-limits to workers — it is the supervisor's operating manual, and a worker who has read it is one step from using it; *acting* on supervision capabilities (contacting other agents, arming watch loops, pacing itself with timers) is the hard violation and an immediate correction signal. Observed in practice: a worker browsing the skills directory for an unrelated skill read this one's transport docs and began driving its own review loop with another agent; the supervisor then compounded the error by ratifying it. State the rule at kickoff, treat worker references to supervision tooling as NEEDS_CORRECTION, and reclaim any coordination that has leaked.
 
-## Supervisor anti-pattern: Monitor for worker waits
+## Supervisor anti-pattern: holding a turn open to wait on a worker
 
-**Do not use the `Monitor` tool to wait on a worker action.** Use cron loops instead — `CronCreate` with a recurring schedule on Claude, `LoopCreate` with a cron trigger on Pi, or repeated heartbeats from the user on Codex/OpenCode.
+**Never block your own turn waiting for a worker to reach a condition.** You already have a loop. Use it, and do not try to optimize around it.
 
-The failure mode is concrete and observed: the supervisor writes a `Monitor` script that polls the worker for some condition ("ctx dropped below 100k", "this file exists", "this PID is gone"), arms it with a multi-minute timeout, and walks away. If the supervisor's *premise* about what the worker is doing is wrong — e.g., the supervisor told the worker to run `/compact` in a prompt but never actually sent the slash command, so no compaction is in progress — the polled condition will never fire and the monitor sits silent for the full timeout window. The user has to intervene to unblock it. Nothing in the monitor's design re-tests the supervisor's premise.
+This rule is about the *mechanism*, not any one tool. All of these are the same anti-pattern:
 
-Crons are different. A recurring cron fires on its schedule regardless of the worker's state. Each fire re-runs the supervisor's logic against current truth: "is the worker really doing X? if not, why? what should I do now?" Wrong assumptions surface within one cron interval instead of festering for the full Monitor timeout. Crons also produce a visible audit trail (each fire is a turn in the conversation), so the user can see the supervisor still reasoning rather than silently waiting.
+- A `Monitor` script polling for a worker condition.
+- A `Bash` loop that spins until a pattern appears — `until tmux capture-pane … | grep -q "…"; do sleep 5; done`, `while ! test -f …; do sleep 10; done`, or any variant.
+- A long foreground command whose only purpose is to delay until a worker finishes.
+- Chained short sleeps that add up to the same wait.
 
-**Allowed `Monitor` uses (not supervision-related):**
+Reaching for `Bash` instead of `Monitor` does not make it a different thing. If the supervisor's turn is being held open until a worker does something, it is this anti-pattern.
+
+The failure mode is concrete and observed twice. **First**, the supervisor writes a poll for some condition ("ctx dropped below 100k", "this file exists", "the verify run printed its summary"), arms it with a multi-minute timeout, and walks away. If the supervisor's *premise* is wrong — the slash command was never actually sent so no compaction is in progress; the run already finished before the loop started; the pattern never appears because a redrawing terminal UI scrolled it away — the condition never fires and the supervisor sits silent for the entire timeout. The user has to intervene to unblock it. Nothing in the loop's design re-tests the premise.
+
+**Second, and worse: the wait itself is a guess.** Writing the match pattern means predicting the exact text a worker will emit on success. That prediction is frequently wrong, and when it is wrong the supervisor burns the full timeout on something that already happened or will never happen. A pattern matched against a live terminal is worse still: panes redraw, scrollback rolls, and a substring from unrelated output can fire the condition early.
+
+And while the turn is held, the supervisor is deaf. It cannot answer the user, cannot react to a second worker, cannot notice that something else broke.
+
+Crons are different. A recurring cron fires on its schedule regardless of the worker's state. Each fire re-runs the supervisor's logic against current truth: "is the worker really doing X? if not, why? what should I do now?" Wrong assumptions surface within one interval instead of festering for a full timeout. Crons also produce a visible audit trail — each fire is a turn in the conversation — so the user can see the supervisor still reasoning rather than silently waiting.
+
+**The correct shape is always the same:** take a snapshot, read it, report what is true now, end the turn. If the thing you wanted has not happened yet, the next heartbeat gets it. A worker finishing thirty seconds after your turn ends costs one heartbeat interval. A wrong wait costs the whole timeout and the user's attention.
+
+Do not accept "but I want the result in *this* turn" as a reason. That impatience is precisely what produces the wrong-premise wait.
+
+**Allowed waiting (not supervision-related):**
 - Watching log files for arbitrary error patterns during a debugging session.
 - Streaming events from a one-off external process the supervisor itself launched (not a worker).
 - Tailing a CI run or remote API to surface state changes the harness can't notify on.
+- A foreground command the supervisor itself runs for its own work, where the wait is the command's own runtime rather than a poll for someone else's state.
 
-**Disallowed `Monitor` uses (use a cron instead):**
+**Disallowed (let the heartbeat handle it):**
 - "Wake me when the worker finishes."
 - "Wake me when the worker's context drops below N."
 - "Wake me when the worker writes file X."
+- "Wait until the worker's test run prints its result."
 - Any condition whose truth depends on the worker doing what the supervisor asked.
 
-If a heartbeat or recurring cron is too coarse-grained for the work — e.g., a 2-minute cron would burn cache for an action that completes in 20 seconds — accept the coarse grain anyway, or block on a direct `Bash` `run_in_background` call that the supervisor itself controls (not a polling loop based on worker state). The bias is toward periodic re-examination of premises, not toward silent waiting on assumed truths.
+If a heartbeat is too coarse-grained for the work — e.g., a 2-minute interval for an action that completes in 20 seconds — accept the coarse grain. The bias is toward periodic re-examination of premises, not toward silent waiting on assumed truths.
 
 ## Self-disclosure rule
 
