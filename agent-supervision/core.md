@@ -72,6 +72,38 @@ Use this prompt verbatim for scheduled loops and as the semantic content of poll
 
 The prompt is intentionally generic. Do not add worker IDs, task goals, phase names, current constraints, note paths, status snapshots, teardown conditions, or other project state. Those change while the supervisor's responsibility continues and belong in conversation context and durable supervision state.
 
+## State the condition, not the answer — delegate the lookup
+
+**Do not do research or enumeration a worker can do itself.** When a task depends on some set of
+specific things — commits, identifiers, files, tickets, test names — send the **logical condition that
+defines the set**, not the set. The worker resolves it in its own environment, at its own moment, with
+its own eyes on the result.
+
+**Workers are intellectual peers.** Treating a lookup as something you must complete before they can
+start is both a waste of your turn and an insult to theirs.
+
+**The failure this prevents is not laziness, it is staleness and error.** A fact you look up and pass
+along has three ways to be wrong that a condition does not: it can be out of date by the time they read
+it, it can be misread on the way through you, and it can be misattributed. Observed in a single day of
+supervision: a baseline number passed on after it had changed; an invariant count passed on after a
+landing had altered it; and a set of test placeholders attributed to the wrong owning job because the
+supervisor transcribed one identifier for another. **All three were caught by the workers, who
+differenced the sources themselves. All three would have been non-events had the supervisor sent the
+predicate instead of the result.**
+
+Concretely, prefer the left column:
+
+| Send this | Not this |
+|---|---|
+| "Read the current baseline from `expected-failing-tests.txt` at your branch point." | "The baseline is 125." |
+| "Your job owns whatever is tagged with its own identifier — check." | "Your job owns 114 of them." |
+| "The trunk has moved since your branch point; read the delta and say whether it can reach you." | A hand-listed enumeration of the intervening commits. |
+| "Find the tests this assertion cites and confirm they still exist." | A list of the three test names you looked up. |
+
+**The exception is information that exists nowhere they can look** — a decision you made, a constraint
+from outside their environment, something another worker discovered that is not yet written down. That
+is the category worth spending your turn on, and it is much smaller than it feels.
+
 ## Nudge taxonomy
 
 **Nudge when** all four hold:
