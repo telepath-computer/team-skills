@@ -9,10 +9,13 @@ Subcommands:
   unregister <id>              Remove a registry entry (cursor and notes are kept).
   watch <id>                   Incremental view of new persisted entries since cursor.
   watch <id> --live            Live-state probe (tmux pane / http /session/status).
-  detail <id> <entry-id>       Full content for one persisted entry.
+  recent <id>                  Non-mutating recent messages/tools/errors query.
+  detail <id> <entry-id>       Bounded detail for one persisted entry.
   send <id> "<msg>"            Send a message to the worker (any text, single or multi-line).
   send <id> --file <path>      Send a message read from a file (convenience).
-  status <id>                  One-line mechanical classification: running/idle/stalled/broken.
+  status <id>                  One-line state, context, and unread count.
+  await <id>                   Experimental: block until the worker needs attention.
+  sweep [id ...]               Concise status plus latest intent across workers.
   note <id> "<obs>" --tag T    Append a timestamped tagged entry to the notes file.
   heartbeat <id> --bump|--reset|--teardown|--show
                                Manage the polled-supervisor heartbeat instruction file.
@@ -42,7 +45,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # -- paths --------------------------------------------------------------------
 
-STATE_ROOT = Path.home() / ".agent-supervision"
+# AGENT_SUPERVISION_ROOT relocates all superv state (registry, cursors, notes,
+# heartbeats). Tests and throwaway supervision sandboxes point it at a temp
+# dir so they never touch the live registry.
+STATE_ROOT = Path(os.environ.get("AGENT_SUPERVISION_ROOT") or (Path.home() / ".agent-supervision"))
 WORKERS_DIR = STATE_ROOT / "workers"
 CURSORS_DIR = STATE_ROOT / "cursors"
 NOTES_DIR = STATE_ROOT / "notes"
@@ -52,6 +58,8 @@ TMUX_CURSORS_DIR = STATE_ROOT / "tmux-cursors"
 TMUX_LOCK_FILE = STATE_ROOT / "tmux.lock"
 
 PI_SESSIONS_ROOT = Path.home() / ".pi" / "agent" / "sessions"
+PI_MODELS_PATH = Path.home() / ".pi" / "agent" / "models.json"
+PI_MODELS_STORE_PATH = Path.home() / ".pi" / "agent" / "models-store.json"
 CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 CLAUDE_PID_META_DIR = Path.home() / ".claude" / "sessions"
 CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
@@ -67,6 +75,16 @@ RECENT_COUNT_DEFAULT = 6
 MAX_RENDERED_CHARS = 12000
 ESTABLISHED_THRESHOLD = 20  # entries; cursor required beyond this on bootstrap
 
+# Compact-overview budgets apply after whitespace normalization. Source line
+# breaks never decide what survives: a persisted line may be one word or many
+# thousands of characters.
+OVERVIEW_TEXT_TRUNC = 420
+OVERVIEW_INTENT_TRUNC = 220
+OVERVIEW_TOOL_TRUNC = 160
+OVERVIEW_RESULT_TRUNC = 180
+DETAIL_COMPONENT_TRUNC = 8000
+LOCATOR_PREFIX_MIN = 8
+
 # -- name pool ----------------------------------------------------------------
 
 NAME_POOL = [
@@ -81,13 +99,7 @@ NAME_POOL = [
 HEARTBEAT_START = 30
 HEARTBEAT_STEP = 30
 HEARTBEAT_CAP = 240
-CANONICAL_HEARTBEAT_PROMPT = (
-    "You are a supervisor agent. Reassess the current project using conversation context and durable supervision state. "
-    "Observe and interpret whatever currently needs attention, then continue your supervisor duties as appropriate—wait, "
-    "nudge, correct, dispatch, review, transition, or escalate—following the agent-supervision skill. This heartbeat does not "
-    "define or limit task scope. Preserve this prompt in this generic form: do not rewrite it around a specific worker, task, "
-    "phase, or current state. Keep project details in conversation, session files, or supervision notes rather than this prompt."
-)
+CANONICAL_HEARTBEAT_PROMPT = "Heartbeat: perform your supervision duties if applicable in this moment."
 
 
 # -- utilities ----------------------------------------------------------------
@@ -114,6 +126,95 @@ def trunc(text: str, limit: int) -> str:
 
 def single_line(text: str, limit: int) -> str:
     return trunc(str(text).replace("\n", "\\n"), limit)
+
+
+def normalize_whitespace(text: Any) -> str:
+    """Turn arbitrary persisted text into one readable display line."""
+    return re.sub(r"\s+", " ", "" if text is None else str(text)).strip()
+
+
+def clip_overview(text: Any, limit: int, *, preserve_tail: bool = False) -> Tuple[str, bool]:
+    """Character-wise clipping for compact overview lines.
+
+    Assistant prose and tool results preserve a small tail because conclusions
+    and errors often appear there. Tool-call arguments favor the leading text,
+    which identifies the command, path, pattern, query, or URL.
+    """
+    value = normalize_whitespace(text)
+    if len(value) <= limit:
+        return value, False
+    if limit <= 1:
+        return "…", True
+    if preserve_tail and limit >= 24:
+        tail = max(12, limit // 4)
+        head = limit - tail - 1
+        return f"{value[:head].rstrip()}…{value[-tail:].lstrip()}", True
+    return f"{value[:limit - 1].rstrip()}…", True
+
+
+def reasoning_labels(text: Any) -> List[str]:
+    """Readable plaintext intent labels from a persisted reasoning summary."""
+    raw = "" if text is None else str(text)
+    labels = []
+    for part in re.split(r"\n\s*\n", raw):
+        value = normalize_whitespace(part)
+        if value.startswith("**") and value.endswith("**") and len(value) >= 4:
+            value = value[2:-2].strip()
+        if value:
+            labels.append(value)
+    return labels
+
+
+def meaningful_stop_reason(reason: Any, *, has_tool_call: bool = False) -> Optional[str]:
+    """Exceptional stop reasons worth showing in routine observations."""
+    value = "" if reason is None else str(reason).strip()
+    normalized = re.sub(r"[-_]", "", value).lower()
+    if normalized in {"stop", "endturn"}:
+        return None
+    if normalized == "tooluse" and has_tool_call:
+        return None
+    return value or None
+
+
+def common_prefix_length(left: str, right: str) -> int:
+    size = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        size += 1
+    return size
+
+
+def unique_prefixes(values: List[str], minimum: int = LOCATOR_PREFIX_MIN) -> Dict[str, str]:
+    """Shortest unique prefixes, found from each sorted value's neighbors.
+
+    In sorted order, the value sharing the longest prefix must be adjacent.
+    Comparing only those neighbors avoids comparing every session id with
+    every other id during each watch.
+    """
+    strings = sorted(str(value) for value in values if value)
+    out: Dict[str, str] = {}
+    for index, value in enumerate(strings):
+        previous = common_prefix_length(value, strings[index - 1]) if index else 0
+        following = common_prefix_length(value, strings[index + 1]) if index + 1 < len(strings) else 0
+        needed = max(previous, following) + 1
+        size = min(len(value), max(minimum, needed))
+        out[value] = value[:size]
+    return out
+
+
+def resolve_unique_prefix(values: List[str], target: str, label: str = "id") -> str:
+    if target in values:
+        return target
+    matches = [value for value in values if value.startswith(target)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"{label} not found: {target}")
+    prefixes = unique_prefixes(matches)
+    choices = ", ".join(prefixes[value] for value in matches[:12])
+    suffix = " …" if len(matches) > 12 else ""
+    raise ValueError(f"ambiguous {label} prefix '{target}'; use one of: {choices}{suffix}")
 
 
 def fmt_ts(ts: Any) -> str:
@@ -376,24 +477,85 @@ def http_post(path: str, body: Dict[str, Any], directory: str = "/", timeout: in
 
 # -- adapters base ------------------------------------------------------------
 
-class Entry:
-    """Uniform rendered entry shape returned by adapters."""
+class OverviewLine:
+    """One bounded line in an overflow overview."""
 
-    def __init__(self, eid: str, ts: str, kind: str, header: str, body: str = ""):
+    def __init__(self, locator: str, ts: str, kind: str, text: Any = "", *,
+                 limit: int = OVERVIEW_TEXT_TRUNC, preserve_tail: bool = False):
+        self.locator = locator
+        self.ts = ts
+        self.kind = kind
+        self.text, self.truncated = clip_overview(text, limit, preserve_tail=preserve_tail)
+
+    def render(self) -> str:
+        suffix = f" {self.text}" if self.text else ""
+        return f"{self.ts} {self.locator} {self.kind}{suffix}"
+
+
+class Entry:
+    """Uniform rendered entry shape returned by adapters.
+
+    One persisted entry may contain several overview lines. In particular,
+    every tool call remains individually visible rather than being replaced by
+    an activity count.
+    """
+
+    def __init__(self, eid: str, ts: str, kind: str, header: str, body: str = "",
+                 overview: Optional[List[OverviewLine]] = None,
+                 cursor_after: Optional[Dict[str, Any]] = None):
         self.id = eid
         self.ts = ts
         self.kind = kind
         self.header = header
         self.body = body
+        self.overview = overview or [OverviewLine(eid, ts, kind, body or header)]
+        self.cursor_after = cursor_after
 
     def render(self) -> str:
         if self.body:
             return f"{self.header}\n{self.body}"
         return self.header
 
+    def render_overview(self) -> str:
+        return "\n".join(line.render() for line in self.overview)
+
+    def overview_was_truncated(self) -> bool:
+        return any(line.truncated for line in self.overview)
+
 
 def render_entries(entries: List[Entry]) -> str:
     return "\n\n".join(e.render() for e in entries)
+
+
+def render_overview(entries: List[Entry]) -> str:
+    return "\n".join(e.render_overview() for e in entries)
+
+
+def latest_supervisory_marker(entries: List[Entry]) -> Optional[Tuple[str, str]]:
+    """Most recent readable intent or conversation text, excluding tool traffic."""
+    for entry in reversed(entries):
+        intents = [line for line in entry.overview if line.kind == "intent" and line.text]
+        if intents:
+            return "intent", intents[-1].text
+        messages = [line for line in entry.overview
+                    if line.kind in {"assistant", "user"} and line.text]
+        if messages:
+            return messages[-1].kind, messages[-1].text
+    return None
+
+
+def unread_after_id(cursor: Optional[Dict[str, Any]], *, identity_key: str,
+                    identity_value: str, last_key: str, ids: List[Any]) -> Optional[int]:
+    """Exact unread count for an id-addressed cursor, or None if it is stale."""
+    if cursor is None:
+        return len(ids)
+    if cursor.get(identity_key) != identity_value:
+        return None
+    try:
+        index = ids.index(cursor.get(last_key))
+    except ValueError:
+        return None
+    return len(ids) - index - 1
 
 
 # -- adapter: pi --------------------------------------------------------------
@@ -403,32 +565,140 @@ def pi_path_key_for_cwd(cwd: str) -> str:
     return f"--{trimmed.replace('/', '-')}--"
 
 
-def pi_resolve_session(cwd: Optional[str], hint: Optional[str]) -> Path:
-    if hint:
-        p = Path(hint).expanduser()
-        if p.exists():
-            return p
-        if PI_SESSIONS_ROOT.exists():
-            matches = [c for c in PI_SESSIONS_ROOT.rglob("*.jsonl") if hint in c.name]
-            if len(matches) == 1:
-                return matches[0]
-            if len(matches) > 1:
-                raise ValueError(f"Ambiguous pi session hint '{hint}'")
-        raise ValueError(f"pi session not found: {hint}")
-    if not cwd:
-        raise ValueError("pi: need cwd to resolve session")
-    target_dir = PI_SESSIONS_ROOT / pi_path_key_for_cwd(cwd)
-    if not target_dir.exists():
-        raise ValueError(f"pi: no sessions dir for cwd {cwd}")
-    files = sorted(target_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        raise ValueError(f"pi: no jsonl files in {target_dir}")
-    return files[0]
+def pi_filename_session_id(path: Path) -> Optional[str]:
+    """Session id embedded in a pi session filename (<timestamp>_<id>.jsonl)."""
+    stem = path.stem
+    if "_" not in stem:
+        return None
+    return stem.split("_", 1)[1]
+
+
+def pi_read_session_header(path: Path) -> Optional[Dict[str, Any]]:
+    """First line of a pi session JSONL if it is a valid session header."""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            first = f.readline()
+        header = json.loads(first)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(header, dict) or header.get("type") != "session":
+        return None
+    return header
+
+
+def pi_find_sessions_by_id(session_id: str, session_dir: Optional[str] = None) -> List[Path]:
+    """All session files whose identity is exactly `session_id`.
+
+    Identity requires BOTH the filename-embedded id and the header id to equal
+    `session_id` — the glob alone would false-match ids that are suffixes of
+    other ids. Searches the flat `session_dir` when given (pi --session-dir),
+    else every project dir under the default sessions root.
+    """
+    if session_dir:
+        base = Path(session_dir).expanduser()
+        candidates = list(base.glob(f"*_{session_id}.jsonl")) if base.is_dir() else []
+    elif PI_SESSIONS_ROOT.is_dir():
+        candidates = list(PI_SESSIONS_ROOT.glob(f"*/*_{session_id}.jsonl"))
+    else:
+        candidates = []
+    out = []
+    for c in candidates:
+        if pi_filename_session_id(c) != session_id:
+            continue
+        header = pi_read_session_header(c)
+        if header is None or header.get("id") != session_id:
+            continue
+        out.append(c)
+    return sorted(out)
+
+
+def pi_candidate_lines(cwd: Optional[str], session_dir: Optional[str] = None) -> List[str]:
+    """Human-readable candidate list for fail-closed diagnostics (never auto-picked)."""
+    if session_dir:
+        d = Path(session_dir).expanduser()
+    elif cwd:
+        d = PI_SESSIONS_ROOT / pi_path_key_for_cwd(cwd)
+    else:
+        return []
+    if not d.is_dir():
+        return []
+    lines = []
+    for p in sorted(d.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True)[:10]:
+        age_min = (time.time() - p.stat().st_mtime) / 60
+        sid = pi_filename_session_id(p) or "?"
+        lines.append(f"    id={sid}  age={age_min:.1f}m  {p}")
+    return lines
+
+
+def pi_resolve_by_session_id(session_id: str, pane_cwd: Optional[str],
+                             session_dir: Optional[str] = None) -> Path:
+    """Resolve a session id to exactly one session file, or raise.
+
+    Never considers mtime. Ambiguity (the same id under several project dirs)
+    is resolved only by the pane's cwd matching the session header cwd.
+    """
+    matches = pi_find_sessions_by_id(session_id, session_dir)
+    if not matches:
+        where = f"session dir {session_dir}" if session_dir else f"sessions root {PI_SESSIONS_ROOT}"
+        raise ValueError(
+            f"no session file found for session id '{session_id}' under {where}\n"
+            f"  pi persists a session on its first assistant reply — a freshly launched worker\n"
+            f"  has no JSONL yet. Wait for the worker's first turn, then retry.\n"
+            f"  Also verify the id matches the one given to `pi --session-id` at launch\n"
+            f"  (or the uuid in `pi --session <uuid>` for a resumed worker)."
+        )
+    if len(matches) > 1:
+        if pane_cwd:
+            pane_real = os.path.realpath(pane_cwd)
+            cwd_matches = [
+                m for m in matches
+                if os.path.realpath(str((pi_read_session_header(m) or {}).get("cwd", ""))) == pane_real
+            ]
+            if len(cwd_matches) == 1:
+                return cwd_matches[0]
+        listing = "\n".join(f"    {m}" for m in matches)
+        raise ValueError(
+            f"session id '{session_id}' matches multiple session files:\n{listing}\n"
+            f"  pass --path <file> to pick one explicitly (or --session-dir to scope the search)"
+        )
+    match = matches[0]
+    if pane_cwd and not session_dir:
+        header_cwd = str((pi_read_session_header(match) or {}).get("cwd", ""))
+        if os.path.realpath(header_cwd) != os.path.realpath(pane_cwd):
+            raise ValueError(
+                f"session '{session_id}' belongs to cwd {header_cwd}, but the tmux pane is in {pane_cwd}\n"
+                f"  this usually means the wrong pane target was given, or the worker was launched\n"
+                f"  in a different directory. Verify the pane, or pass --path to override deliberately."
+            )
+    return match
+
+
+def find_record_bound_to(path: Path, exclude_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Registered worker already bound to this transcript, if any."""
+    real = os.path.realpath(str(path))
+    for rec in list_records():
+        if exclude_id is not None and rec.get("id") == exclude_id:
+            continue
+        other = (rec.get("persisted") or {}).get("path")
+        if other and os.path.realpath(str(other)) == real:
+            return rec
+    return None
 
 
 def pi_load_active(path: Path) -> List[Dict[str, Any]]:
     lines = path.read_text(encoding="utf-8").splitlines()
-    parsed = [json.loads(line) for line in lines if line.strip()]
+    parsed = []
+    nonempty = [(index, line) for index, line in enumerate(lines) if line.strip()]
+    for position, (line_index, line) in enumerate(nonempty):
+        try:
+            parsed.append(json.loads(line))
+        except json.JSONDecodeError:
+            if position == len(nonempty) - 1:
+                # The worker may be in the middle of appending its final JSONL
+                # record. Ignore only that incomplete tail; malformed history
+                # elsewhere remains a loud error.
+                continue
+            raise ValueError(f"malformed pi session JSONL at line {line_index + 1}: {path}")
     if not parsed or parsed[0].get("type") != "session":
         raise ValueError(f"not a pi session file: {path}")
     entries = parsed[1:]
@@ -501,58 +771,121 @@ def pi_preview_args(args: Any, limit: int) -> str:
     return f"{k}={single_line(json.dumps(args[k], ensure_ascii=False), limit)}"
 
 
-def pi_format(entry: Dict[str, Any]) -> Entry:
+def pi_locator_context(entries: List[Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    ids = [str(entry.get("id")) for entry in entries if entry.get("id")]
+    prefixes = unique_prefixes(ids)
+    call_locators: Dict[str, str] = {}
+    for entry in entries:
+        eid = str(entry.get("id", "?"))
+        loc = prefixes.get(eid, eid)
+        msg = entry.get("message", {}) if entry.get("type") == "message" else {}
+        content = msg.get("content", []) if isinstance(msg.get("content", []), list) else []
+        calls = [block for block in content
+                 if isinstance(block, dict) and block.get("type") == "toolCall"]
+        for number, block in enumerate(calls, 1):
+            if block.get("id"):
+                call_locators[str(block["id"])] = f"{loc}/tool/{number}"
+    return prefixes, call_locators
+
+
+def pi_format(entry: Dict[str, Any], locator: Optional[str] = None,
+              call_locators: Optional[Dict[str, str]] = None) -> Entry:
     etype = entry.get("type")
-    eid = entry.get("id", "?")
+    eid = str(entry.get("id", "?"))
+    loc = locator or eid
+    call_locators = call_locators or {}
     ts = fmt_ts(entry.get("timestamp"))
     if etype != "message":
         if etype == "model_change":
-            return Entry(eid, ts, etype, f"[model] {ts} id={eid} {entry.get('provider', '?')}/{entry.get('modelId', '?')}")
+            model = f"{entry.get('provider', '?')}/{entry.get('modelId', '?')}"
+            return Entry(eid, ts, etype, f"[model] {ts} id={loc} {model}",
+                         overview=[OverviewLine(loc, ts, "model", model, limit=OVERVIEW_TOOL_TRUNC)])
         if etype == "compaction":
-            return Entry(eid, ts, etype, f"[compaction] {ts} id={eid}", "  " + single_line(entry.get("summary", ""), RESULT_TRUNC))
+            before = entry.get("tokensBefore")
+            text = f"from={before / 1000:.0f}k tokens" if isinstance(before, (int, float)) else "conversation compacted"
+            if entry.get("fromHook"):
+                text += " automatically"
+            return Entry(eid, ts, etype, f"[compaction] {ts} id={loc} {text}",
+                         overview=[OverviewLine(loc, ts, "compaction", text, limit=OVERVIEW_TOOL_TRUNC)])
         if etype == "branch_summary":
-            return Entry(eid, ts, etype, f"[branch-summary] {ts} id={eid} from={entry.get('fromId', '?')}", "  " + single_line(entry.get("summary", ""), RESULT_TRUNC))
-        return Entry(eid, ts, etype, f"[{etype}] {ts} id={eid}")
+            return Entry(eid, ts, etype, f"[branch-summary] {ts} id={loc}",
+                         overview=[OverviewLine(loc, ts, "branch-summary", limit=OVERVIEW_TOOL_TRUNC)])
+        return Entry(eid, ts, etype, f"[{etype}] {ts} id={loc}",
+                     overview=[OverviewLine(loc, ts, str(etype), "", limit=OVERVIEW_TOOL_TRUNC)])
 
     msg = entry.get("message", {})
     role = msg.get("role", "?")
     if role == "user":
         text = pi_stringify(msg.get("content", ""))
-        body = "\n".join("    " + line for line in trunc(text, TEXT_TRUNC).splitlines() or [""])
-        return Entry(eid, ts, "user", f"[user] {ts} id={eid}", "  text:\n" + body)
+        body = "\n".join("  " + line for line in trunc(text, TEXT_TRUNC).splitlines() or [""])
+        return Entry(eid, ts, "user", f"[user] {ts} id={loc}", body,
+                     overview=[OverviewLine(loc, ts, "user", text, preserve_tail=True)])
     if role == "assistant":
         content = msg.get("content", [])
         text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
         text = "\n".join(p for p in text_parts if p).strip()
         lines: List[str] = []
+        overview: List[OverviewLine] = []
         if text:
-            lines.append("  text:")
             for line in trunc(text, TEXT_TRUNC).splitlines() or [""]:
-                lines.append("    " + line)
+                lines.append("  " + line)
+            overview.append(OverviewLine(loc, ts, "assistant", text, preserve_tail=True))
+        thinking_number = 0
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict) or block.get("type") != "thinking":
+                continue
+            for label in reasoning_labels(block.get("thinking")):
+                thinking_number += 1
+                lines.append(f"  intent: {label}")
+                overview.append(OverviewLine(f"{loc}/thinking/{thinking_number}", ts, "intent", label,
+                                             limit=OVERVIEW_INTENT_TRUNC, preserve_tail=True))
+        tool_number = 0
         for tc in [b for b in content if isinstance(b, dict) and b.get("type") == "toolCall"]:
+            tool_number += 1
             preview = pi_preview_args(tc.get("arguments", {}), ARGS_TRUNC)
             suffix = f" {preview}" if preview else ""
-            lines.append(f"  toolCall: {tc.get('name', '?')}{suffix} [{tc.get('id', '?')}]")
-        sr = msg.get("stopReason")
+            child_loc = f"{loc}/tool/{tool_number}"
+            lines.append(f"  tool: {tc.get('name', '?')}{suffix} [{child_loc}]")
+            overview.append(OverviewLine(child_loc, ts, "tool",
+                                         f"{tc.get('name', '?')} {pi_preview_args(tc.get('arguments', {}), OVERVIEW_TOOL_TRUNC)}",
+                                         limit=OVERVIEW_TOOL_TRUNC))
+        sr = meaningful_stop_reason(msg.get("stopReason"), has_tool_call=tool_number > 0)
         if sr:
-            lines.append(f"  stopReason: {sr}")
-        return Entry(eid, ts, "assistant", f"[assistant] {ts} id={eid}", "\n".join(lines))
+            lines.append(f"  stop: {sr}")
+        if not overview:
+            overview.append(OverviewLine(loc, ts, "assistant", f"stop={sr}" if sr else "(no visible content)",
+                                         limit=OVERVIEW_TOOL_TRUNC))
+        return Entry(eid, ts, "assistant", f"[assistant] {ts} id={loc}", "\n".join(lines), overview=overview)
     if role == "toolResult":
         text = pi_stringify(msg.get("content", []))
-        err = " ERROR" if msg.get("isError") else ""
-        header = f"[toolResult{err}] {ts} id={eid} tool={msg.get('toolName', '?')} call={msg.get('toolCallId', '?')}"
-        body = f"  result: {single_line(text, RESULT_TRUNC)}" if text else ""
-        return Entry(eid, ts, "tool_result", header, body)
+        is_error = bool(msg.get("isError"))
+        err = " ERROR" if is_error else ""
+        tool = msg.get("toolName", "?")
+        call_ref = call_locators.get(str(msg.get("toolCallId", "")))
+        association = f" for={call_ref}" if call_ref else ""
+        header = f"[result{err}] {ts} id={loc} tool={tool}{association}"
+        body = f"  {single_line(text, RESULT_TRUNC)}" if text else ""
+        status = "ERROR " if is_error else ""
+        overview_text = f"{tool}{association} {status}{text}"
+        return Entry(eid, ts, "tool_result", header, body,
+                     overview=[OverviewLine(loc, ts, "result", overview_text,
+                                            limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True)])
     if role == "bashExecution":
         out = msg.get("output", "")
-        body_lines = [f"  command: {single_line(msg.get('command', ''), ARGS_TRUNC)}"]
+        command = msg.get("command", "")
+        body_lines = [f"  command: {single_line(command, ARGS_TRUNC)}"]
         if out:
             body_lines.append(f"  output: {single_line(out, RESULT_TRUNC)}")
         ec = msg.get("exitCode")
         if ec is not None:
             body_lines.append(f"  exitCode: {ec}")
-        return Entry(eid, ts, "bash", f"[bashExecution] {ts} id={eid}", "\n".join(body_lines))
-    return Entry(eid, ts, role, f"[{role}] {ts} id={eid}")
+        overview = [OverviewLine(f"{loc}/tool/1", ts, "tool", f"bash command={command}",
+                                 limit=OVERVIEW_TOOL_TRUNC)]
+        overview.append(OverviewLine(loc, ts, "result", f"bash exit={ec} {out}",
+                                     limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True))
+        return Entry(eid, ts, "bash", f"[bashExecution] {ts} id={loc}", "\n".join(body_lines), overview=overview)
+    return Entry(eid, ts, role, f"[{role}] {ts} id={loc}",
+                 overview=[OverviewLine(loc, ts, str(role), "", limit=OVERVIEW_TOOL_TRUNC)])
 
 
 class PiAdapter:
@@ -560,11 +893,20 @@ class PiAdapter:
 
     @staticmethod
     def session_path(rec: Dict[str, Any]) -> Path:
+        # The registered path is the worker's identity. If the file is gone,
+        # fail loudly — re-resolving "some other file" here (e.g. by recency)
+        # would silently attach another agent's transcript.
         path = rec.get("persisted", {}).get("path")
         if path and Path(path).exists():
             return Path(path)
-        cwd = rec.get("persisted", {}).get("cwd") or rec.get("extra", {}).get("cwd")
-        return pi_resolve_session(cwd, None)
+        sid = rec.get("extra", {}).get("session_id")
+        raise ValueError(
+            f"registered session file is gone: {path or '(none recorded)'}\n"
+            f"  worker '{rec.get('id')}'"
+            + (f" was bound to session id '{sid}'" if sid else "")
+            + " — if the session still exists, re-register (or pass --path); "
+            "superv never re-binds by recency."
+        )
 
     @classmethod
     def read_persisted(cls, rec: Dict[str, Any], count: Optional[int] = None,
@@ -577,7 +919,8 @@ class PiAdapter:
             ids = [e.get("id") for e in active]
             try:
                 idx = ids.index(last_id)
-                window = active[idx + 1:]
+                unread = active[idx + 1:]
+                window = unread[:count] if count is not None else unread
             except ValueError:
                 raise ValueError("cursor entry not on active branch — use 'watch --reset' to rebootstrap")
         else:
@@ -585,7 +928,11 @@ class PiAdapter:
                 raise ValueError(f"established session ({len(active)} entries) requires a cursor — use 'watch --reset' or 'watch --count N' to bootstrap")
             window = active[-(count or RECENT_COUNT_DEFAULT):]
 
-        rendered = [pi_format(e) for e in window]
+        prefix_by_id, call_locators = pi_locator_context(active)
+        rendered = [pi_format(e, prefix_by_id.get(str(e.get("id")), str(e.get("id", "?"))), call_locators)
+                    for e in window]
+        for formatted, raw in zip(rendered, window):
+            formatted.cursor_after = {"session_path": str(path), "last_entry_id": raw.get("id")}
         new_cursor = {
             "session_path": str(path),
             "last_entry_id": window[-1].get("id") if window else (active[-1].get("id") if active else None),
@@ -595,16 +942,95 @@ class PiAdapter:
     @classmethod
     def detail(cls, rec: Dict[str, Any], target: str) -> str:
         path = cls.session_path(rec)
-        for entry in pi_load_active(path):
-            if entry.get("id") == target:
-                return json.dumps(entry, indent=2, ensure_ascii=False)
+        entries = pi_load_active(path)
+        parent_target = target.split("/", 1)[0]
+        ids = [str(entry.get("id")) for entry in entries if entry.get("id")]
+        prefix_by_id, call_locators = pi_locator_context(entries)
+        parent_id = (resolve_unique_prefix(ids, parent_target, "pi entry id")
+                     if "/" in target or any(value.startswith(parent_target) for value in ids) else None)
+        for entry in entries:
+            eid = str(entry.get("id", "?"))
             if entry.get("type") == "message":
                 msg = entry.get("message", {})
+                content = msg.get("content", []) if isinstance(msg.get("content", []), list) else []
+                if parent_id == eid and "/" in target:
+                    suffix = target[len(parent_target):]
+                    if msg.get("role") == "bashExecution":
+                        if suffix != "/tool/1":
+                            raise ValueError(f"pi child locator not found: {target}")
+                        command, cut = clip_overview(msg.get("command", ""), DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                        return f"[tool] id={target} name=bash\n  command: {command}" + ("\n  (command shortened)" if cut else "")
+                    match = re.fullmatch(r"/(tool|thinking)/(\d+)", suffix)
+                    if not match:
+                        raise ValueError(f"invalid pi child locator: {target}")
+                    kind, number_text = match.groups()
+                    block_type = "toolCall" if kind == "tool" else "thinking"
+                    blocks = [block for block in content if isinstance(block, dict) and block.get("type") == block_type]
+                    number = int(number_text)
+                    if number < 1 or number > len(blocks):
+                        raise ValueError(f"pi child locator not found: {target}")
+                    block = blocks[number - 1]
+                    if kind == "thinking":
+                        return f"[intent] id={target}\n  " + "\n  ".join(reasoning_labels(block.get("thinking")))
+                    args = json.dumps(block.get("arguments", {}), ensure_ascii=False)
+                    shown, cut = clip_overview(args, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                    return f"[toolCall] id={target} name={block.get('name', '?')}\n  arguments: {shown}" + ("\n  (arguments shortened)" if cut else "")
                 if msg.get("role") == "toolResult" and msg.get("toolCallId") == target:
-                    return json.dumps(entry, indent=2, ensure_ascii=False)
-                for block in msg.get("content", []):
+                    return pi_format(entry).render()
+                for block in content:
                     if isinstance(block, dict) and block.get("type") == "toolCall" and block.get("id") == target:
-                        return json.dumps(block, indent=2, ensure_ascii=False)
+                        args = json.dumps(block.get("arguments", {}), ensure_ascii=False)
+                        shown, cut = clip_overview(args, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                        return f"[toolCall] id={target} name={block.get('name', '?')}\n  arguments: {shown}" + ("\n  (arguments shortened)" if cut else "")
+            if eid == target or (parent_id == eid and "/" not in target):
+                if entry.get("type") == "compaction":
+                    summary, cut = clip_overview(entry.get("summary", ""), TEXT_TRUNC, preserve_tail=True)
+                    rendered = pi_format(entry, prefix_by_id.get(eid, eid), call_locators).render()
+                    return f"{rendered}\n  summary: {summary}" + ("\n  (summary shortened)" if cut else "")
+                return pi_format(entry, prefix_by_id.get(eid, eid), call_locators).render()
+        raise ValueError(f"id not found on active branch: {target}")
+
+    @classmethod
+    def raw_detail(cls, rec: Dict[str, Any], target: str) -> Any:
+        entries = pi_load_active(cls.session_path(rec))
+        ids = [str(entry.get("id")) for entry in entries if entry.get("id")]
+        parent_target = target.split("/", 1)[0]
+        parent_id = (resolve_unique_prefix(ids, parent_target, "pi entry id")
+                     if "/" in target or any(value.startswith(parent_target) for value in ids) else None)
+        for entry in entries:
+            eid = str(entry.get("id", "?"))
+            if parent_id == eid and "/" in target:
+                suffix = target[len(parent_target):]
+                match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+                if not match:
+                    raise ValueError(f"invalid pi child locator: {target}")
+                kind, number_text = match.groups()
+                msg = entry.get("message", {}) if entry.get("type") == "message" else {}
+                if msg.get("role") == "bashExecution":
+                    if kind == "tool" and number_text == "1":
+                        return {"type": "toolCall", "name": "bash", "command": msg.get("command", "")}
+                    if kind == "result" and number_text == "1":
+                        return {"type": "toolResult", "output": msg.get("output", ""),
+                                "exitCode": msg.get("exitCode")}
+                    raise ValueError(f"pi child locator not found: {target}")
+                content = msg.get("content", []) if isinstance(msg.get("content", []), list) else []
+                block_type = {"tool": "toolCall", "thinking": "thinking", "result": "toolResult"}[kind]
+                blocks = [block for block in content
+                          if isinstance(block, dict) and block.get("type") == block_type]
+                number = int(number_text)
+                if number < 1 or number > len(blocks):
+                    raise ValueError(f"pi child locator not found: {target}")
+                return blocks[number - 1]
+            if eid == parent_id and "/" not in target:
+                return entry
+            if entry.get("type") == "message":
+                msg = entry.get("message", {})
+                content = msg.get("content", []) if isinstance(msg.get("content", []), list) else []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "toolCall" and block.get("id") == target:
+                        return block
+                if msg.get("role") == "toolResult" and msg.get("toolCallId") == target:
+                    return entry
         raise ValueError(f"id not found on active branch: {target}")
 
     @classmethod
@@ -624,53 +1050,117 @@ class PiAdapter:
     @classmethod
     def turn_state(cls, rec: Dict[str, Any]) -> str:
         try:
-            entries = pi_load_active(cls.session_path(rec))
+            return pi_turn_state_from_entries(pi_load_active(cls.session_path(rec)))
         except Exception:
             return "unknown"
-        for entry in reversed(entries):
-            if entry.get("type") != "message":
-                continue
-            msg = entry.get("message", {})
-            role = msg.get("role")
-            if role == "assistant":
-                content = msg.get("content", [])
-                has_tool_call = any(isinstance(b, dict) and b.get("type") == "toolCall" for b in content if isinstance(content, list))
-                stop = str(msg.get("stopReason") or msg.get("stop_reason") or "").lower()
-                if has_tool_call or stop in {"tooluse", "tool_use", "tool-use"}:
-                    return "busy"
-                return "idle"
-            if role in {"user", "toolResult", "bashExecution"}:
-                return "busy"
-            return "unknown"
-        return "unknown"
 
     @classmethod
     def status_signals(cls, rec: Dict[str, Any]) -> Dict[str, Any]:
         try:
             path = cls.session_path(rec)
-            mtime = path.stat().st_mtime
-            age = time.time() - mtime
+            age = time.time() - path.stat().st_mtime
+            active = pi_load_active(path)
+            visible = pi_displayable(active)
         except Exception:
-            path = None
-            age = float("inf")
-        ctx = pi_last_context_tokens(path) if path else None
-        return {"turn": cls.turn_state(rec), "persisted_age_s": age, "context_input_tokens": ctx}
+            return {
+                "turn": "unknown", "persisted_age_s": float("inf"),
+                "context_input_tokens": None, "context_window_tokens": None,
+                "unread_count": None, "latest_marker": None,
+            }
+        ids = [entry.get("id") for entry in visible]
+        unread = unread_after_id(load_cursor(rec["id"]), identity_key="session_path",
+                                 identity_value=str(path), last_key="last_entry_id", ids=ids)
+        recent = [pi_format(entry) for entry in visible[-50:]]
+        return {
+            "turn": pi_turn_state_from_entries(active),
+            "persisted_age_s": age,
+            "context_input_tokens": pi_last_context_tokens_from_entries(active),
+            "context_window_tokens": pi_context_window_tokens_from_entries(active),
+            "unread_count": unread,
+            "latest_marker": latest_supervisory_marker(recent),
+        }
 
 
-def pi_last_context_tokens(path: Path) -> Optional[int]:
-    """Most recent assistant turn's prompt token count.
-
-    Pi message.usage shape:
-      {"input": N, "output": M, "cacheRead": K, "cacheWrite": L, "totalTokens": ...}
-    Pi treats input and cacheRead as ADDITIVE (verified: totalTokens = input + cacheRead + output).
-    Total prompt = input + cacheRead.
-    Returns None when no usage block is found.
-    """
-    try:
-        entries = pi_load_active(path)
-    except Exception:
-        return None
+def pi_turn_state_from_entries(entries: List[Dict[str, Any]]) -> str:
     for entry in reversed(entries):
+        if entry.get("type") != "message":
+            continue
+        msg = entry.get("message", {})
+        role = msg.get("role")
+        if role == "assistant":
+            content = msg.get("content", [])
+            has_tool_call = any(
+                isinstance(block, dict) and block.get("type") == "toolCall"
+                for block in content if isinstance(content, list)
+            )
+            stop = str(msg.get("stopReason") or msg.get("stop_reason") or "").lower()
+            return "busy" if has_tool_call or stop in {"tooluse", "tool_use", "tool-use"} else "idle"
+        if role in {"user", "toolResult", "bashExecution"}:
+            return "busy"
+        return "unknown"
+    return "unknown"
+
+
+def _find_model_context_window(value: Any, provider: str, model: str,
+                               inherited_provider: Optional[str] = None) -> Optional[int]:
+    if isinstance(value, dict):
+        current_provider = str(value.get("provider") or value.get("providerId") or inherited_provider or "")
+        current_model = str(value.get("id") or value.get("model") or value.get("modelId") or "")
+        if current_model == model and (not provider or not current_provider or current_provider == provider):
+            candidate = value.get("contextWindow") or value.get("context_window")
+            try:
+                parsed = int(candidate)
+                if parsed > 0:
+                    return parsed
+            except (TypeError, ValueError):
+                pass
+        for key, child in value.items():
+            child_provider = current_provider
+            if key == provider or (inherited_provider is None and key not in {"providers", "models", "modelOverrides"}):
+                child_provider = str(key)
+            found = _find_model_context_window(child, provider, model, child_provider)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_model_context_window(child, provider, model, inherited_provider)
+            if found:
+                return found
+    return None
+
+
+def pi_context_window_tokens_from_entries(entries: List[Dict[str, Any]]) -> Optional[int]:
+    provider = ""
+    model = ""
+    for entry in reversed(entries):
+        if entry.get("type") == "message":
+            msg = entry.get("message", {})
+            if msg.get("role") == "assistant" and (msg.get("model") or msg.get("modelId")):
+                provider = str(msg.get("provider") or "")
+                model = str(msg.get("model") or msg.get("modelId"))
+                break
+        if entry.get("type") == "model_change" and entry.get("modelId"):
+            provider = str(entry.get("provider") or "")
+            model = str(entry.get("modelId"))
+            break
+    if not model:
+        return None
+    for models_path in (PI_MODELS_PATH, PI_MODELS_STORE_PATH):
+        try:
+            data = json.loads(models_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        found = _find_model_context_window(data, provider, model)
+        if found:
+            return found
+    return None
+
+
+def pi_last_context_tokens_from_entries(entries: List[Dict[str, Any]]) -> Optional[int]:
+    """Pi prompt tokens are input plus cacheRead; cacheRead is additive."""
+    for entry in reversed(entries):
+        if entry.get("type") == "compaction":
+            return None
         if entry.get("type") != "message":
             continue
         msg = entry.get("message", {})
@@ -738,6 +1228,8 @@ def claude_visible(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         t = e.get("type")
         if t in {"user", "assistant"}:
             out.append(e)
+        elif t == "system" and e.get("subtype") == "compact_boundary":
+            out.append(e)
     return out
 
 
@@ -779,35 +1271,72 @@ def claude_preview_args(args: Any, limit: int) -> str:
     return f"{k}={single_line(json.dumps(args[k], ensure_ascii=False), limit)}"
 
 
-def claude_format(entry: Dict[str, Any]) -> Entry:
+def claude_locator_context(entries: List[Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    ids = [str(entry.get("uuid")) for entry in entries if entry.get("uuid")]
+    prefixes = unique_prefixes(ids)
+    call_locators: Dict[str, str] = {}
+    for entry in entries:
+        uuid = str(entry.get("uuid", "?"))
+        loc = prefixes.get(uuid, uuid)
+        msg = entry.get("message", {})
+        content = msg.get("content", []) if isinstance(msg.get("content", []), list) else []
+        calls = [block for block in content
+                 if isinstance(block, dict) and block.get("type") == "tool_use"]
+        for number, block in enumerate(calls, 1):
+            if block.get("id"):
+                call_locators[str(block["id"])] = f"{loc}/tool/{number}"
+    return prefixes, call_locators
+
+
+def claude_format(entry: Dict[str, Any], locator: Optional[str] = None,
+                  call_locators: Optional[Dict[str, str]] = None) -> Entry:
     etype = entry.get("type")
-    uuid = entry.get("uuid", "?")
+    uuid = str(entry.get("uuid", "?"))
+    loc = locator or uuid
+    call_locators = call_locators or {}
     ts = fmt_ts(entry.get("timestamp"))
     if etype == "assistant":
         msg = entry.get("message", {})
         text_parts: List[str] = []
         tool_lines: List[str] = []
+        overview: List[OverviewLine] = []
+        thinking_number = 0
+        tool_number = 0
         for block in msg.get("content", []):
             if not isinstance(block, dict):
                 continue
             bt = block.get("type")
             if bt == "text":
                 text_parts.append(block.get("text", ""))
+            elif bt == "thinking":
+                for label in reasoning_labels(block.get("thinking")):
+                    thinking_number += 1
+                    tool_lines.append(f"  intent: {label}")
+                    overview.append(OverviewLine(f"{loc}/thinking/{thinking_number}", ts, "intent", label,
+                                                 limit=OVERVIEW_INTENT_TRUNC, preserve_tail=True))
             elif bt == "tool_use":
+                tool_number += 1
                 preview = claude_preview_args(block.get("input", {}), ARGS_TRUNC)
                 suffix = f" {preview}" if preview else ""
-                tool_lines.append(f"  toolUse: {block.get('name', '?')}{suffix} [{block.get('id', '?')}]")
+                child_loc = f"{loc}/tool/{tool_number}"
+                tool_lines.append(f"  tool: {block.get('name', '?')}{suffix} [{child_loc}]")
+                overview.append(OverviewLine(child_loc, ts, "tool",
+                                             f"{block.get('name', '?')} {claude_preview_args(block.get('input', {}), OVERVIEW_TOOL_TRUNC)}",
+                                             limit=OVERVIEW_TOOL_TRUNC))
         text = "\n".join(p for p in text_parts if p).strip()
         body_lines = []
         if text:
-            body_lines.append("  text:")
             for line in trunc(text, TEXT_TRUNC).splitlines() or [""]:
-                body_lines.append("    " + line)
+                body_lines.append("  " + line)
+            overview.insert(0, OverviewLine(loc, ts, "assistant", text, preserve_tail=True))
         body_lines.extend(tool_lines)
-        sr = msg.get("stop_reason")
+        sr = meaningful_stop_reason(msg.get("stop_reason"), has_tool_call=tool_number > 0)
         if sr:
-            body_lines.append(f"  stopReason: {sr}")
-        return Entry(uuid, ts, "assistant", f"[assistant] {ts} id={uuid}", "\n".join(body_lines))
+            body_lines.append(f"  stop: {sr}")
+        if not overview:
+            overview.append(OverviewLine(loc, ts, "assistant", f"stop={sr}" if sr else "(no visible content)",
+                                         limit=OVERVIEW_TOOL_TRUNC))
+        return Entry(uuid, ts, "assistant", f"[assistant] {ts} id={loc}", "\n".join(body_lines), overview=overview)
     if etype == "user":
         msg = entry.get("message", {})
         content = msg.get("content", "")
@@ -815,19 +1344,41 @@ def claude_format(entry: Dict[str, Any]) -> Entry:
             tool_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
             if tool_blocks:
                 lines = []
-                for block in tool_blocks:
-                    tool_id = block.get("tool_use_id", "?")
+                overview = []
+                for number, block in enumerate(tool_blocks, 1):
+                    tool_id = str(block.get("tool_use_id", "?"))
                     text = block.get("content", "")
                     if not isinstance(text, str):
                         text = claude_content_text(text)
-                    err = " ERROR" if block.get("is_error") else ""
-                    lines.append(f"[toolResult{err}] {ts} id={uuid} call={tool_id}")
-                    lines.append(f"  result: {single_line(text, RESULT_TRUNC)}")
-                return Entry(uuid, ts, "tool_result", "\n".join(lines))
+                    is_error = bool(block.get("is_error"))
+                    err = " ERROR" if is_error else ""
+                    result_loc = f"{loc}/result/{number}"
+                    call_ref = call_locators.get(tool_id)
+                    association = f" for={call_ref}" if call_ref else ""
+                    lines.append(f"[result{err}] {ts} id={result_loc}{association}")
+                    lines.append(f"  {single_line(text, RESULT_TRUNC)}")
+                    status = "ERROR " if is_error else ""
+                    overview.append(OverviewLine(result_loc, ts, "result",
+                                                 f"{association.strip()} {status}{text}".strip(),
+                                                 limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True))
+                return Entry(uuid, ts, "tool_result", "\n".join(lines), overview=overview)
         text = claude_content_text(content)
-        body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
-        return Entry(uuid, ts, "user", f"[user] {ts} id={uuid}", "  text:\n" + body)
-    return Entry(uuid, ts, etype or "other", f"[{etype}] {ts} id={uuid}")
+        body = "\n".join("  " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
+        return Entry(uuid, ts, "user", f"[user] {ts} id={loc}", body,
+                     overview=[OverviewLine(loc, ts, "user", text, preserve_tail=True)])
+    if etype == "system" and entry.get("subtype") == "compact_boundary":
+        meta = entry.get("compactMetadata") or {}
+        before = meta.get("preTokens")
+        after = meta.get("postTokens")
+        text = "conversation compacted"
+        if isinstance(before, (int, float)):
+            text = f"from={before / 1000:.0f}k tokens"
+            if isinstance(after, (int, float)):
+                text += f" to={after / 1000:.0f}k"
+        return Entry(uuid, ts, "compaction", f"[compaction] {ts} id={loc} {text}",
+                     overview=[OverviewLine(loc, ts, "compaction", text, limit=OVERVIEW_TOOL_TRUNC)])
+    return Entry(uuid, ts, etype or "other", f"[{etype}] {ts} id={loc}",
+                 overview=[OverviewLine(loc, ts, etype or "other", "", limit=OVERVIEW_TOOL_TRUNC)])
 
 
 class ClaudeAdapter:
@@ -838,8 +1389,20 @@ class ClaudeAdapter:
         path = rec.get("persisted", {}).get("path")
         if path and Path(path).exists():
             return Path(path)
-        cwd = rec.get("persisted", {}).get("cwd") or rec.get("extra", {}).get("cwd")
-        return claude_resolve_session(cwd, None)
+        # Stored transcript path is gone. Claude agents launch in the
+        # worktrees' PARENT folder, which several agents share, so the
+        # cwd-keyed projects dir holds other agents' transcripts too —
+        # "newest jsonl for this cwd" would happily grab someone else's.
+        # Re-resolve only by the stored session id; otherwise fail loudly.
+        sid = rec.get("extra", {}).get("session_id")
+        if not sid:
+            raise ValueError(
+                f"claude: stored session file is missing ({path or 'no path recorded'}) and the "
+                f"record has no extra.session_id to re-resolve it safely.\n"
+                f"  Refusing to guess by recency (shared cwd => could bind another agent's transcript).\n"
+                f"  Fix persisted.path, or re-register with an explicit --path."
+            )
+        return claude_resolve_session(None, sid)
 
     @classmethod
     def read_persisted(cls, rec, count=None, use_cursor=True):
@@ -851,14 +1414,19 @@ class ClaudeAdapter:
             ids = [e.get("uuid") for e in entries]
             try:
                 idx = ids.index(last_uuid)
-                window = entries[idx + 1:]
+                unread = entries[idx + 1:]
+                window = unread[:count] if count is not None else unread
             except ValueError:
                 raise ValueError("claude cursor not in session — use 'watch --reset' to rebootstrap")
         else:
             if cursor is None and len(entries) > ESTABLISHED_THRESHOLD and count is None:
                 raise ValueError(f"established session ({len(entries)} entries) requires a cursor")
             window = entries[-(count or RECENT_COUNT_DEFAULT):]
-        rendered = [claude_format(e) for e in window]
+        prefix_by_id, call_locators = claude_locator_context(entries)
+        rendered = [claude_format(e, prefix_by_id.get(str(e.get("uuid")), str(e.get("uuid", "?"))), call_locators)
+                    for e in window]
+        for formatted, raw in zip(rendered, window):
+            formatted.cursor_after = {"session_path": str(path), "last_entry_id": raw.get("uuid")}
         new_cursor = {
             "session_path": str(path),
             "last_entry_id": window[-1].get("uuid") if window else (entries[-1].get("uuid") if entries else None),
@@ -868,19 +1436,86 @@ class ClaudeAdapter:
     @classmethod
     def detail(cls, rec, target):
         path = cls.session_path(rec)
-        for entry in claude_load_entries(path):
-            if entry.get("uuid") == target:
-                return json.dumps(entry, indent=2, ensure_ascii=False)
+        entries = claude_visible(claude_load_entries(path))
+        ids = [str(entry.get("uuid")) for entry in entries if entry.get("uuid")]
+        parent_target = target.split("/", 1)[0]
+        parent_id = None
+        if "/" in target or any(value.startswith(parent_target) for value in ids):
+            parent_id = resolve_unique_prefix(ids, parent_target, "claude entry id")
+        prefix_by_id, call_locators = claude_locator_context(entries)
+        for entry in entries:
+            uuid = str(entry.get("uuid", "?"))
             msg = entry.get("message", {})
             content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "tool_use" and block.get("id") == target:
-                        return json.dumps(block, indent=2, ensure_ascii=False)
-                    if block.get("type") == "tool_result" and block.get("tool_use_id") == target:
-                        return json.dumps(block, indent=2, ensure_ascii=False)
+            blocks = content if isinstance(content, list) else []
+            if parent_id == uuid and "/" in target:
+                suffix = target[len(parent_target):]
+                match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+                if not match:
+                    raise ValueError(f"invalid claude child locator: {target}")
+                kind, number_text = match.groups()
+                block_type = {"tool": "tool_use", "thinking": "thinking", "result": "tool_result"}[kind]
+                selected = [block for block in blocks if isinstance(block, dict) and block.get("type") == block_type]
+                number = int(number_text)
+                if number < 1 or number > len(selected):
+                    raise ValueError(f"claude child locator not found: {target}")
+                block = selected[number - 1]
+                if kind == "thinking":
+                    return f"[intent] id={target}\n  " + "\n  ".join(reasoning_labels(block.get("thinking")))
+                value = block.get("input", {}) if kind == "tool" else block.get("content", "")
+                text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+                shown, cut = clip_overview(text, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                return f"[{kind}] id={target}\n  {shown}" + (f"\n  ({kind} content shortened)" if cut else "")
+            if uuid == parent_id and "/" not in target:
+                return claude_format(entry, prefix_by_id.get(uuid, uuid), call_locators).render()
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use" and block.get("id") == target:
+                    value = json.dumps(block.get("input", {}), ensure_ascii=False)
+                    shown, cut = clip_overview(value, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                    return f"[tool] id={target} name={block.get('name', '?')}\n  input: {shown}" + ("\n  (input shortened)" if cut else "")
+                if block.get("type") == "tool_result" and block.get("tool_use_id") == target:
+                    value = block.get("content", "")
+                    text = value if isinstance(value, str) else claude_content_text(value)
+                    shown, cut = clip_overview(text, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+                    return f"[result] call={target}\n  {shown}" + ("\n  (result shortened)" if cut else "")
+        raise ValueError(f"id not found: {target}")
+
+    @classmethod
+    def raw_detail(cls, rec, target):
+        entries = claude_visible(claude_load_entries(cls.session_path(rec)))
+        ids = [str(entry.get("uuid")) for entry in entries if entry.get("uuid")]
+        parent_target = target.split("/", 1)[0]
+        parent_id = (resolve_unique_prefix(ids, parent_target, "claude entry id")
+                     if "/" in target or any(value.startswith(parent_target) for value in ids) else None)
+        for entry in entries:
+            entry_id = str(entry.get("uuid", "?"))
+            msg = entry.get("message", {})
+            content = msg.get("content")
+            blocks = content if isinstance(content, list) else []
+            if parent_id == entry_id and "/" in target:
+                suffix = target[len(parent_target):]
+                match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+                if not match:
+                    raise ValueError(f"invalid claude child locator: {target}")
+                kind, number_text = match.groups()
+                block_type = {"tool": "tool_use", "thinking": "thinking", "result": "tool_result"}[kind]
+                selected = [block for block in blocks
+                            if isinstance(block, dict) and block.get("type") == block_type]
+                number = int(number_text)
+                if number < 1 or number > len(selected):
+                    raise ValueError(f"claude child locator not found: {target}")
+                return selected[number - 1]
+            if entry_id == parent_id and "/" not in target:
+                return entry
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use" and block.get("id") == target:
+                    return block
+                if block.get("type") == "tool_result" and block.get("tool_use_id") == target:
+                    return block
         raise ValueError(f"id not found: {target}")
 
     @classmethod
@@ -900,61 +1535,61 @@ class ClaudeAdapter:
     @classmethod
     def turn_state(cls, rec) -> str:
         try:
-            entries = claude_visible(claude_load_entries(cls.session_path(rec)))
+            return claude_turn_state_from_entries(claude_visible(claude_load_entries(cls.session_path(rec))))
         except Exception:
             return "unknown"
-        if not entries:
-            return "unknown"
-        last = entries[-1]
-        etype = last.get("type")
-        msg = last.get("message", {})
-        if etype == "assistant":
-            content = msg.get("content", [])
-            has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content if isinstance(content, list))
-            stop = str(msg.get("stop_reason") or msg.get("stopReason") or "").lower()
-            if has_tool_use or stop in {"tool_use", "tooluse", "tool-use"}:
-                return "busy"
-            return "idle"
-        if etype == "user":
-            return "busy"
-        return "unknown"
 
     @classmethod
     def status_signals(cls, rec):
         try:
             path = cls.session_path(rec)
             age = time.time() - path.stat().st_mtime
+            visible = claude_visible(claude_load_entries(path))
         except Exception:
-            path = None
-            age = float("inf")
-        ctx = claude_last_context_tokens(path) if path else None
-        return {"turn": cls.turn_state(rec), "persisted_age_s": age, "context_input_tokens": ctx}
+            return {
+                "turn": "unknown", "persisted_age_s": float("inf"),
+                "context_input_tokens": None, "unread_count": None, "latest_marker": None,
+            }
+        ids = [entry.get("uuid") for entry in visible]
+        unread = unread_after_id(load_cursor(rec["id"]), identity_key="session_path",
+                                 identity_value=str(path), last_key="last_entry_id", ids=ids)
+        recent = [claude_format(entry) for entry in visible[-50:]]
+        return {
+            "turn": claude_turn_state_from_entries(visible),
+            "persisted_age_s": age,
+            "context_input_tokens": claude_last_context_tokens_from_entries(visible),
+            "unread_count": unread,
+            "latest_marker": latest_supervisory_marker(recent),
+        }
 
 
-def claude_last_context_tokens(path: Path) -> Optional[int]:
-    """Most recent assistant turn's prompt token count.
-
-    Claude message.usage shape:
-      {"input_tokens": N, "cache_read_input_tokens": K, "cache_creation_input_tokens": L, "output_tokens": M}
-    Where input_tokens, cache_read_input_tokens, and cache_creation_input_tokens
-    are SEPARATE (additive). Total prompt = sum of the three.
-    Returns None when no usage block is found in the tail.
-    """
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 50000))
-            tail_lines = f.read().splitlines()
-    except Exception:
-        return None
-    for line in reversed(tail_lines):
-        if not line.strip():
+def claude_turn_state_from_entries(entries: List[Dict[str, Any]]) -> str:
+    for last in reversed(entries):
+        etype = last.get("type")
+        if etype == "system" and last.get("subtype") == "compact_boundary":
             continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
+        msg = last.get("message", {})
+        break
+    else:
+        return "unknown"
+    if etype == "assistant":
+        content = msg.get("content", [])
+        has_tool_use = any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content if isinstance(content, list)
+        )
+        stop = str(msg.get("stop_reason") or msg.get("stopReason") or "").lower()
+        return "busy" if has_tool_use or stop in {"tool_use", "tooluse", "tool-use"} else "idle"
+    if etype == "user":
+        return "busy"
+    return "unknown"
+
+
+def claude_last_context_tokens_from_entries(entries: List[Dict[str, Any]]) -> Optional[int]:
+    """Claude prompt tokens sum input, cache-read input, and cache-creation input."""
+    for obj in reversed(entries):
+        if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
+            return None
         usage = (obj.get("message") or {}).get("usage")
         if not isinstance(usage, dict):
             continue
@@ -1011,57 +1646,89 @@ def codex_load_entries(path: Path) -> List[Dict[str, Any]]:
     return out
 
 
-def codex_visible(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Filter codex JSONL entries to a deduplicated, supervisor-relevant set.
+def codex_reasoning_text(payload: Dict[str, Any]) -> str:
+    parts = []
+    summary = payload.get("summary")
+    for item in summary if isinstance(summary, list) else []:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            value = item.get("text") or item.get("summary_text")
+            if value:
+                parts.append(str(value))
+    return "\n\n".join(parts)
 
-    Codex emits each user/assistant message twice — once as event_msg
-    (user_message / agent_message) and once as response_item.message.
-    response_item is the canonical primary record (it carries full content
-    structure including tool calls), so we surface that and drop the
-    event_msg duplicates. We keep event_msg.task_started / task_complete
-    because they have no response_item analogue and signal turn boundaries.
-    """
-    out = []
-    for e in entries:
+
+def codex_is_call_type(ptype: Any) -> bool:
+    value = str(ptype or "")
+    return value.endswith("_call") or value in {"function_call", "web_search_call", "local_shell_call"}
+
+
+def codex_is_output_type(ptype: Any) -> bool:
+    value = str(ptype or "")
+    return value.endswith("_call_output") or value in {"function_call_output"}
+
+
+def codex_visible_indexed(entries: List[Dict[str, Any]], *, legacy: bool = False) -> List[Tuple[int, Dict[str, Any]]]:
+    """Deduplicated supervisor-relevant Codex entries with stable raw indices."""
+    out: List[Tuple[int, Dict[str, Any]]] = []
+    for raw_index, e in enumerate(entries):
         t = e.get("type")
-        if t == "session_meta":
+        payload = e.get("payload", {})
+        ptype = payload.get("type")
+        if t in {"session_meta", "turn_context"}:
             continue
-        if t == "turn_context":
+        if legacy:
+            if t == "event_msg" and ptype in {"task_started", "task_complete"}:
+                out.append((raw_index, e))
+            elif t == "response_item" and ptype in {"message", "function_call", "function_call_output"}:
+                if ptype != "message" or payload.get("role") != "developer":
+                    out.append((raw_index, e))
             continue
         if t == "event_msg":
-            ptype = e.get("payload", {}).get("type")
-            # Skip user_message/agent_message — duplicated by response_item.message.
-            if ptype in {"task_started", "task_complete"}:
-                out.append(e)
+            # user_message/agent_message duplicate response_item.message.
+            if ptype in {"task_started", "task_complete", "context_compacted"}:
+                out.append((raw_index, e))
         elif t == "response_item":
-            ptype = e.get("payload", {}).get("type")
-            if ptype in {"message", "function_call", "function_call_output"}:
-                role = e.get("payload", {}).get("role")
-                if ptype == "message" and role == "developer":
-                    continue
-                out.append(e)
+            if ptype == "message":
+                if payload.get("role") != "developer":
+                    out.append((raw_index, e))
+            elif codex_is_call_type(ptype) or codex_is_output_type(ptype):
+                out.append((raw_index, e))
+            elif ptype == "reasoning" and codex_reasoning_text(payload):
+                out.append((raw_index, e))
+        elif t == "compacted":
+            out.append((raw_index, e))
     return out
+
+
+def codex_visible(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [entry for _, entry in codex_visible_indexed(entries)]
 
 
 def codex_format(entry: Dict[str, Any], idx: int) -> Entry:
     ts = fmt_ts(entry.get("timestamp"))
-    eid = f"codex-{idx}"
+    eid = f"codex-r{idx}"
     payload = entry.get("payload", {})
     ptype = payload.get("type", "?")
 
     if entry.get("type") == "event_msg":
         if ptype == "task_started":
-            return Entry(eid, ts, "system", f"[task_started] {ts} id={eid} turn={payload.get('turn_id', '?')}")
+            text = f"turn={payload.get('turn_id', '?')}"
+            return Entry(eid, ts, "system", f"[task_started] {ts} id={eid} {text}",
+                         overview=[OverviewLine(eid, ts, "task-started", text, limit=OVERVIEW_TOOL_TRUNC)])
         if ptype == "task_complete":
-            return Entry(eid, ts, "system", f"[task_complete] {ts} id={eid}")
-        if ptype == "user_message":
-            text = payload.get("message") or payload.get("text") or ""
-            body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
-            return Entry(eid, ts, "user", f"[user] {ts} id={eid}", "  text:\n" + body)
-        if ptype == "agent_message":
-            text = payload.get("message") or ""
-            body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
-            return Entry(eid, ts, "assistant", f"[assistant] {ts} id={eid}", "  text:\n" + body)
+            return Entry(eid, ts, "system", f"[task_complete] {ts} id={eid}",
+                         overview=[OverviewLine(eid, ts, "task-complete", "", limit=OVERVIEW_TOOL_TRUNC)])
+        if ptype == "context_compacted":
+            return Entry(eid, ts, "compaction", f"[compaction] {ts} id={eid}",
+                         overview=[OverviewLine(eid, ts, "compaction", "conversation compacted",
+                                                limit=OVERVIEW_TOOL_TRUNC)])
+
+    if entry.get("type") == "compacted":
+        return Entry(eid, ts, "compaction", f"[compaction] {ts} id={eid}",
+                     overview=[OverviewLine(eid, ts, "compaction", "conversation compacted",
+                                            limit=OVERVIEW_TOOL_TRUNC)])
 
     if entry.get("type") == "response_item":
         if ptype == "message":
@@ -1077,21 +1744,43 @@ def codex_format(entry: Dict[str, Any], idx: int) -> Entry:
             text = "\n".join(p for p in text_parts if p).strip()
             body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
             label = "user" if role == "user" else ("assistant" if role == "assistant" else role)
-            return Entry(eid, ts, label, f"[{label}] {ts} id={eid}", "  text:\n" + body)
-        if ptype == "function_call":
-            name = payload.get("name", "?")
-            args = payload.get("arguments", "")
-            preview = single_line(args, ARGS_TRUNC) if isinstance(args, str) else single_line(json.dumps(args), ARGS_TRUNC)
+            return Entry(eid, ts, label, f"[{label}] {ts} id={eid}", "  text:\n" + body,
+                         overview=[OverviewLine(eid, ts, label, text, preserve_tail=True)])
+        if ptype == "reasoning":
+            text = codex_reasoning_text(payload)
+            body = "\n".join(f"  intent: {label}" for label in reasoning_labels(text))
+            return Entry(eid, ts, "intent", f"[intent] {ts} id={eid}", body,
+                         overview=[OverviewLine(eid, ts, "intent", label,
+                                                limit=OVERVIEW_INTENT_TRUNC, preserve_tail=True)
+                                   for label in reasoning_labels(text)])
+        if codex_is_call_type(ptype):
+            name = payload.get("name") or str(ptype).removesuffix("_call") or "?"
+            value = payload.get("arguments")
+            if value is None:
+                value = payload.get("input")
+            if value is None:
+                value = payload.get("command")
+            if value is None:
+                value = payload.get("action", "")
+            raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            preview = single_line(raw, ARGS_TRUNC)
             call_id = payload.get("call_id", payload.get("id", "?"))
-            return Entry(eid, ts, "tool_call", f"[function_call] {ts} id={eid} call={call_id}", f"  {name}({preview})")
-        if ptype == "function_call_output":
+            return Entry(eid, ts, "tool_call", f"[{ptype}] {ts} id={eid} call={call_id}", f"  {name}({preview})",
+                         overview=[OverviewLine(eid, ts, "tool", f"{name} {raw}", limit=OVERVIEW_TOOL_TRUNC)])
+        if codex_is_output_type(ptype):
             output = payload.get("output", "")
             if isinstance(output, dict):
-                output = output.get("content", "") or json.dumps(output)
+                output = output.get("content", "") or json.dumps(output, ensure_ascii=False)
             call_id = payload.get("call_id", payload.get("id", "?"))
-            return Entry(eid, ts, "tool_result", f"[function_call_output] {ts} id={eid} call={call_id}", f"  output: {single_line(str(output), RESULT_TRUNC)}")
+            status = payload.get("status")
+            status_text = f"status={status} " if status else ""
+            return Entry(eid, ts, "tool_result", f"[{ptype}] {ts} id={eid} call={call_id}", f"  output: {single_line(str(output), RESULT_TRUNC)}",
+                         overview=[OverviewLine(eid, ts, "result", f"{status_text}{output}",
+                                                limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True)])
 
-    return Entry(eid, ts, "other", f"[{entry.get('type', '?')}/{ptype}] {ts} id={eid}")
+    return Entry(eid, ts, "other", f"[{entry.get('type', '?')}/{ptype}] {ts} id={eid}",
+                 overview=[OverviewLine(eid, ts, "other", f"{entry.get('type', '?')}/{ptype}",
+                                        limit=OVERVIEW_TOOL_TRUNC)])
 
 
 class CodexAdapter:
@@ -1102,6 +1791,10 @@ class CodexAdapter:
         path = rec.get("persisted", {}).get("path")
         if path and Path(path).exists():
             return Path(path)
+        # Prefer the stored session id. The cwd fallback is acceptable for
+        # codex only because codex agents (unlike pi/claude) still launch
+        # INSIDE their worktree — cwd is unique per agent, since codex
+        # sessions bind by rollout payload.cwd and have no id-based binding.
         cwd = rec.get("persisted", {}).get("cwd") or rec.get("extra", {}).get("cwd")
         sid = rec.get("extra", {}).get("session_id")
         return codex_resolve_session(cwd, sid)
@@ -1109,37 +1802,74 @@ class CodexAdapter:
     @classmethod
     def read_persisted(cls, rec, count=None, use_cursor=True):
         path = cls.session_path(rec)
-        entries = codex_visible(codex_load_entries(path))
-        # Provide stable indices matching pre-cursor positions
-        indexed = list(enumerate(entries))
+        raw_entries = codex_load_entries(path)
+        indexed = codex_visible_indexed(raw_entries)
         cursor = load_cursor(rec["id"]) if use_cursor else None
         if cursor and cursor.get("session_path") == str(path):
-            last_idx = cursor.get("last_idx", -1)
-            window = [(i, e) for i, e in indexed if i > last_idx]
+            if "last_raw_idx" in cursor:
+                last_raw_idx = int(cursor.get("last_raw_idx", -1))
+            else:
+                # Migrate the previous visible-index cursor without changing its
+                # meaning when newly supported Codex tool types become visible.
+                legacy = codex_visible_indexed(raw_entries, legacy=True)
+                old_idx = int(cursor.get("last_idx", -1))
+                last_raw_idx = legacy[old_idx][0] if 0 <= old_idx < len(legacy) else -1
+            unread = [(i, e) for i, e in indexed if i > last_raw_idx]
+            window = unread[:count] if count is not None else unread
         else:
-            if cursor is None and len(entries) > ESTABLISHED_THRESHOLD and count is None:
-                raise ValueError(f"established session ({len(entries)} entries) requires a cursor")
+            if cursor is None and len(indexed) > ESTABLISHED_THRESHOLD and count is None:
+                raise ValueError(f"established session ({len(indexed)} entries) requires a cursor")
             window = indexed[-(count or RECENT_COUNT_DEFAULT):]
         rendered = [codex_format(e, i) for i, e in window]
-        last_idx = window[-1][0] if window else (len(entries) - 1 if entries else -1)
-        new_cursor = {"session_path": str(path), "last_idx": last_idx}
+        for formatted, (raw_index, _) in zip(rendered, window):
+            formatted.cursor_after = {"session_path": str(path), "cursor_version": 2, "last_raw_idx": raw_index}
+        last_raw_idx = window[-1][0] if window else (indexed[-1][0] if indexed else -1)
+        new_cursor = {"session_path": str(path), "cursor_version": 2, "last_raw_idx": last_raw_idx}
         return rendered, new_cursor
 
     @classmethod
     def detail(cls, rec, target):
         path = cls.session_path(rec)
         entries = codex_load_entries(path)
-        m = re.match(r"^codex-(\d+)$", target)
-        if m:
-            visible = codex_visible(entries)
-            i = int(m.group(1))
-            if 0 <= i < len(visible):
-                return json.dumps(visible[i], indent=2, ensure_ascii=False)
-        # try call_id match
-        for e in entries:
+        raw_match = re.fullmatch(r"codex-r(\d+)", target)
+        if raw_match:
+            raw_index = int(raw_match.group(1))
+            if 0 <= raw_index < len(entries):
+                return codex_format(entries[raw_index], raw_index).render()
+        legacy_match = re.fullmatch(r"codex-(\d+)", target)
+        if legacy_match:
+            legacy = codex_visible_indexed(entries, legacy=True)
+            visible_index = int(legacy_match.group(1))
+            if 0 <= visible_index < len(legacy):
+                raw_index, entry = legacy[visible_index]
+                return codex_format(entry, raw_index).render()
+        for raw_index, e in enumerate(entries):
             payload = e.get("payload", {})
             if payload.get("call_id") == target or payload.get("id") == target:
-                return json.dumps(e, indent=2, ensure_ascii=False)
+                return codex_format(e, raw_index).render()
+        raise ValueError(f"id not found: {target}")
+
+    @classmethod
+    def raw_detail(cls, rec, target):
+        entries = codex_load_entries(cls.session_path(rec))
+        raw_match = re.fullmatch(r"codex-r(\d+)", target)
+        if raw_match:
+            raw_index = int(raw_match.group(1))
+            if 0 <= raw_index < len(entries):
+                return entries[raw_index]
+        legacy_match = re.fullmatch(r"codex-(\d+)", target)
+        if legacy_match:
+            legacy = codex_visible_indexed(entries, legacy=True)
+            visible_index = int(legacy_match.group(1))
+            if 0 <= visible_index < len(legacy):
+                return legacy[visible_index][1]
+        matches = [entry for entry in entries
+                   if (entry.get("payload") or {}).get("call_id") == target
+                   or (entry.get("payload") or {}).get("id") == target]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return matches
         raise ValueError(f"id not found: {target}")
 
     @classmethod
@@ -1158,77 +1888,94 @@ class CodexAdapter:
 
     @classmethod
     def turn_state(cls, rec) -> str:
-        # KNOWN-ISSUE (status accuracy, informational only): unrecognized entries are silently
-        # skipped, falling through to an older (often idle-looking) entry — response_item types
-        # local_shell_call / custom_tool_call / web_search_call have no branch, so a rollout that
-        # records shell work that way reads idle for the whole exec. Fix sketch: map the
-        # *_call/*_call_output families -> busy; return unknown for unrecognized response_item types.
         try:
-            entries = codex_load_entries(cls.session_path(rec))
+            return codex_turn_state_from_entries(codex_load_entries(cls.session_path(rec)))
         except Exception:
             return "unknown"
-        for last in reversed(entries):
-            payload = last.get("payload", {})
-            ptype = payload.get("type")
-            etype = last.get("type")
-            if etype in {"session_meta", "turn_context"} or ptype in {"token_count", "reasoning"}:
-                continue
-            if etype == "event_msg":
-                if ptype == "task_complete":
-                    return "idle"
-                if ptype in {"task_started", "user_message"}:
-                    return "busy"
-                if ptype == "agent_message":
-                    return "idle"
-                continue
-            if etype == "response_item":
-                if ptype in {"function_call", "function_call_output"}:
-                    return "busy"
-                if ptype == "message":
-                    role = payload.get("role")
-                    if role == "assistant":
-                        return "idle"
-                    if role == "user":
-                        return "busy"
-                    if role == "developer":
-                        continue
-        return "unknown"
 
     @classmethod
     def status_signals(cls, rec):
         try:
             path = cls.session_path(rec)
             age = time.time() - path.stat().st_mtime
+            raw_entries = codex_load_entries(path)
+            indexed = codex_visible_indexed(raw_entries)
         except Exception:
-            path = None
-            age = float("inf")
-        ctx, window = codex_last_context_tokens(path) if path else (None, None)
+            return {
+                "turn": "unknown", "persisted_age_s": float("inf"),
+                "context_input_tokens": None, "context_window_tokens": None,
+                "unread_count": None, "latest_marker": None,
+            }
+        cursor = load_cursor(rec["id"])
+        if cursor is None:
+            unread = len(indexed)
+        elif cursor.get("session_path") != str(path):
+            unread = None
+        else:
+            try:
+                if "last_raw_idx" in cursor:
+                    last_raw_idx = int(cursor.get("last_raw_idx", -1))
+                else:
+                    legacy = codex_visible_indexed(raw_entries, legacy=True)
+                    old_idx = int(cursor.get("last_idx", -1))
+                    last_raw_idx = legacy[old_idx][0] if 0 <= old_idx < len(legacy) else -1
+                unread = sum(raw_index > last_raw_idx for raw_index, _ in indexed)
+            except (TypeError, ValueError):
+                unread = None
+        recent = [codex_format(entry, raw_index) for raw_index, entry in indexed[-50:]]
+        ctx, window = codex_last_context_tokens_from_entries(raw_entries)
         return {
-            "turn": cls.turn_state(rec),
+            "turn": codex_turn_state_from_entries(raw_entries),
             "persisted_age_s": age,
             "context_input_tokens": ctx,
             "context_window_tokens": window,
+            "unread_count": unread,
+            "latest_marker": latest_supervisory_marker(recent),
         }
 
 
-def codex_last_context_tokens(path: Path) -> Tuple[Optional[int], Optional[int]]:
-    """Return (last-turn input token count, model context window) from the
-    most recent token_count event in the JSONL.
+def codex_turn_state_from_entries(entries: List[Dict[str, Any]]) -> str:
+    for last in reversed(entries):
+        payload = last.get("payload", {})
+        ptype = payload.get("type")
+        etype = last.get("type")
+        if etype in {"session_meta", "turn_context"} or ptype in {"token_count", "reasoning"}:
+            continue
+        if etype == "event_msg":
+            if ptype == "task_complete":
+                return "idle"
+            if ptype in {"task_started", "user_message"}:
+                return "busy"
+            if ptype == "agent_message":
+                return "idle"
+            continue
+        if etype == "response_item":
+            if codex_is_call_type(ptype) or codex_is_output_type(ptype):
+                return "busy"
+            if ptype == "message":
+                role = payload.get("role")
+                if role == "assistant":
+                    return "idle"
+                if role == "user":
+                    return "busy"
+                if role == "developer":
+                    continue
+            if ptype == "reasoning":
+                return "busy"
+            return "unknown"
+    return "unknown"
 
-    Codex emits event_msg entries of type token_count with:
-      info.last_token_usage.input_tokens     — most recent prompt size
-      info.total_token_usage.input_tokens    — cumulative across turns
-      info.model_context_window              — model's context window
-    Codex semantics: input_tokens INCLUDES cached_input_tokens (subset, not additive).
-    """
-    try:
-        entries = codex_load_entries(path)
-    except Exception:
-        return (None, None)
+
+def codex_last_context_tokens_from_entries(entries: List[Dict[str, Any]]) -> Tuple[Optional[int], Optional[int]]:
+    """Codex input_tokens includes cached_input_tokens rather than adding it."""
     for entry in reversed(entries):
+        payload = entry.get("payload", {})
+        if entry.get("type") == "compacted" or (
+            entry.get("type") == "event_msg" and payload.get("type") == "context_compacted"
+        ):
+            return (None, None)
         if entry.get("type") != "event_msg":
             continue
-        payload = entry.get("payload", {})
         if payload.get("type") != "token_count":
             continue
         info = payload.get("info", {})
@@ -1271,14 +2018,24 @@ class OpenCodeAdapter:
             raise ValueError("opencode: unexpected /message response")
         cursor = load_cursor(rec["id"]) if use_cursor else None
         if cursor and cursor.get("session_id") == sid:
-            last_count = cursor.get("last_msg_count", 0)
-            window = messages[last_count:]
+            start = int(cursor.get("last_msg_count", 0))
+            indexed = list(enumerate(messages[start:], start))
+            window = indexed[:count] if count is not None else indexed
         else:
-            if cursor is None and len(messages) > ESTABLISHED_THRESHOLD:
+            if cursor is None and len(messages) > ESTABLISHED_THRESHOLD and count is None:
                 raise ValueError(f"established session ({len(messages)} messages) requires a cursor")
-            window = messages[-(count or RECENT_COUNT_DEFAULT):] if count is not None or cursor is None else messages
-        rendered = [oc_format_message(m, idx + (len(messages) - len(window))) for idx, m in enumerate(window)]
-        new_cursor = {"session_id": sid, "last_msg_count": len(messages)}
+            start = max(0, len(messages) - (count or RECENT_COUNT_DEFAULT))
+            window = list(enumerate(messages[start:], start))
+        message_ids = [str(m.get("id") or m.get("info", {}).get("id") or f"oc-{i}") for i, m in enumerate(messages)]
+        prefix_by_id = unique_prefixes(message_ids)
+        rendered = []
+        for index, message in window:
+            message_id = message_ids[index]
+            formatted = oc_format_message(message, index, prefix_by_id.get(message_id, message_id))
+            formatted.cursor_after = {"session_id": sid, "last_msg_count": index + 1}
+            rendered.append(formatted)
+        last_count = window[-1][0] + 1 if window else len(messages)
+        new_cursor = {"session_id": sid, "last_msg_count": last_count}
         return rendered, new_cursor
 
     @classmethod
@@ -1286,11 +2043,67 @@ class OpenCodeAdapter:
         sid = cls.session_id(rec)
         directory = cls.directory(rec)
         messages = http_get(f"/session/{sid}/message", directory=directory)
-        for i, m in enumerate(messages):
-            mid = m.get("id") or m.get("info", {}).get("id") or f"oc-{i}"
-            if mid == target or f"oc-{i}" == target:
-                return json.dumps(m, indent=2, ensure_ascii=False)
-        raise ValueError(f"opencode message not found: {target}")
+        ids = [str(m.get("id") or m.get("info", {}).get("id") or f"oc-{i}") for i, m in enumerate(messages)]
+        parent_target = target.split("/", 1)[0]
+        parent_id = resolve_unique_prefix(ids, parent_target, "opencode message id")
+        index = ids.index(parent_id)
+        message = messages[index]
+        locator = unique_prefixes(ids).get(parent_id, parent_id)
+        if "/" not in target:
+            return oc_format_message(message, index, locator).render()
+        suffix = target[len(parent_target):]
+        match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+        if not match:
+            raise ValueError(f"invalid opencode child locator: {target}")
+        kind, number_text = match.groups()
+        part_type = {"tool": "tool", "thinking": "reasoning", "result": "tool"}[kind]
+        parts = [part for part in message.get("parts", []) if isinstance(part, dict) and part.get("type") == part_type]
+        if kind == "result":
+            parts = [part for part in parts if isinstance(part.get("state"), dict) and (
+                part["state"].get("output") is not None or part["state"].get("error") is not None or
+                part["state"].get("status") in {"completed", "done", "success", "error", "failed"}
+            )]
+        number = int(number_text)
+        if number < 1 or number > len(parts):
+            raise ValueError(f"opencode child locator not found: {target}")
+        part = parts[number - 1]
+        if kind == "thinking":
+            text = part.get("text") or part.get("content") or ""
+        else:
+            state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
+            value = state.get("input") if kind == "tool" else (state.get("output") or state.get("error"))
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        shown, cut = clip_overview(text, DETAIL_COMPONENT_TRUNC, preserve_tail=True)
+        return f"[{kind}] id={target}\n  {shown}" + (f"\n  ({kind} content shortened)" if cut else "")
+
+    @classmethod
+    def raw_detail(cls, rec, target):
+        sid = cls.session_id(rec)
+        messages = http_get(f"/session/{sid}/message", directory=cls.directory(rec))
+        ids = [str(message.get("id") or message.get("info", {}).get("id") or f"oc-{index}")
+               for index, message in enumerate(messages)]
+        parent_target = target.split("/", 1)[0]
+        parent_id = resolve_unique_prefix(ids, parent_target, "opencode message id")
+        message = messages[ids.index(parent_id)]
+        if "/" not in target:
+            return message
+        suffix = target[len(parent_target):]
+        match = re.fullmatch(r"/(tool|thinking|result)/(\d+)", suffix)
+        if not match:
+            raise ValueError(f"invalid opencode child locator: {target}")
+        kind, number_text = match.groups()
+        part_type = {"tool": "tool", "thinking": "reasoning", "result": "tool"}[kind]
+        parts = [part for part in message.get("parts", [])
+                 if isinstance(part, dict) and part.get("type") == part_type]
+        if kind == "result":
+            parts = [part for part in parts if isinstance(part.get("state"), dict) and (
+                part["state"].get("output") is not None or part["state"].get("error") is not None or
+                part["state"].get("status") in {"completed", "done", "success", "error", "failed"}
+            )]
+        number = int(number_text)
+        if number < 1 or number > len(parts):
+            raise ValueError(f"opencode child locator not found: {target}")
+        return parts[number - 1]
 
     @classmethod
     def read_live(cls, rec):
@@ -1326,67 +2139,88 @@ class OpenCodeAdapter:
 
     @classmethod
     def turn_state(cls, rec) -> str:
-        # KNOWN-ISSUE (status accuracy, informational only — turn= drives no decisions):
-        # - ignores info.time.completed, so an in-flight assistant turn that has not yet
-        #   emitted a tool part (or is generating text after tools finished) reads idle mid-turn.
-        # - the part scan treats any errored tool in the final message as busy, so a session
-        #   whose last turn had one failed tool reads busy forever; 'error' should be terminal.
-        # Fix sketch: info.time.completed == null -> busy (primary); treat error states as terminal.
         try:
             sid = cls.session_id(rec)
             messages = http_get(f"/session/{sid}/message", directory=cls.directory(rec))
         except Exception:
             return "unknown"
-        if not isinstance(messages, list) or not messages:
-            return "unknown"
-        last = messages[-1]
-        info = last.get("info", last) if isinstance(last, dict) else {}
-        role = info.get("role")
-        if role == "user":
-            return "busy"
-        if role == "assistant":
-            parts = last.get("parts", []) if isinstance(last, dict) else []
-            for part in parts if isinstance(parts, list) else []:
-                if part.get("type") != "tool":
-                    continue
-                state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
-                status = state.get("status")
-                if status and status not in {"completed", "done", "success"}:
-                    return "busy"
-            return "idle"
-        return "unknown"
+        return oc_turn_state_from_messages(messages)
 
     @classmethod
     def status_signals(cls, rec):
         try:
             sid = cls.session_id(rec)
-            meta = http_get(f"/session/{sid}", directory=cls.directory(rec))
+            directory = cls.directory(rec)
+        except Exception:
+            return {
+                "turn": "unknown", "persisted_age_s": float("inf"),
+                "context_input_tokens": None, "unread_count": None, "latest_marker": None,
+            }
+        try:
+            messages = http_get(f"/session/{sid}/message", directory=directory)
+            if not isinstance(messages, list):
+                raise ValueError("opencode: unexpected /message response")
+        except Exception:
+            messages = None
+        try:
+            meta = http_get(f"/session/{sid}", directory=directory)
             updated_ms = (meta.get("time", {}) or {}).get("updated") or 0
             age = (time.time() - updated_ms / 1000) if updated_ms else float("inf")
         except Exception:
             age = float("inf")
-        ctx = oc_last_context_tokens(rec)
-        return {"turn": cls.turn_state(rec), "persisted_age_s": age, "context_input_tokens": ctx}
+        if messages is None:
+            return {
+                "turn": "unknown", "persisted_age_s": age, "context_input_tokens": None,
+                "unread_count": None, "latest_marker": None,
+            }
+        cursor = load_cursor(rec["id"])
+        if cursor is None:
+            unread = len(messages)
+        elif cursor.get("session_id") != sid:
+            unread = None
+        else:
+            try:
+                position = int(cursor.get("last_msg_count", 0))
+                unread = max(0, len(messages) - position) if position <= len(messages) else None
+            except (TypeError, ValueError):
+                unread = None
+        recent = [oc_format_message(message, index)
+                  for index, message in list(enumerate(messages))[-50:]]
+        return {
+            "turn": oc_turn_state_from_messages(messages),
+            "persisted_age_s": age,
+            "context_input_tokens": oc_last_context_tokens_from_messages(messages),
+            "unread_count": unread,
+            "latest_marker": latest_supervisory_marker(recent),
+        }
 
 
-def oc_last_context_tokens(rec: Dict[str, Any]) -> Optional[int]:
-    """Most recent assistant message's prompt token count.
+def oc_turn_state_from_messages(messages: Any) -> str:
+    if not isinstance(messages, list) or not messages:
+        return "unknown"
+    last = messages[-1]
+    info = last.get("info", last) if isinstance(last, dict) else {}
+    role = info.get("role")
+    if role == "user":
+        return "busy"
+    if role != "assistant":
+        return "unknown"
+    time_info = info.get("time") if isinstance(info.get("time"), dict) else {}
+    if "completed" in time_info and time_info.get("completed") is None:
+        return "busy"
+    parts = last.get("parts", []) if isinstance(last, dict) else []
+    for part in parts if isinstance(parts, list) else []:
+        if part.get("type") != "tool":
+            continue
+        state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
+        status = state.get("status")
+        if status and status not in {"completed", "done", "success", "error", "failed"}:
+            return "busy"
+    return "idle"
 
-    OpenCode message info.tokens shape:
-      {"total": N, "input": K, "output": M, "reasoning": R, "cache": {"read": C, "write": W}}
-    Verified additive: total = input + cache.read + output (cache.read is NOT a subset of input).
-    Total prompt = input + cache.read.
 
-    The model context window is available via /provider but it's expensive to call
-    on every status check (~3MB response, ~200ms), so we emit raw tokens. Look up
-    the window separately if you need a percentage.
-    """
-    try:
-        sid = OpenCodeAdapter.session_id(rec)
-        directory = OpenCodeAdapter.directory(rec)
-        messages = http_get(f"/session/{sid}/message", directory=directory)
-    except Exception:
-        return None
+def oc_last_context_tokens_from_messages(messages: Any) -> Optional[int]:
+    """OpenCode prompt tokens are input plus cache.read; cache.read is additive."""
     if not isinstance(messages, list):
         return None
     for m in reversed(messages):
@@ -1408,10 +2242,11 @@ def oc_last_context_tokens(rec: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def oc_format_message(m: Dict[str, Any], idx: int) -> Entry:
+def oc_format_message(m: Dict[str, Any], idx: int, locator: Optional[str] = None) -> Entry:
     info = m.get("info", m)
     role = info.get("role", "?")
-    mid = info.get("id") or m.get("id") or f"oc-{idx}"
+    mid = str(info.get("id") or m.get("id") or f"oc-{idx}")
+    loc = locator or mid
     ts_raw = info.get("time", {}).get("created") if isinstance(info.get("time"), dict) else info.get("created")
     ts = fmt_ts(ts_raw)
 
@@ -1421,28 +2256,61 @@ def oc_format_message(m: Dict[str, Any], idx: int) -> Entry:
 
     if role == "assistant":
         body_lines: List[str] = []
-        text_parts = [p.get("text", "") for p in parts if p.get("type") == "text"]
+        overview: List[OverviewLine] = []
+        text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") == "text"]
         text = "\n".join(t for t in text_parts if t).strip()
         if text:
             body_lines.append("  text:")
             for line in trunc(text, TEXT_TRUNC).splitlines() or [""]:
                 body_lines.append("    " + line)
-        for p in parts:
-            if p.get("type") == "tool":
-                tool = p.get("tool", "?")
-                state = p.get("state", {}).get("status", "?") if isinstance(p.get("state"), dict) else "?"
-                args = p.get("state", {}).get("input") if isinstance(p.get("state"), dict) else p.get("input", {})
+            overview.append(OverviewLine(loc, ts, "assistant", text, preserve_tail=True))
+        thinking_number = 0
+        tool_number = 0
+        result_number = 0
+        for part in parts if isinstance(parts, list) else []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "reasoning":
+                value = part.get("text") or part.get("content") or ""
+                for label in reasoning_labels(value):
+                    thinking_number += 1
+                    body_lines.append(f"  intent: {label}")
+                    overview.append(OverviewLine(f"{loc}/thinking/{thinking_number}", ts, "intent", label,
+                                                 limit=OVERVIEW_INTENT_TRUNC, preserve_tail=True))
+            if part.get("type") == "tool":
+                tool_number += 1
+                tool = part.get("tool", "?")
+                state_obj = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
+                status = state_obj.get("status", "?")
+                args = state_obj.get("input", part.get("input", {}))
                 preview = claude_preview_args(args, ARGS_TRUNC)
-                body_lines.append(f"  tool: {tool} state={state} {preview}")
-        return Entry(mid, ts, "assistant", f"[assistant] {ts} id={mid}", "\n".join(body_lines))
+                body_lines.append(f"  tool: {tool} state={status} {preview}")
+                overview.append(OverviewLine(f"{loc}/tool/{tool_number}", ts, "tool",
+                                             f"{tool} {claude_preview_args(args, OVERVIEW_TOOL_TRUNC)}",
+                                             limit=OVERVIEW_TOOL_TRUNC))
+                output = state_obj.get("output")
+                error = state_obj.get("error")
+                if output is not None or error is not None or status in {"completed", "done", "success", "error", "failed"}:
+                    result_number += 1
+                    value = error if error is not None else output
+                    value_text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                    body_lines.append(f"  result: {tool} state={status} {single_line(value_text, RESULT_TRUNC)}")
+                    prefix = f"{tool} status={status} "
+                    overview.append(OverviewLine(f"{loc}/result/{result_number}", ts, "result", prefix + value_text,
+                                                 limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True))
+        if not overview:
+            overview.append(OverviewLine(loc, ts, "assistant", "", limit=OVERVIEW_TOOL_TRUNC))
+        return Entry(mid, ts, "assistant", f"[assistant] {ts} id={mid}", "\n".join(body_lines), overview=overview)
 
     if role == "user":
-        text_parts = [p.get("text", "") for p in parts if p.get("type") == "text"]
+        text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") == "text"]
         text = "\n".join(t for t in text_parts if t).strip()
         body = "\n".join("    " + l for l in trunc(text, TEXT_TRUNC).splitlines() or [""])
-        return Entry(mid, ts, "user", f"[user] {ts} id={mid}", "  text:\n" + body)
+        return Entry(mid, ts, "user", f"[user] {ts} id={mid}", "  text:\n" + body,
+                     overview=[OverviewLine(loc, ts, "user", text, preserve_tail=True)])
 
-    return Entry(mid, ts, role, f"[{role}] {ts} id={mid}")
+    return Entry(mid, ts, role, f"[{role}] {ts} id={mid}",
+                 overview=[OverviewLine(loc, ts, str(role), "", limit=OVERVIEW_TOOL_TRUNC)])
 
 
 # -- adapter dispatch ---------------------------------------------------------
@@ -1460,6 +2328,259 @@ def adapter_for(rec: Dict[str, Any]):
     if kind not in ADAPTERS:
         raise ValueError(f"unknown worker kind: {kind}")
     return ADAPTERS[kind]
+
+
+# -- experimental attention await --------------------------------------------
+
+def await_entries(rec: Dict[str, Any]) -> Tuple[Path, List[Dict[str, Any]]]:
+    """Current ordered event stream for file-backed experimental await."""
+    kind = rec.get("kind")
+    if kind == "pi":
+        path = PiAdapter.session_path(rec)
+        return path, pi_load_active(path)
+    if kind == "claude":
+        path = ClaudeAdapter.session_path(rec)
+        return path, claude_load_entries(path)
+    if kind == "codex":
+        path = CodexAdapter.session_path(rec)
+        return path, codex_load_entries(path)
+    if kind == "opencode":
+        raise ValueError(
+            "await is experimental and does not yet support opencode; its compaction event "
+            "shape must be established before it can safely act as an attention notifier"
+        )
+    raise ValueError(f"await: unsupported worker kind: {kind}")
+
+
+def await_event_kind(kind: str, entry: Dict[str, Any]) -> Optional[str]:
+    """Classify only structural attention events; never return message content."""
+    if kind == "pi":
+        if entry.get("type") == "compaction":
+            return "compaction"
+        if entry.get("type") != "message":
+            return None
+        msg = entry.get("message", {})
+        if msg.get("role") != "assistant":
+            return None
+        content = msg.get("content", [])
+        has_tool_call = any(
+            isinstance(block, dict) and block.get("type") == "toolCall"
+            for block in content if isinstance(content, list)
+        )
+        stop = str(msg.get("stopReason") or msg.get("stop_reason") or "").lower()
+        return None if has_tool_call or stop in {"tooluse", "tool_use", "tool-use"} else "idle"
+
+    if kind == "claude":
+        if entry.get("type") == "system" and entry.get("subtype") == "compact_boundary":
+            return "compaction"
+        if entry.get("type") != "assistant":
+            return None
+        msg = entry.get("message", {})
+        content = msg.get("content", [])
+        has_tool_use = any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content if isinstance(content, list)
+        )
+        stop = str(msg.get("stop_reason") or msg.get("stopReason") or "").lower()
+        return None if has_tool_use or stop in {"tool_use", "tooluse", "tool-use"} else "idle"
+
+    if kind == "codex":
+        payload = entry.get("payload", {})
+        ptype = payload.get("type") if isinstance(payload, dict) else None
+        if entry.get("type") == "compacted" or (
+            entry.get("type") == "event_msg" and ptype == "context_compacted"
+        ):
+            return "compaction"
+        if entry.get("type") == "event_msg" and ptype == "task_complete":
+            return "idle"
+    return None
+
+
+def await_turn_state(kind: str, entries: List[Dict[str, Any]]) -> str:
+    if kind == "pi":
+        return pi_turn_state_from_entries(entries)
+    if kind == "claude":
+        return claude_turn_state_from_entries(claude_visible(entries))
+    if kind == "codex":
+        # Only task lifecycle events are authoritative here. Codex may persist
+        # assistant prose and then continue into more calls before task_complete.
+        for entry in reversed(entries):
+            payload = entry.get("payload", {})
+            if entry.get("type") != "event_msg" or not isinstance(payload, dict):
+                continue
+            ptype = payload.get("type")
+            if ptype == "task_complete":
+                return "idle"
+            if ptype in {"task_started", "user_message"}:
+                return "busy"
+        return codex_turn_state_from_entries(entries)
+    return "unknown"
+
+
+def await_cursor_position(rec: Dict[str, Any], path: Path,
+                          entries: List[Dict[str, Any]]) -> Optional[int]:
+    """Raw/active entry position acknowledged by the ordinary watch cursor."""
+    cursor = load_cursor(rec["id"])
+    if cursor is None or cursor.get("session_path") != str(path):
+        return None
+    kind = rec.get("kind")
+    if kind == "pi":
+        last_entry_id = cursor.get("last_entry_id")
+        if not last_entry_id:
+            return None
+        ids = [str(entry.get("id")) for entry in entries]
+        try:
+            return ids.index(str(last_entry_id))
+        except ValueError:
+            return None
+    if kind == "claude":
+        last_entry_id = cursor.get("last_entry_id")
+        if not last_entry_id:
+            return None
+        ids = [str(entry.get("uuid")) for entry in entries]
+        try:
+            return ids.index(str(last_entry_id))
+        except ValueError:
+            return None
+    if kind == "codex":
+        try:
+            if "last_raw_idx" in cursor:
+                position = int(cursor["last_raw_idx"])
+                return position if -1 <= position < len(entries) else None
+            legacy = codex_visible_indexed(entries, legacy=True)
+            old_index = int(cursor.get("last_idx", -1))
+            return legacy[old_index][0] if 0 <= old_index < len(legacy) else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def await_unresolved_compaction(rec: Dict[str, Any], path: Path,
+                                entries: List[Dict[str, Any]]) -> bool:
+    """Whether the latest in-flight compaction remains unread by watch."""
+    kind = str(rec.get("kind", ""))
+    last_compaction = -1
+    last_idle = -1
+    for index, entry in enumerate(entries):
+        event = await_event_kind(kind, entry)
+        if event == "compaction":
+            last_compaction = index
+        elif event == "idle":
+            last_idle = index
+    if last_compaction <= last_idle:
+        return False
+    cursor_position = await_cursor_position(rec, path, entries)
+    return cursor_position is None or cursor_position < last_compaction
+
+
+def await_attention(worker_id: str, reason: str) -> None:
+    print(f"ATTENTION {worker_id}: {reason}", flush=True)
+    print(f"Run: superv watch {worker_id}", flush=True)
+
+
+def await_stable_snapshot(rec: Dict[str, Any]) -> Tuple[Path, List[Dict[str, Any]], os.stat_result]:
+    """Read a snapshot whose file identity and size stayed fixed while parsing."""
+    path, _ = await_entries(rec)
+    while True:
+        before = path.stat()
+        current_path, entries = await_entries(rec)
+        after = current_path.stat()
+        if current_path != path:
+            raise ValueError(f"registered transcript path changed from {path} to {current_path}")
+        before_key = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        after_key = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if before_key == after_key:
+            return path, entries, after
+
+
+def cmd_await(args: argparse.Namespace) -> int:
+    """One-shot experimental notifier for structural worker attention events."""
+    rec = load_record(args.id)
+    kind = rec.get("kind", "")
+    try:
+        path, entries, stat = await_stable_snapshot(rec)
+    except OSError as error:
+        await_attention(args.id, "STREAM RESYNC REQUIRED")
+        eprint(f"await: cannot establish transcript snapshot: {error}")
+        return 2
+
+    if await_unresolved_compaction(rec, path, entries):
+        await_attention(args.id, "COMPACTION")
+        return 0
+
+    turn = await_turn_state(kind, entries)
+    if turn == "idle":
+        await_attention(args.id, "IDLE")
+        return 0
+    if turn != "busy":
+        await_attention(args.id, "STREAM RESYNC REQUIRED")
+        eprint(f"await: worker turn state is {turn!r}; refusing to wait on an unknown premise")
+        return 2
+
+    identity = (stat.st_dev, stat.st_ino)
+    last_size = stat.st_size
+    baseline_count = len(entries)
+    baseline_pi_leaf = str(entries[-1].get("id")) if kind == "pi" and entries else None
+    poll_interval = float(os.environ.get("SUPERV_AWAIT_POLL_INTERVAL", "0.25"))
+    if poll_interval <= 0:
+        raise ValueError("SUPERV_AWAIT_POLL_INTERVAL must be positive")
+
+    # Printing only after the baseline is fixed makes this line an arming
+    # handshake for background-command hosts and tests.
+    print(f"AWAIT {args.id}: CURRENTLY BUSY — waiting until the worker needs attention.", flush=True)
+
+    while True:
+        time.sleep(poll_interval)
+        try:
+            current_stat = path.stat()
+        except OSError as error:
+            await_attention(args.id, "STREAM RESYNC REQUIRED")
+            eprint(f"await: transcript disappeared: {path}: {error}")
+            return 2
+        if (current_stat.st_dev, current_stat.st_ino) != identity or current_stat.st_size < last_size:
+            await_attention(args.id, "STREAM RESYNC REQUIRED")
+            eprint(f"await: transcript identity changed or shrank: {path}")
+            return 2
+        if current_stat.st_size == last_size:
+            continue
+
+        try:
+            _, current = await_entries(rec)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            await_attention(args.id, "STREAM RESYNC REQUIRED")
+            eprint(f"await: could not read updated transcript: {error}")
+            return 2
+
+        if kind == "pi":
+            ids = [str(entry.get("id")) for entry in current]
+            if baseline_pi_leaf is not None:
+                if baseline_pi_leaf not in ids:
+                    await_attention(args.id, "STREAM RESYNC REQUIRED")
+                    eprint("await: pi active branch no longer contains the armed leaf")
+                    return 2
+                start = ids.index(baseline_pi_leaf) + 1
+            else:
+                start = 0
+            new_entries = current[start:]
+        else:
+            if len(current) < baseline_count:
+                await_attention(args.id, "STREAM RESYNC REQUIRED")
+                eprint("await: transcript entry count decreased")
+                return 2
+            new_entries = current[baseline_count:]
+
+        events = [await_event_kind(kind, entry) for entry in new_entries]
+        if "compaction" in events:
+            await_attention(args.id, "COMPACTION")
+            return 0
+        if "idle" in events:
+            await_attention(args.id, "IDLE")
+            return 0
+
+        last_size = current_stat.st_size
+        baseline_count = len(current)
+        if kind == "pi" and current:
+            baseline_pi_leaf = str(current[-1].get("id"))
 
 
 # -- subcommands --------------------------------------------------------------
@@ -1498,14 +2619,16 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def acquire_context_window(rec: Dict[str, Any]) -> Optional[int]:
-    """One-time per-kind context window acquisition.
+    """Registration-time context-window fallback.
 
-    Stashed in rec["extra"]["context_window_tokens"] at register time so cmd_status
-    can compute a percentage. Returns None if the window can't be determined; that's
-    not fatal — status falls back to printing raw token counts.
+    The value is stashed in rec["extra"]["context_window_tokens"]. Pi status
+    normally resolves the active model through persisted history and its local
+    model registry; this cache covers cases where that lookup is unavailable.
+    Other adapters use the cache as described below. An unresolved window is
+    not fatal: status prints an explicit unknown denominator.
 
     Per-kind sources:
-      pi:       tmux status bar (look for `46.8%/1.0M` style fragment)
+      pi:       tmux status bar (fallback; look for `46.8%/1.0M` style fragment)
       claude:   tmux status bar after the agent-supervision statusLine script is wired in
                 (look for `ctx:1000k` fragment); requires `superv install-claude-statusline`
       codex:    None — Codex publishes the window per turn in the JSONL token_count event,
@@ -1523,14 +2646,14 @@ def acquire_context_window(rec: Dict[str, Any]) -> Optional[int]:
         live = tmux_capture(target, lines=120)
         if kind == "pi":
             # Pi status bar: "...46.8%/1.0M (auto)..."
-            m = re.search(r"(\d+(?:\.\d+)?)%/(\d+(?:\.\d+)?)([KMG])\b", live)
+            m = re.search(r"(\d+(?:\.\d+)?)%/(\d+(?:\.\d+)?)([kKmMgG])\b", live)
             if not m:
                 return None
             try:
                 value = float(m.group(2))
             except ValueError:
                 return None
-            unit = {"K": 1000, "M": 1_000_000, "G": 1_000_000_000}[m.group(3)]
+            unit = {"K": 1000, "M": 1_000_000, "G": 1_000_000_000}[m.group(3).upper()]
             return int(value * unit)
         else:  # claude
             # Our statusline script emits `ctx:1000k` — see scripts/claude-statusline.sh
@@ -1638,6 +2761,10 @@ def cmd_register(args: argparse.Namespace) -> int:
             )
         if args.oc_session:
             raise ValueError(f"--oc-session is only valid for kind=opencode, not kind={args.kind}")
+        if args.kind != "pi" and (args.session_id or args.session_dir):
+            raise ValueError(
+                f"--session-id/--session-dir are only valid for kind=pi, not kind={args.kind}"
+            )
     elif args.kind == "opencode":
         if not args.oc_session:
             raise ValueError(
@@ -1647,6 +2774,8 @@ def cmd_register(args: argparse.Namespace) -> int:
             )
         if args.tmux:
             raise ValueError("--tmux is not valid for kind=opencode (opencode uses HTTP transport)")
+        if args.session_id or args.session_dir:
+            raise ValueError("--session-id/--session-dir are only valid for kind=pi")
 
     rec: Dict[str, Any] = {
         "id": args.id,
@@ -1701,20 +2830,72 @@ def cmd_register(args: argparse.Namespace) -> int:
                 rec["extra"]["session_id"] = sid
                 rec["persisted"] = {"type": "jsonl", "path": str(candidate), "cwd": cwd2}
         elif args.kind == "pi":
+            # Pi panes carry no recoverable session identity (pi rewrites its
+            # process title, erasing launch flags from /proc), and several pi
+            # agents may share one cwd, so the session file must be named
+            # explicitly — via the launch-seeded --session-id or via --path.
+            # Recency never decides; without an exact identity we fail closed.
             if args.path:
-                if not Path(args.path).exists():
+                p = Path(args.path).expanduser()
+                if not p.exists():
                     raise ValueError(f"--path does not exist: {args.path}")
-                rec["persisted"] = {"type": "jsonl", "path": args.path, "cwd": cwd}
-            else:
-                try:
-                    p = pi_resolve_session(cwd, None)
-                except ValueError as e:
+                header = pi_read_session_header(p)
+                if header is None:
                     raise ValueError(
-                        f"could not auto-resolve pi session for cwd={cwd}: {e}\n"
-                        f"  hint: send the worker at least one message so it writes its JSONL, then re-register;\n"
-                        f"  or pass --path /home/user/.pi/agent/sessions/<dir>/<file>.jsonl explicitly"
+                        f"--path is not a pi session file (first line must be a session header): {p}"
+                    )
+                header_id = header.get("id")
+                if args.session_id and header_id != args.session_id:
+                    raise ValueError(
+                        f"--path and --session-id disagree: {p} has session id '{header_id}', "
+                        f"not '{args.session_id}'"
+                    )
+                bound = find_record_bound_to(p)
+                if bound is not None:
+                    raise ValueError(
+                        f"session file {p} is already bound to registered worker '{bound.get('id')}'\n"
+                        f"  two supervision handles on one transcript means one of them is misbound.\n"
+                        f"  If '{bound.get('id')}' is stale, run: superv unregister {bound.get('id')}"
                     )
                 rec["persisted"] = {"type": "jsonl", "path": str(p), "cwd": cwd}
+                if args.session_dir:
+                    rec["persisted"]["session_dir"] = args.session_dir
+                if header_id:
+                    rec["extra"]["session_id"] = header_id
+            elif args.session_id:
+                p = pi_resolve_by_session_id(args.session_id, cwd, args.session_dir)
+                bound = find_record_bound_to(p)
+                if bound is not None:
+                    raise ValueError(
+                        f"session file {p} is already bound to registered worker '{bound.get('id')}'\n"
+                        f"  two supervision handles on one transcript means one of them is misbound.\n"
+                        f"  If '{bound.get('id')}' is stale, run: superv unregister {bound.get('id')}"
+                    )
+                rec["persisted"] = {"type": "jsonl", "path": str(p), "cwd": cwd}
+                if args.session_dir:
+                    rec["persisted"]["session_dir"] = args.session_dir
+                rec["extra"]["session_id"] = args.session_id
+            else:
+                candidates = pi_candidate_lines(cwd, args.session_dir)
+                candidate_block = (
+                    "  session files in the pane's cwd (NOT auto-selected):\n" + "\n".join(candidates) + "\n"
+                    if candidates else
+                    "  (no session files found in the pane's cwd session directory)\n"
+                )
+                raise ValueError(
+                    "pi registration needs an exact session identity: --session-id <id> or --path <file>\n"
+                    "  why: a pane's pi process cannot be matched to a session file after launch\n"
+                    "  (pi rewrites its process title, erasing launch flags), and picking the newest\n"
+                    "  JSONL misbinds whenever several pi agents share a cwd or a stale transcript\n"
+                    "  sits next to a fresh worker that has not flushed its file yet.\n"
+                    + candidate_block +
+                    "  remedies:\n"
+                    "    - launch workers with an explicit id:  pi --session-id <id> ...\n"
+                    "      then:  superv register <name> --kind pi --tmux <target> --session-id <id>\n"
+                    "    - for a worker resumed with `pi --session <uuid>`, register with --session-id <uuid>\n"
+                    "    - for an already-running worker without an id: run /session inside its TUI to see\n"
+                    "      its session file, then pass --path <file>"
+                )
         elif args.kind == "codex":
             if args.path:
                 if not Path(args.path).exists():
@@ -1764,7 +2945,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         if ctx_window:
             rec["extra"]["context_window_tokens"] = ctx_window
     except Exception as e:
-        eprint(f"warning: context-window acquisition failed ({e!r}); status will report raw tokens only")
+        eprint(f"warning: context-window acquisition failed ({e!r}); status will report an unknown denominator")
 
     save_record(rec)
     print(json.dumps(rec, indent=2))
@@ -1859,6 +3040,9 @@ def extract_session_id(rec: Dict[str, Any]) -> str:
             return Path(path).stem
         raise ValueError("no claude session_id available (registry missing extra.session_id and persisted.path)")
     if kind == "pi":
+        sid = (rec.get("extra") or {}).get("session_id")
+        if sid:
+            return sid
         path = (rec.get("persisted") or {}).get("path") or ""
         stem = Path(path).stem
         if "_" in stem:
@@ -1895,7 +3079,15 @@ def build_resume_cmd(rec: Dict[str, Any], extra_flags: str = "") -> str:
             parts.extend(shlex.split(extra_flags))
         return " ".join(parts)
     if kind == "pi":
-        parts = ["pi", "--session", sid]
+        # A worker launched with a custom --session-dir keeps its session file
+        # outside pi's default lookup root, so resume must address the file by
+        # path (and re-supply --session-dir for consistent in-session behavior).
+        session_dir = (rec.get("persisted") or {}).get("session_dir")
+        if session_dir:
+            path = (rec.get("persisted") or {}).get("path") or ""
+            parts = ["pi", "--session", shlex.quote(path), "--session-dir", shlex.quote(session_dir)]
+        else:
+            parts = ["pi", "--session", sid]
         if base:
             parts.extend(base.split())
         if extra_flags:
@@ -1983,11 +3175,35 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if not Path(cwd).exists():
         raise ValueError(
             f"cwd does not exist: {cwd}\n"
-            f"  hint: pass --cwd <other-path>; the worker's stored cwd may be a deleted worktree"
+            f"  hint: pi/claude workers store the worktrees' parent folder as cwd, which outlives\n"
+            f"  worktree rotation — if even that is gone, something upstream moved. codex workers\n"
+            f"  still store the worktree itself and may need --cwd <path> after it is deleted."
         )
 
     extra_flags = args.launch_hint or (rec.get("extra") or {}).get("launch_hint", "")
     cmd = build_resume_cmd(rec, extra_flags)
+
+    # --cwd relocates the worker, and persisted.path is cwd-adjacent state:
+    # leaving it stale would force later reads onto the resolve-by-recency
+    # fallback, which can grab another agent's transcript. Re-resolve the
+    # transcript by session id up front, or refuse before touching tmux.
+    repointed_path: Optional[str] = None
+    if args.cwd:
+        sid = extract_session_id(rec)
+        try:
+            if kind == "pi":
+                p = pi_resolve_by_session_id(sid, None, (rec.get("persisted") or {}).get("session_dir"))
+            elif kind == "claude":
+                p = claude_resolve_session(None, sid)
+            else:
+                p = codex_resolve_session(None, sid)
+        except ValueError as e:
+            raise ValueError(
+                f"--cwd was passed, but persisted.path could not be re-resolved by session id '{sid}': {e}\n"
+                f"  refusing to resume with a cwd that no longer matches the stored transcript path.\n"
+                f"  Inspect with 'superv show {args.id}', fix persisted.path, or re-register with --path."
+            )
+        repointed_path = str(p)
 
     # Determine target tmux session and window.
     prev_target = (rec.get("live") or {}).get("target", "")
@@ -2033,9 +3249,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
     rec["extra"]["resumed_at"] = now_iso()
     if args.cwd:
         # If the user resumed in a different cwd, update the stored cwd too,
-        # since future re-pause/re-resume should use the new location.
+        # since future re-pause/re-resume should use the new location — and
+        # keep persisted.path in step (re-resolved by session id above).
         rec.setdefault("persisted", {})
         rec["persisted"]["cwd"] = cwd
+        if repointed_path:
+            rec["persisted"]["path"] = repointed_path
     save_record(rec)
 
     print(f"resumed {args.id} (kind={kind}) in tmux {new_target}")
@@ -2044,23 +3263,27 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-def _enforce_safety_caps(entries: List[Entry], force: bool) -> int:
-    # Gate only on total rendered size, not entry count. Individual entries are
-    # short (tool args/results are truncated when rendered), so a high entry
-    # count is fine as long as the rendered text stays under the char cap.
-    rendered = render_entries(entries)
-    if len(rendered) > MAX_RENDERED_CHARS and not force:
-        eprint(f"refusing to print {len(rendered)} chars from {len(entries)} entries (max {MAX_RENDERED_CHARS}). use --count to scope down, detail for one entry, or --force.")
-        return 1
-    return 0
+def _overview_page(entries: List[Entry]) -> List[Entry]:
+    """Largest oldest contiguous entry page whose compact overview fits."""
+    page: List[Entry] = []
+    for entry in entries:
+        candidate = page + [entry]
+        if page and len(render_overview(candidate)) > MAX_RENDERED_CHARS:
+            break
+        page.append(entry)
+        # A single persisted message can contain several calls. Keep it
+        # atomic so advancing the entry cursor never hides an unrendered call.
+        if len(render_overview(page)) > MAX_RENDERED_CHARS:
+            break
+    return page
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
     # Flag interactions:
     #   --live alone         → read live channel only; cursor flags are nonsensical here
-    #   --reset              → delete cursor before reading; persisted read uses tail
-    #   --full               → ignore cursor for this read; cursor still updates
-    #   --count N            → read tail of N (implies bootstrap if no cursor)
+    #   --reset              → delete cursor before reading; persisted read uses recent tail
+    #   --full               → read from the start; cursor advances only through represented entries
+    #   --count N            → bootstrap tail, or oldest N unread when a cursor exists
     if args.live:
         for flag in ("reset", "full", "count", "force"):
             if getattr(args, flag):
@@ -2077,22 +3300,54 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(adapter.read_live(rec))
         return 0
 
+    if args.count is not None and args.count <= 0:
+        raise ValueError("watch --count must be a positive integer")
+
     if args.reset:
         reset_cursor(args.id)
 
     use_cursor = not args.full
-    entries, new_cursor = adapter.read_persisted(rec, count=args.count, use_cursor=use_cursor)
+    # --reset without an explicit count deliberately reboots from the normal
+    # recent tail instead of asking an established session to dump its history.
+    read_count = args.count if args.count is not None else (RECENT_COUNT_DEFAULT if args.reset else None)
+    if args.full and args.count is None:
+        read_count = sys.maxsize
+    entries, new_cursor = adapter.read_persisted(rec, count=read_count, use_cursor=use_cursor)
 
     if not entries:
         print("(no new entries)")
         save_cursor(args.id, new_cursor)
         return 0
 
-    if _enforce_safety_caps(entries, args.force):
-        return 1
+    detailed = render_entries(entries)
+    if len(detailed) <= MAX_RENDERED_CHARS or args.force:
+        print(detailed)
+        save_cursor(args.id, new_cursor)
+        if args.count is None and not args.reset:
+            print(f"\nOBSERVATION COMPLETE — {len(entries)}/{len(entries)} unread entries shown; cursor advanced through all.")
+        print(f"\n(cursor: {cursor_path(args.id)})")
+        return 0
 
-    print(render_entries(entries))
-    save_cursor(args.id, new_cursor)
+    page = _overview_page(entries)
+    complete = len(page) == len(entries)
+    print(f"COMPACT OVERVIEW — detailed content shortened ({len(entries)} unread entries)\n")
+    print(render_overview(page))
+    if any(entry.overview_was_truncated() for entry in page):
+        print(f"\nLines ending in … were shortened. Use `superv detail {args.id} <locator>` to inspect one entry.")
+
+    cursor_to_save = new_cursor if complete else page[-1].cursor_after
+    if cursor_to_save is None:
+        raise ValueError("internal error: overview page has no cursor boundary")
+    save_cursor(args.id, cursor_to_save)
+
+    if complete:
+        print(f"\nOBSERVATION COMPLETE — {len(page)}/{len(entries)} unread entries shown (compact); cursor advanced through all.")
+    else:
+        remaining = len(entries) - len(page)
+        print(f"\n⚠ INCOMPLETE OBSERVATION — {len(page)}/{len(entries)} unread entries shown; {remaining} remain.")
+        print(f"Cursor advanced through shown entries only. Run again: superv watch {args.id}")
+        print("Repeat until OBSERVATION COMPLETE.")
+        print(f"Intentional skip: superv watch {args.id} --reset --count <N> (discards unread remainder).")
     print(f"\n(cursor: {cursor_path(args.id)})")
     return 0
 
@@ -2100,11 +3355,49 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def cmd_detail(args: argparse.Namespace) -> int:
     rec = load_record(args.id)
     adapter = adapter_for(rec)
+    if args.raw != args.force:
+        raise ValueError("unbounded raw detail requires both --raw and --force")
     try:
-        print(adapter.detail(rec, args.entry_id))
+        if args.raw:
+            print(json.dumps(adapter.raw_detail(rec, args.entry_id), indent=2, ensure_ascii=False))
+            return 0
+        rendered = adapter.detail(rec, args.entry_id)
+        if len(rendered) <= MAX_RENDERED_CHARS:
+            print(rendered)
+        else:
+            shown, _ = clip_overview(rendered, MAX_RENDERED_CHARS, preserve_tail=True)
+            print(shown)
+            print(f"\nDETAIL SHORTENED — original rendered content was {len(rendered)} characters.")
+            print("Use a child tool/result locator when available to inspect that component directly.")
     except ValueError as e:
         eprint(f"error: {e}")
         return 1
+    return 0
+
+
+def cmd_recent(args: argparse.Namespace) -> int:
+    """Non-mutating query over recent persisted content."""
+    if args.count <= 0:
+        raise ValueError("recent --count must be a positive integer")
+    rec = load_record(args.id)
+    adapter = adapter_for(rec)
+    entries, _ = adapter.read_persisted(rec, count=sys.maxsize, use_cursor=False)
+    lines = [line for entry in entries for line in entry.overview]
+    if args.kind == "messages":
+        lines = [line for line in lines if line.kind in {"assistant", "user", "intent"}]
+    elif args.kind == "tools":
+        lines = [line for line in lines if line.kind in {"tool", "result"}]
+    elif args.kind == "errors":
+        pattern = re.compile(r"\b(error|failed|failure)\b|\bexit=[1-9]\d*", re.I)
+        lines = [line for line in lines if pattern.search(line.text)]
+    selected = lines[-args.count:]
+    if not selected:
+        print("(no matching recent entries)")
+        return 0
+    print("\n".join(line.render() for line in selected))
+    if any(line.truncated for line in selected):
+        print(f"\nLines ending in … were shortened. Use `superv detail {args.id} <locator>` to inspect one entry.")
+    print("\n(recent query did not move the watch cursor)")
     return 0
 
 
@@ -2115,6 +3408,19 @@ def _snapshot_entry_ids(adapter, rec: Dict[str, Any]) -> set:
     except Exception:
         return set()
     return {e.id for e in entries}
+
+
+def _is_compaction_command(text: str) -> bool:
+    """True if the message is a harness compaction command rather than agent input.
+
+    Compaction is a runtime operation, not an agent turn: it produces no persisted
+    entry, so --verify's polling can never observe it. See send_cmd for why that
+    matters.
+    """
+    if not text:
+        return False
+    first = text.strip().splitlines()[0].strip() if text.strip() else ""
+    return first == "/compact" or first.startswith("/compact ")
 
 
 def _verify_send_landed(adapter, rec: Dict[str, Any], pre_ids: set, timeout_s: float = 6.0) -> bool:
@@ -2163,10 +3469,38 @@ def cmd_send(args: argparse.Namespace) -> int:
         if not text.strip():
             raise ValueError(f"--file is empty: {path}")
         adapter.send(rec, text)
+        sent_text = text
         print(f"sent {len(text)} chars from {path} via {transport}.")
     else:
         adapter.send(rec, args.message)
+        sent_text = args.message
         print(f"sent via {transport}.")
+
+    if _is_compaction_command(sent_text):
+        print(
+            "\n"
+            + ("!! VERIFY SKIPPED — A COMPACTION COMMAND CANNOT BE VERIFIED THIS WAY. !!\n"
+               if args.verify else
+               "!! COMPACTION SENT — ITS COMPLETION CANNOT BE OBSERVED FROM SUPERV. !!\n")
+            + "\n"
+            "Compaction is a harness operation, not an agent turn. It writes no persisted\n"
+            "entry, so polling for one proves nothing: a worker that compacted successfully\n"
+            "and is now waiting looks exactly like one that never received the command.\n"
+            "The same is true of `ctx=`, `persisted_age` and `unread` in `superv status` —\n"
+            "all three are absences of output, and a healthy compacted worker produces them.\n"
+            "\n"
+            "DO NOT re-send /compact to find out whether the first one worked. A second\n"
+            "compaction can land on an already-compacted worker and discard the context it\n"
+            "just rebuilt.\n"
+            "\n"
+            "CORRECT PROCEDURE:\n"
+            "  1. Send /compact once, and send the post-compaction orientation in the same turn.\n"
+            "  2. On each SUBSEQUENT heartbeat, check whether it finished by reading the harness\n"
+            "     display. This is the normal validation step, not a last resort:\n"
+            f"       tmux capture-pane -p -t <target>   # target: superv show {args.id}\n"
+            "  3. Never re-send /compact to find out whether the first one worked.\n"
+        )
+        return 0
 
     if args.verify:
         landed = _verify_send_landed(adapter, rec, pre_ids, timeout_s=args.verify_timeout)
@@ -2190,20 +3524,13 @@ def cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_status(args: argparse.Namespace) -> int:
-    rec = load_record(args.id)
-    adapter = adapter_for(rec)
-    sig = adapter.status_signals(rec)
-
+def status_line(rec: Dict[str, Any], sig: Dict[str, Any], *, include_latest: bool = False) -> str:
     turn = sig.get("turn", "unknown")
     age = sig.get("persisted_age_s", float("inf"))
     broken = sig.get("broken", False)
 
-    # KNOWN-ISSUE (status accuracy, informational only): an agent that dies mid-turn reads
-    # 'running' forever — a trailing user/tool entry never expires and tmux kinds never set
-    # 'broken' (nothing checks pane/process reachability here). Operator sees persisted_age
-    # climbing as the tell. Fix sketch: busy + persisted_age above a generous cap (~60 min,
-    # clears worst-case pi thinking) -> stalled; optionally a cheap tmux-target-exists check -> broken.
+    # A trailing busy entry can outlive a dead process. persisted_age remains
+    # visible so the supervisor can distinguish fresh work from that condition.
     if broken or turn == "unknown":
         verdict = "broken"
     elif turn == "busy":
@@ -2215,28 +3542,53 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     age_min = age / 60 if age != float("inf") else None
     age_str = f"{age_min:.1f}m" if age_min is not None else "?"
-
+    unread = sig.get("unread_count")
     parts = [
-        f"id={args.id}",
+        f"id={rec['id']}",
         f"kind={rec['kind']}",
         f"status={verdict}",
         f"turn={turn}",
         f"persisted_age={age_str}",
+        f"unread={unread if unread is not None else '?'}",
     ]
 
     ctx_tokens = sig.get("context_input_tokens")
-    # Prefer per-status window from adapter (Codex), else fall back to cached
-    # one-time acquisition stashed at register time.
     ctx_window = sig.get("context_window_tokens") or rec.get("extra", {}).get("context_window_tokens")
     if ctx_tokens:
         if ctx_window:
             pct = (ctx_tokens / ctx_window) * 100
             parts.append(f"ctx={ctx_tokens / 1000:.0f}k/{ctx_window / 1000:.0f}k({pct:.0f}%)")
         else:
-            parts.append(f"ctx={ctx_tokens / 1000:.0f}k")
+            parts.append(f"ctx={ctx_tokens / 1000:.0f}k/?")
 
-    print(" ".join(parts))
+    if include_latest and sig.get("latest_marker"):
+        kind, text = sig["latest_marker"]
+        shown, _ = clip_overview(text, 140)
+        parts.append(f"latest_{kind}={json.dumps(shown, ensure_ascii=False)}")
+    return " ".join(parts)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    rec = load_record(args.id)
+    print(status_line(rec, adapter_for(rec).status_signals(rec)))
     return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Concise routing view across registered workers; never moves cursors."""
+    records = [load_record(worker_id) for worker_id in args.ids] if args.ids else list_records()
+    if not records:
+        print("(no registered workers)")
+        return 0
+    failed = False
+    for rec in records:
+        try:
+            print(status_line(rec, adapter_for(rec).status_signals(rec), include_latest=True))
+        except Exception as error:
+            failed = True
+            message, _ = clip_overview(str(error), 180, preserve_tail=True)
+            print(f"id={rec.get('id', '?')} kind={rec.get('kind', '?')} status=broken unread=? error={json.dumps(message)}")
+    return 1 if failed else 0
 
 
 def cmd_note(args: argparse.Namespace) -> int:
@@ -2338,10 +3690,13 @@ typical workflows:
     superv send my-worker --file /tmp/long-instruction.md
 
   classify and observe:
+    superv sweep                                  # route attention across every worker
     superv status my-worker
+    superv await my-worker                        # experimental one-shot attention wait
     superv watch my-worker
     superv watch my-worker --live                 # live channel only
-    superv detail my-worker <entry-id>            # full content of one entry
+    superv recent my-worker --kind messages       # query without moving cursor
+    superv detail my-worker <entry-id>            # bounded content for one entry
 
   heartbeat (polled supervisors only — codex/opencode):
     superv heartbeat my-worker --reset            # initial 30s
@@ -2372,16 +3727,22 @@ state location: ~/.agent-supervision/{workers,cursors,notes,heartbeats}/
         description="Register a new worker. Fails if the id is already taken — unregister first to re-use an id. Auto-resolves session/transcript path from the transport.",
         epilog="""\
 required flags by kind:
-  --kind pi      requires --tmux T:W.P                (auto-resolves cwd → JSONL)
+  --kind pi      requires --tmux T:W.P and an exact session identity:
+                   --session-id <id>   the id the worker was launched with
+                                       (pi --session-id <id>, or the uuid in pi --session <uuid>)
+                   or --path <file>    explicit session JSONL
+                 pi sessions are never auto-resolved by recency — several pi agents may
+                 share one cwd, so registration fails closed without an exact identity.
   --kind claude  requires --tmux T:W.P                (auto-resolves PID → sessionId → JSONL)
   --kind codex   requires --tmux T:W.P                (auto-resolves cwd → rollout JSONL)
   --kind opencode requires --oc-session ses_...       (auto-resolves directory via http)
 
-if auto-resolution fails (e.g. JSONL doesn't exist yet), the command fails with a hint.
-pass --path explicitly to override.
+pi timing note: pi writes its session file on its first assistant reply. Registering
+--session-id before the worker's first turn fails with "no session file found ... yet";
+retry after the first turn (the triad launcher polls for this automatically).
 
 examples:
-  superv register tv-pi   --kind pi   --tmux 0:pi-worker.0
+  superv register tv-pi   --kind pi   --tmux 0:pi-worker.0 --session-id tv-pi-01983c
   superv register c-acp   --kind claude --tmux 0:claude.0
   superv register oc-impl --kind opencode --oc-session ses_29ab1c5e...
 """,
@@ -2391,6 +3752,8 @@ examples:
     sp.add_argument("--tmux", help="tmux target for tmux-backed kinds, e.g. 0:my-window.0")
     sp.add_argument("--oc-session", help="opencode session id, e.g. ses_29ab...; only valid for --kind opencode")
     sp.add_argument("--path", help="explicit session/JSONL path override (skips auto-resolution)")
+    sp.add_argument("--session-id", help="pi only: exact session id the worker was launched with (pi --session-id)")
+    sp.add_argument("--session-dir", help="pi only: custom session directory the worker was launched with (pi --session-dir)")
     sp.set_defaults(func=cmd_register)
 
     # name
@@ -2494,10 +3857,15 @@ examples:
         epilog="""\
 modes:
   default              read entries past the cursor (cursor advances)
-  --reset              delete cursor before reading; persisted read uses tail
-  --full               ignore cursor for this read (cursor still updates)
-  --count N            read tail of N entries (implies bootstrap if no cursor)
+  --reset              discard cursor and rebootstrap from the recent tail
+  --full               read from the start; partial overview pages advance only through shown entries
+  --count N            bootstrap tail, or oldest N unread when a cursor exists
   --live               read the live channel only (tmux pane / http status); cursor flags forbidden
+
+overflow:
+  detailed output that exceeds 12000 characters becomes a compact chronological overview.
+  every tool call remains on its own line. INCOMPLETE OBSERVATION means you must run watch
+  again before judging the worker; repeat until OBSERVATION COMPLETE.
 
 bootstrap rule:
   on a session with >20 entries and no cursor, watch refuses unless --count or --reset is given.
@@ -2505,8 +3873,8 @@ bootstrap rule:
 
 examples:
   superv watch tv-pi                  # incremental: only new entries since cursor
-  superv watch tv-pi --count 8        # initial bootstrap, show last 8
-  superv watch tv-pi --reset          # discard cursor and rebootstrap with default tail
+  superv watch tv-pi --count 8        # bootstrap tail, or next 8 unread with a cursor
+  superv watch tv-pi --reset          # deliberately discard unread history; show default tail
   superv watch tv-pi --live           # current tmux pane / http status
 """,
     )
@@ -2518,27 +3886,42 @@ examples:
     sp.add_argument("--force", action="store_true", help="bypass the safety cap (max 12000 rendered chars)")
     sp.set_defaults(func=cmd_watch)
 
+    # recent
+    sp = sub.add_parser(
+        "recent",
+        help="query recent persisted content without moving the watch cursor",
+        description="Show recent compact messages, tool activity, errors, or all content. This is a read-only historical query and never updates the watch cursor.",
+    )
+    sp.add_argument("id")
+    sp.add_argument("--kind", choices=["messages", "tools", "errors", "all"], default="messages")
+    sp.add_argument("--count", type=int, default=3, help="number of matching compact lines to show (default: 3)")
+    sp.set_defaults(func=cmd_recent)
+
     # detail
     sp = sub.add_parser(
         "detail",
-        help="full content for one entry (use when watch's truncation is too aggressive)",
+        help="bounded content for one entry (use when watch's overview is shortened)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Show full original content for one persisted entry — full text, full tool args, full tool result.",
+        description="Show supervisor-oriented content for one persisted entry while omitting opaque signatures and bounding large text, tool arguments, and results.",
         epilog="""\
 entry-id formats:
-  pi      entry uuid (from watch output 'id=...') OR toolCallId
-  claude  entry uuid OR tool_use id OR tool_use_id
-  codex   the codex-N index from watch output, OR a call_id
-  opencode message id (msg_...)
+  pi       entry id, toolCallId, or displayed child locator
+  claude   unique entry prefix, tool id, or displayed child locator
+  codex    codex-rN from watch output, legacy codex-N, or a call_id
+  opencode unique message prefix or displayed child locator
 
 examples:
   superv detail tv-pi a6ca92b7
+  superv detail tv-pi a6ca92b7/tool/1
   superv detail c-acp tool_01ABC
-  superv detail c1 codex-12
+  superv detail c1 codex-r12
+  superv detail c1 codex-r12 --raw --force   # explicit unbounded JSON override
 """,
     )
     sp.add_argument("id")
     sp.add_argument("entry_id", help="entry id, tool call id, or worker-specific identifier from watch output")
+    sp.add_argument("--raw", action="store_true", help="print the persisted JSON object; requires --force")
+    sp.add_argument("--force", action="store_true", help="confirm unbounded raw output; requires --raw")
     sp.set_defaults(func=cmd_detail)
 
     # send
@@ -2593,6 +3976,39 @@ typical use: status narrows the worker-level question; the global supervisor sti
     )
     sp.add_argument("id")
     sp.set_defaults(func=cmd_status)
+
+    # await (experimental)
+    sp = sub.add_parser(
+        "await",
+        help="experimental: block until a worker needs supervisory attention",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Experimental one-shot attention notifier. Exits when the worker is idle, compacts, or its persisted stream requires resynchronization. It never prints worker message content and never moves the watch cursor.",
+        epilog="""\
+experimental event-driven supervision:
+  Dispatch and verify work, then run this command through the supervisor host's
+  background-command facility. Its completion is an alert; always run `superv watch`
+  to interpret the authoritative persisted stream. Do not rearm while the worker is idle.
+
+attention events:
+  IDLE                    the worker reached a terminal turn, or was idle at startup
+  COMPACTION              a compaction boundary appeared; continuation is unpredictable
+  STREAM RESYNC REQUIRED  the stream changed identity, shrank, branched away, or is unknown
+
+currently supported: pi, claude, codex. OpenCode is rejected until its real
+compaction event shape is established.
+""",
+    )
+    sp.add_argument("id")
+    sp.set_defaults(func=cmd_await)
+
+    # sweep
+    sp = sub.add_parser(
+        "sweep",
+        help="concise status, unread count, context, and latest intent across workers",
+        description="Route attention across all registered workers, or the worker ids supplied. This reads persisted state without moving any watch cursor.",
+    )
+    sp.add_argument("ids", nargs="*", help="worker ids (default: all registered workers)")
+    sp.set_defaults(func=cmd_sweep)
 
     # note
     sp = sub.add_parser(

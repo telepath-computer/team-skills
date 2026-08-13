@@ -26,6 +26,8 @@ tmux send-keys -t <session>:codex-worker.0 \
 #   tmux send-keys -t <session>:codex-worker.0 'cd /path && codex --yolo' Enter
 ```
 
+**Launch cwd — codex is the exception.** Pi and claude workers launch in the worktrees' PARENT folder (worktrees are often shorter-lived than the agent sessions that operate over them; the parent survives worktree deletion). Codex workers instead launch INSIDE their task worktree, because codex sessions bind to their pane **only by cwd** — `superv register --kind codex` matches the rollout's `payload.cwd` against the pane's cwd, and there is no id-based binding at registration. Several codex agents sharing the parent folder would misbind to each other's rollouts. This exception stands until codex registration gains id-based binding; accept the cost that deleting the worktree strands the codex worker's shell.
+
 **Common flags:**
 
 | Flag | Purpose |
@@ -121,15 +123,15 @@ Busy/idle comes from rollout turn-state (`superv status <id>` prints `turn=busy|
 - `type=response_item` with `payload.type` ∈ {`message`, `reasoning`, `function_call`, `function_call_output`}.
 - `type=turn_context` — turn metadata (cwd, approval policy).
 
-Display surface: user messages (`event_msg.user_message` and `response_item.message` with role=user), assistant messages (`response_item.message` role=assistant, content array of `output_text`), tool calls (`response_item.function_call`), tool outputs (`response_item.function_call_output`). Reasoning is skipped by default (analogous to Claude's `thinking`).
+Display surface: user and assistant messages; the function, custom-tool, local-shell, and web-search call/output families; compaction markers; and readable plaintext reasoning summaries as `intent` lines. Empty or opaque reasoning payloads are omitted.
 
 ## 6b. Measure context fill
 
-`superv status <id>` prints `ctx=Nk/Mk(P%)` for Codex — both the prompt token count and the percentage of the model's context window consumed. Codex's JSONL conveniently includes both numbers, so you get the percentage automatically (Claude and Pi only get raw tokens because their JSONLs don't include the model window).
+`superv status <id>` prints the unread-entry count plus `ctx=Nk/Mk(P%)` for Codex. The rollout JSONL includes both the prompt token count and model context window, so the percentage needs no registration-time cache.
 
 ```
 $ superv status codex-worker
-id=codex-worker kind=codex status=running turn=busy persisted_age=0.4m ctx=25k/258k(10%)
+id=codex-worker kind=codex status=running turn=busy persisted_age=0.4m unread=3 ctx=25k/258k(10%)
 ```
 
 Internally that reads the most recent `event_msg` of `payload.type=token_count`:
@@ -142,7 +144,7 @@ If you only want the cumulative-across-turns count, use `info.total_token_usage.
 
 - **Rollouts are date-bucketed** — a single Codex session can span midnight and produce two files. Adapter follows the active session by `payload.id` from the meta line, not by file mtime alone.
 - **No tree/branch model** — Codex rollouts are linear, simpler than Pi's branch tree.
-- **Cwd lock-in** — the cwd from `session_meta` is the canonical project; verifications should use that path.
+- **Cwd lock-in** — the cwd from `session_meta` is the canonical project; verifications should use that path. This cwd-only identity is also why codex workers still launch inside their worktree while pi/claude workers launch in the worktrees' parent folder (see "Launch cwd" above).
 - **`codex exec resume`** can resume a thread by id outside the TUI for one-shot follow-ups. Useful for the supervisor's own verification queries.
 
 ## 8. Done signals
@@ -159,15 +161,15 @@ Codex supports session resume by UUID. The supervisor wraps this via `superv pau
 - The `<uuid>` is the UUID portion of the rollout filename: `rollout-<ISO-ts>-<uuid>.jsonl` — the last 5 dash-separated tokens of the stem (UUIDs have 4 dashes).
 - **`codex resume --last`** picks the most recent session in the current cwd interactively; not used by `superv resume` because we want explicit ID-based resume.
 - **`codex exec resume <thread-id>`** is the *non-interactive* form — useful for the supervisor's own one-shot verification queries, not for re-launching a long-running TUI worker.
-- Run resume in the original cwd for cleanest behavior; `superv resume` defaults to the stored cwd.
+- Run resume in the original cwd for cleanest behavior; `superv resume` defaults to the stored cwd. For codex that stored cwd is the worktree itself (the launch-cwd exception above), so if the worktree has been deleted, resume needs `--cwd <path>` — which also re-resolves and rewrites the stored rollout path by session id.
 
 ## 9. Kickoff template (Codex-flavored additions)
 
 Append to the core kickoff:
 
 ```
-8. You are running with --yolo; sandboxing and approvals are off, you have full access.
-9. The supervisor reads your rollout JSONL and live tmux pane.
-10. When done, end your final turn with a clear summary — the supervisor uses
+9. You are running with --yolo; sandboxing and approvals are off, you have full access.
+10. The supervisor reads your rollout JSONL and live tmux pane.
+11. When done, end your final turn with a clear summary — the supervisor uses
     task_complete + assistant text as a done signal.
 ```

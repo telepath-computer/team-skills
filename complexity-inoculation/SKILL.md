@@ -45,6 +45,20 @@ Do not add requirements merely because they sound complete, symmetric, rigorous,
 
 Before declaring a document ready, look at it from a blank page: knowing only the project's purpose, would you introduce these concepts and constraints? If not, simplify the document before implementation gives them weight.
 
+## Instructions are themselves a source of complexity
+
+The same accretion happens in what you write *to* a capable reader, not only in what you build. Over-specification is complexity, and it compounds the same way.
+
+**Let the highest statement the reader can work from be the boundary of the communication.** If a competent agent or engineer can act correctly from a general statement, that statement is the instruction. Enumerating the cases it covers does not add rigor — it moves judgment out of the reader and into a list that will be wrong the first time reality presents a case the list did not anticipate.
+
+**Enumeration implies litigation.** A list of examples stops being illustration and becomes the definition. The reader then reasons about whether their situation is *on the list* rather than about what was meant, and edge cases become disputes about the boundary of the enumeration instead of ordinary judgment calls. The list has quietly replaced the intent it was meant to illustrate.
+
+**Prefer soft statements where soft statements suffice.** A rule with strong, far-reaching teeth forecloses the gray areas where intelligence is most valuable. Reach for that force only when crossing the line is genuinely unacceptable — not to signal that you mean it.
+
+**Hard lines propagate.** Once one is drawn, the environment changes: readers begin expecting hard lines, hesitate where they should exercise judgment, and infer that other lines must exist and should be drawn. One unnecessary prohibition teaches everyone downstream to ask for prohibitions. That cost never appears in the document that caused it.
+
+The test before writing a constraint: *could this reader do the right thing without it?* If yes, the constraint is not protection, it is noise with authority.
+
 ## While designing, implementing, or reviewing
 
 When work begins to expand, stop reasoning only from the most recent local decision. Restate the original problem and inspect the entire chain that led to the proposed machinery.
@@ -81,31 +95,6 @@ A feature plan required a broad server-test command. The command included an uns
 
 Other shapes will look entirely different: an abstraction that makes every concrete case harder, a compatibility layer outliving its obligation, automation that exists to satisfy unused process evidence, or a general framework built for one exception. The common signal is not any specific pattern. It is a whole whose complexity no longer earns its keep.
 
-## Required local work journal
-
-Any change to a spec or plan made because of this defense **must be recorded in a dedicated local journal** so the user can review where written instructions were challenged or refined.
-
-Use this file in the project or worktree root:
-
-```text
-.complexity-inoculation-journal.md
-```
-
-Keep it local and uncommitted unless the user explicitly asks to preserve it in the repository. Its visibility in the working directory and `git status` is intentional: the journal should be easy for the user to find and review.
-
-Keep each entry brief:
-
-```markdown
-## <timestamp> — <document and section>
-**Changed:** <what changed>
-**Why:** <the purpose, the unnecessary complexity, and why the revision preserves the purpose>
-**Effect:** <what is avoided or simplified, plus any risk or owner decision>
-```
-
-Record the entry before or immediately after changing the document. At the next progress update, give the user the journal path and summarize new entries.
-
-The journal is visibility, not permission. Do not silently override an explicit owner requirement and explain it afterward. Escalate genuine conflicts.
-
 ## Guardrails
 
 This defense is not reflexive minimalism. Some problems deserve substantial systems. It is not permission to ignore relevant failures, weaken acceptance criteria, or label disliked requirements “complexity.” Deliberate owner decisions remain decisions.
@@ -114,4 +103,4 @@ It is also not a reason to hold an elaborate anti-complexity review at every ste
 
 ## Compact reminder
 
-**Step outside the chain. Recover the purpose. Question the earliest premise. Compare value with the machinery it creates. Delete before adding. Record any resulting spec or plan change in the local journal.**
+**Step outside the chain. Recover the purpose. Question the earliest premise. Compare value with the machinery it creates. Delete before adding.**

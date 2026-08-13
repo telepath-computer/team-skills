@@ -144,7 +144,7 @@ Stop and ask the user (or let `triad up` abort) before proceeding if:
 
 - the repo is unknown
 - the task is unknown
-- the operator/supervisor session's current directory violates the `start-worktree` starting-directory rule and the user has not confirmed continuing; task agents launched by `triad up` deliberately start inside their task worktree and are exempt
+- the operator/supervisor session's current directory violates the `start-worktree` starting-directory rule and the user has not confirmed continuing; task agents launched by `triad up` start in the worktrees' parent folder (worktrees are often shorter-lived than the agent sessions that operate over them), with their assigned worktree named in their brief — codex-kind agents excepted (they start inside the worktree; see agent-triad)
 - the canonical repo cannot be found
 - the canonical repo has unsafe state, such as unexpected uncommitted changes
 - the process is not inside tmux and the user has not approved an alternative

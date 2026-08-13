@@ -35,9 +35,19 @@ tmux new-window -t <session> -n pi-worker -d
 # 2. Start pi inside that window. Pi supports "seeded interactive" mode —
 #    pass the prompt as a positional arg (no -p flag) and pi boots the full
 #    TUI, then immediately sends the prompt. This is the standard worker
-#    launch shape. Always pass --model explicitly.
+#    launch shape. Always pass --model explicitly, and ALWAYS seed an explicit
+#    --session-id — it is the only thing that lets registration bind this pane
+#    to exactly this worker's transcript (see "Identify" below).
+#
+#    Launch cwd: the WORKTREES' PARENT folder (e.g. ~/workspace/wt/<repo>/),
+#    not the task worktree itself. Worktrees are often shorter-lived than the
+#    agent sessions that operate over them; a worker homed inside one is
+#    stranded (shell and cwd-keyed session files) when the worktree is deleted.
+#    The trade: the worker cannot infer its worktree from its cwd, so the
+#    initial prompt / task brief MUST state the worktree's absolute path.
+SID="pi-worker-$(uuidgen)"
 tmux send-keys -t <session>:pi-worker.0 \
-  'cd /path/to/workdir && pi --model openai-codex/gpt-5.6-sol:xhigh "<initial prompt>"' Enter
+  'cd /path/to/wt-parent && pi --model openai-codex/gpt-5.6-sol:xhigh --session-id '"$SID"' "<initial prompt naming the worktree path>"' Enter
 ```
 
 **Common flags:**
@@ -45,6 +55,7 @@ tmux send-keys -t <session>:pi-worker.0 \
 | Flag | Purpose |
 |---|---|
 | `--model <model[:level]>` | Model and reasoning level, e.g. `openai-codex/gpt-5.6-sol:xhigh` (default) or `fireworks/accounts/fireworks/models/glm-5p2:xhigh` (GLM 5.2). **Always pass this** so the worker doesn't inherit the last interactive setting. The optional `:level` suffix sets reasoning effort inline. |
+| `--session-id <id>` | Exact session id for the new session (pi creates it if missing). **Always pass this for supervised workers** — it is the identity handshake that `superv register --session-id` binds on. Ids are alphanumeric plus `-`/`_`/`.`; a good shape is `<worker-name>-<uuid>`. |
 | `--thinking <level>` | Reasoning effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. Use `xhigh` when the task needs maximum reasoning. Redundant if the reasoning level is already set via the `--model` suffix. |
 | (positional prompt) | First turn the TUI runs after boot. Pi's "seeded" mode — no flag needed. |
 
@@ -52,10 +63,10 @@ Pi has no permission-bypass flag analogous to `--yolo` or `--dangerously-skip-pe
 
 **Readiness marker:** the pi TUI shows `escape interrupt` in the status bar once it's accepting input. If you launched without a seeded prompt and want to send one programmatically, poll the pane until you see that marker before `tmux send-keys`.
 
-**After launch**, once pi has produced its first turn (so the JSONL exists at `~/.pi/agent/sessions/--<cwd>--/<ts>_<id>.jsonl`):
+**After launch**, once pi has produced its first turn (pi writes the JSONL on its **first assistant reply**, not at boot — so the file exists only after that reply lands):
 
 ```bash
-superv register <id> --kind pi --tmux <session>:pi-worker.0
+superv register <name> --kind pi --tmux <session>:pi-worker.0 --session-id "$SID"
 ```
 
 ## 3. Identify
@@ -66,9 +77,15 @@ Pi sessions live under:
 ~/.pi/agent/sessions/--<cwd-with-dashes>--/<timestamp>_<session-id>.jsonl
 ```
 
-Where `<cwd-with-dashes>` is the absolute cwd's `/` replaced by `-`, surrounded by `--`. The latest file in the directory is the active one for that cwd.
+Where `<cwd-with-dashes>` is the absolute cwd's `/` replaced by `-`, surrounded by `--`. The `<session-id>` in the filename (also in the file's header line) is the session's identity.
 
-`superv register --kind pi --tmux <target>` does this lookup automatically: it reads the pane's cwd via `tmux display-message -p '#{pane_current_path}'` and picks the newest matching JSONL.
+**Identity is established at launch, never inferred afterwards.** `superv register --kind pi` requires an exact identity — `--session-id <id>` (the id the worker was launched with) or `--path <file>` — and resolves it by matching the id in both the filename and the session header, cross-checked against the pane's cwd. Without an identity, registration **fails closed**: it lists the candidate files it can see but never picks one.
+
+Why no auto-resolution exists: several pi agents may share one cwd (parallel workers in one worktree is a normal setup), pi doesn't flush a fresh session's JSONL until the first assistant reply (so a stale transcript can be the only file on disk during launch), and a running pi process can't be interrogated after the fact — pi rewrites its process title at startup, erasing launch flags from the process table, holds no open handle to its transcript, and exports no session id. "Newest file in the cwd's directory" therefore misbinds exactly when it matters, and superv no longer does it — at registration or any later point (if a bound transcript disappears, watch/status fail loudly instead of re-resolving by recency).
+
+For an already-running pi launched **without** `--session-id`: the operator can run `/session` inside its TUI to see the session file, then register with `--path <file>`. A worker launched with a custom `pi --session-dir <dir>` registers with the same `--session-dir` value.
+
+Registration also refuses to bind a transcript that is already bound to another registered worker — two supervision handles on one transcript is the misbinding this design exists to prevent.
 
 ## 4. Send a message
 
@@ -97,28 +114,20 @@ Busy/idle comes from transcript turn-state in the JSONL (`superv status <id>` pr
 
 Entry types displayed: `message`, `model_change`, `thinking_level_change`, `compaction`, `branch_summary`, `session_info`, `custom_message`, `label`. Within a `message`, roles include `user`, `assistant`, `toolResult`, `bashExecution`, `custom`.
 
-`superv detail <id> <entry-or-toolcall-id>` shows full content.
+`superv detail <id> <entry-or-toolcall-id>` shows bounded supervisor-oriented content. Use the explicit `--raw --force` double override only when the persisted JSON itself is necessary.
 
 ## 7. Context-window observation and `/compact`
 
-`superv status <id>` prints `ctx=Nk` — the prompt token count for the most recent assistant turn (the next turn's prompt size). Use it for context-pressure decisions.
+`superv status <id>` reports the exact unread-entry count and the most recent prompt size against the active model's context window. Use the percentage for context-pressure decisions and `unread` to decide which workers need `watch` during a sweep.
 
 ```
 $ superv status dave
-id=dave kind=pi status=running turn=busy persisted_age=0.5m ctx=271k
+id=dave kind=pi status=running turn=busy persisted_age=0.5m unread=14 ctx=143k/272k(52%)
 ```
 
-Internally that reads `input + cacheRead` from the most recent assistant turn's `message.usage` block in the JSONL (verified additive: `totalTokens = input + cacheRead + output`).
+The prompt size is `input + cacheRead` from the most recent assistant turn's `message.usage` block in the JSONL (verified additive: `totalTokens = input + cacheRead + output`). The same persisted history identifies the current provider and model. `superv` resolves that model's `contextWindow` from Pi's local model registry on every status read, so a model change or compaction is reflected without capturing the pane or re-registering the worker.
 
-Pi's JSONL doesn't include the model context window, but Pi's TUI status bar does. `superv register --kind pi` parses the `46.8%/1.0M` fragment from a tmux capture and caches the window in the registry — so subsequent `superv status` calls show the percentage automatically:
-
-```
-↑11M ↓1.2M R806M $255.445 (sub) 46.8%/1.0M (auto)                                                       (openai-codex) gpt-5.4 • medium
-$ superv status dave
-id=dave kind=pi status=running turn=busy persisted_age=0.5m ctx=271k/1000k(27%)
-```
-
-If Pi switches model mid-session to one with a different window (`/model`), the cached value goes stale until you re-register. If the parse fails at register (status bar not yet rendered, unusual layout), superv just stores no window and falls back to printing raw tokens.
+The tmux status bar remains a registration-time fallback for context-window metadata. If no denominator can be resolved, status says so explicitly, for example `ctx=143k/?`.
 
 ### Which regime applies to which model
 
@@ -161,6 +170,31 @@ Wait until the worker is idle before sending `/compact`. If Pi is busy, incoming
 
 After sending, verify with `superv watch <id> --live` that Pi displays `⠴ Compacting context... (escape to cancel)`. The operation typically takes 30s–2min on a deep context. When it finishes, the status-bar percentage drops substantially (often to single digits) and the prompt area returns to idle. Verify again with `superv watch <id> --live`, then send any continuation instruction as a separate message.
 
+#### NEVER send Escape while a compaction is running — Escape is its cancel key
+
+The compaction indicator says `(escape to cancel)` and it means it. A supervisor who reaches for Escape as a generic "unstick the pane" gesture **cancels the compaction**, and does so silently as far as `superv status` is concerned — the worker keeps reading `idle`, the pane stays quiet, and the context stays deep. Repeat the gesture and you get a cancel loop that keeps a worker pinned over its limit indefinitely.
+
+This bites because two different situations look identical from outside: a worker that is compacting, and a worker sitting in the post-compaction phantom state where sends stack unsubmitted (see § 8 Quirks). Both read `busy` or `idle` with a still pane and no new JSONL entries. The flush-and-submit recovery for the phantom state — `Escape` then `Enter` — is exactly the wrong move for the first.
+
+**Always distinguish before touching the pane.** Read the scrollback, not just the last few lines:
+
+```bash
+tmux capture-pane -t <target> -p -S -20 | grep -iE 'compacting|compaction|context overflow'
+```
+
+- `⠴ Compacting context...` or `Context overflow detected, Auto-compacting...` → **hands off entirely.** No keystrokes, no sends. Wait it out; deep contexts can take minutes.
+- `Queued message for after compaction` → your `/compact` (or any other send) is parked behind a compaction already in flight. It will deliver when that finishes. Sending again just queues more.
+- `Error: Compaction cancelled` → something cancelled it, and the most likely something is a supervisor keystroke. Stop touching it; the runtime generally retries on its own.
+- No compaction text at all, worker idle, sends not landing → *now* the phantom state applies and `Escape` then `Enter` is the right recovery.
+
+#### Auto-compaction, overflow, and hard failure
+
+Pi may run **past 100% of its nominal window** (a 272k worker observed working normally at 113%) before the runtime declares `Context overflow detected` and auto-compacts. So a percentage over 100 is not itself a fault, and interrupting a productive turn to force a compaction usually costs more than it saves.
+
+Auto-compaction can fail outright — observed: `Error: Compaction failed: Cannot read properties of undefined (reading 'signal')`. A worker in that state is **unrecoverable by supervision**: it sits far over its window, ignores sends including direct status probes, and cannot compact its way down. Do not spend cycles nudging it. Retire it and launch a replacement.
+
+The real defence is arranging beforehand that a worker's memory is never load-bearing, so replacement is cheap: durable task state on disk (see the context-file practice in `core.md`), commits pushed as they are made rather than batched, and briefs re-seeded from files rather than from conversation. When those hold, losing a worker costs a relaunch and nothing else.
+
 ### When to actually do this
 
 **Only if instructed by the user's monitoring goals.** Compaction is a destructive context operation: pi loses fine-grained recall of earlier turns and replaces it with a summary. That can break in-flight tasks if pi was holding onto state the supervisor expected it to remember. Don't compact unilaterally on a percentage threshold.
@@ -182,6 +216,7 @@ Document any compact you trigger in `superv note --tag supervisor` so the user c
 
 ## 8. Quirks
 
+- **Post-compaction phantom state** — after a compaction, Pi can land in a state where it reads `idle` (or `busy`) with a still pane while everything you send stacks in its steering buffer unsubmitted. Nothing lands; the worker looks like it is thinking and is not. Recovery is `tmux send-keys -t <target> Escape` to flush the queue into the composer, then `Enter` to submit. **Confirm no compaction is running first** — Escape cancels a compaction (see § 7).
 - **`/name` doesn't fully persist alone** — to make a named session show up later in `/resume`, send at least one real message after naming it.
 - **Branch switches** — if the active branch changes (rare in normal supervision), the cursor entry may no longer be on the active branch. The adapter detects this and tells you to reset via `superv watch <id> --reset` rather than silently jumping branches.
 - **TUI chrome strips during live capture** — `tmux-poll` removes the bottom separator pair and status bar before snapshot anchoring; this is automatic and not normally a concern.
@@ -198,10 +233,11 @@ Document any compact you trigger in `superv note --tag supervisor` so the user c
 
 Pi supports session resume by UUID. The supervisor wraps this via `superv pause` / `superv resume` (see `core.md`). Pausing mid-turn discards the in-flight turn, so operators typically pause at a quiet moment — the tool does not check or block.
 
-- **Resume command shape**: `pi --session <uuid>`. The `<uuid>` is the trailing part of the JSONL filename `<timestamp>_<uuid>.jsonl`.
+- **Resume command shape**: `pi --session <uuid>`. The `<uuid>` is the trailing part of the JSONL filename `<timestamp>_<uuid>.jsonl`. (For a worker launched with a custom `--session-dir`, `superv resume` addresses the session file by path and re-supplies `--session-dir` automatically.)
+- **Re-registering a resumed worker**: the resume id IS the session identity — register with `superv register <name> --kind pi --tmux <target> --session-id <uuid>`.
 - **No `--model` at resume.** Resuming a session restores the model and reasoning level it was launched with (Pi persists `model_change`/`thinking_level_change` in the JSONL), so the explicit `--model` belongs at first launch, not at resume.
 - **Cwd-independent for *finding*** the session — Pi searches by partial UUID across `~/.pi/agent/sessions/`.
-- **But run resume in the original cwd** for cleanest behavior. The session metadata remembers the cwd it was created in; resuming elsewhere makes file paths and git context inconsistent. `superv resume` defaults to the stored cwd.
+- **But run resume in the stored cwd** for cleanest behavior; `superv resume` defaults to it. For workers launched the standard way, the stored cwd is the worktrees' parent folder — stable even after the task worktree rotates or is deleted, which is exactly why workers are homed there. Passing `--cwd` to relocate also re-resolves and rewrites the stored transcript path by session id (or refuses if it can't).
 - **Pi has no permission-bypass flag** like Claude's `--dangerously-skip-permissions` — Pi's permission model is governed elsewhere; nothing extra is needed at resume time.
 
 ## 10. Kickoff template (Pi-flavored additions)
@@ -209,10 +245,10 @@ Pi supports session resume by UUID. The supervisor wraps this via `superv pause`
 Append to the core kickoff:
 
 ```
-8. You were launched with an explicit model (e.g. `pi --model openai-codex/gpt-5.6-sol:xhigh`),
+9. You were launched with an explicit model (e.g. `pi --model openai-codex/gpt-5.6-sol:xhigh`),
    which already sets your reasoning level; use `pi --thinking xhigh` only if you need to
    raise effort beyond what the launch set.
-9. The supervisor reads your active-branch JSONL and live tmux pane — both are observed.
-10. When you complete a phase, summarize in a final assistant turn so the supervisor's
+10. The supervisor reads your active-branch JSONL and live tmux pane — both are observed.
+11. When you complete a phase, summarize in a final assistant turn so the supervisor's
     persisted-history check picks up a clear done signal.
 ```

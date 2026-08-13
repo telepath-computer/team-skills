@@ -12,6 +12,22 @@ There are three distinct modes, and you promote between them deliberately, not b
 
 Never silently mutate the worker's environment while remaining in supervise mode. That is the source of nearly every catastrophic supervision failure.
 
+## Action requires clarity in proportion to impact — avoid the twitchy throttle
+
+A twitchy throttle turns a small or ambiguous user signal into a larger action than the user authorized. Questions, observations, preferences, tentative language, and requests to discuss a change do not by themselves authorize implementation.
+
+Match the size and consequence of the action to the explicit instruction. When the user has not clearly authorized the specific action, describe what you propose and obtain approval before you:
+
+- edit shared policy or durable instructions;
+- commit or push;
+- dispatch, cancel, or redirect substantial work;
+- start paid or broad resource-intensive operations;
+- merge, open, close, or retarget a pull request;
+- create, delete, or materially change the supervision heartbeat;
+- discard, rewrite, or clean up existing work.
+
+A request to inspect, explain, propose, compare, or discuss means do that and stop at the discussion boundary. A compound prompt may express a desired direction while asking first for current state or options; answer that question and agree on the consequential next step before acting. Do not treat your own confidence about the likely next step as permission.
+
 ## Don't perturb — the absolute rule
 
 While the worker is active, do **not** in its repo or runtime:
@@ -44,15 +60,49 @@ Keep these concepts separate:
 - **Worker completion** means one worker's current assignment is done. Stop nudging that worker about the completed assignment, verify the result, and reassess the overall goal. Worker completion may lead to review, a new dispatch, a phase transition, or eventual supervisor completion; it never by itself tears down the supervisor heartbeat.
 - **Supervisor completion** means the supervisor's overall assignment is definitively complete. This is distinct from a worker, task, review, slice, or phase being complete.
 
-The supervisor heartbeat remains alive across worker handoffs, idle periods, reviews, and task or phase transitions. Remove it only when the supervisor's overall assignment is definitively complete, progress definitively requires user input, or the user explicitly says to stop. Waiting for another worker, process, build, test, or review is not waiting for user input.
+The supervisor heartbeat remains alive across worker handoffs, idle periods, reviews, and task or phase transitions while agent-owned progress can still occur. Tear it down when supervision reaches a **steady-state no-action condition**: another heartbeat, without user input or a new assignment, would only observe and report the same state because there is no legitimate supervisory action left to take.
+
+A temporary wait is not a steady state. Keep the heartbeat active while a worker, process, build, test, review, or other already-dispatched operation can still complete and create the next supervisory action. Tear it down when the overall assignment is definitively complete, when further progress definitively requires user input and the exact blocker or handoff has been stated, or when the user explicitly says to stop. If the user later resumes the assignment, create the canonical heartbeat again.
 
 ### Canonical supervisor-heartbeat prompt
 
 Use this prompt verbatim for scheduled loops and as the semantic content of polled heartbeats:
 
-> You are a supervisor agent. Reassess the current project using conversation context and durable supervision state. Observe and interpret whatever currently needs attention, then continue your supervisor duties as appropriate—wait, nudge, correct, dispatch, review, transition, or escalate—following the agent-supervision skill. This heartbeat does not define or limit task scope. Preserve this prompt in this generic form: do not rewrite it around a specific worker, task, phase, or current state. Keep project details in conversation, session files, or supervision notes rather than this prompt.
+> Heartbeat: perform your supervision duties if applicable in this moment.
 
-The prompt is intentionally generic. Do not add worker IDs, task goals, phase names, current constraints, note paths, status snapshots, teardown conditions, or other project state. Those change while the supervisor's responsibility continues and belong in conversation context and durable supervision state.
+The heartbeat is only a short reminder. Procedures, task state, worker identities, and recovery instructions belong in their existing authorities rather than in the recurring prompt.
+
+## State the condition, not the answer — delegate the lookup
+
+**Do not do research or enumeration a worker can do itself.** When a task depends on some set of
+specific things — commits, identifiers, files, tickets, test names — send the **logical condition that
+defines the set**, not the set. The worker resolves it in its own environment, at its own moment, with
+its own eyes on the result.
+
+**Workers are intellectual peers.** Treating a lookup as something you must complete before they can
+start is both a waste of your turn and an insult to theirs.
+
+**The failure this prevents is not laziness, it is staleness and error.** A fact you look up and pass
+along has three ways to be wrong that a condition does not: it can be out of date by the time they read
+it, it can be misread on the way through you, and it can be misattributed. Observed in a single day of
+supervision: a baseline number passed on after it had changed; an invariant count passed on after a
+landing had altered it; and a set of test placeholders attributed to the wrong owning job because the
+supervisor transcribed one identifier for another. **All three were caught by the workers, who
+differenced the sources themselves. All three would have been non-events had the supervisor sent the
+predicate instead of the result.**
+
+Concretely, prefer the left column:
+
+| Send this | Not this |
+|---|---|
+| "Read the current baseline from `expected-failing-tests.txt` at your branch point." | "The baseline is 125." |
+| "Your job owns whatever is tagged with its own identifier — check." | "Your job owns 114 of them." |
+| "The trunk has moved since your branch point; read the delta and say whether it can reach you." | A hand-listed enumeration of the intervening commits. |
+| "Find the tests this assertion cites and confirm they still exist." | A list of the three test names you looked up. |
+
+**The exception is information that exists nowhere they can look** — a decision you made, a constraint
+from outside their environment, something another worker discovered that is not yet written down. That
+is the category worth spending your turn on, and it is much smaller than it feels.
 
 ## Nudge taxonomy
 
@@ -171,26 +221,65 @@ When reviewing observations, watch for and correct:
 
 When you spot one of these, send a direct correction. Do not let it ride.
 
-## Supervisor anti-pattern: Monitor for worker waits
+## Supervisor anti-pattern: delegating supervision to a worker
 
-**Do not use the `Monitor` tool to wait on a worker action.** Use cron loops instead — `CronCreate` with a recurring schedule on Claude, `LoopCreate` with a cron trigger on Pi, or repeated heartbeats from the user on Codex/OpenCode.
+**Do not hand supervisor duties to a worker agent to shirk your own coordination work.** Workers do the work; the supervisor does the cross-agent coordination and higher-level goal driving. This division is not negotiable and is not yours to redistribute.
 
-The failure mode is concrete and observed: the supervisor writes a `Monitor` script that polls the worker for some condition ("ctx dropped below 100k", "this file exists", "this PID is gone"), arms it with a multi-minute timeout, and walks away. If the supervisor's *premise* about what the worker is doing is wrong — e.g., the supervisor told the worker to run `/compact` in a prompt but never actually sent the slash command, so no compaction is in progress — the polled condition will never fire and the monitor sits silent for the full timeout window. The user has to intervene to unblock it. Nothing in the monitor's design re-tests the supervisor's premise.
+The failure has a recognizable arc, observed in practice: a worker spontaneously coordinates with another worker (e.g., drives its own review with a reviewer agent) and it *works* — faster, fewer supervisor round-trips. The supervisor then ratifies the pattern ("drive the review peer-to-peer; I'll verify outcomes"), keeping the easy half (verification) while offloading the real coordination (dispatching, waiting, relaying). It reads as efficiency. It is abdication, and the costs arrive quickly:
 
-Crons are different. A recurring cron fires on its schedule regardless of the worker's state. Each fire re-runs the supervisor's logic against current truth: "is the worker really doing X? if not, why? what should I do now?" Wrong assumptions surface within one cron interval instead of festering for the full Monitor timeout. Crons also produce a visible audit trail (each fire is a turn in the conversation), so the user can see the supervisor still reasoning rather than silently waiting.
+- **Workers grow supervisor machinery.** A worker told to "drive" another agent must *wait* on that agent, so it arms itself timers and polling loops — context burned on supervision instead of work, and machinery the supervisor doesn't control.
+- **Dual supervision with no authority.** Two agents now nudge and watch the same target; neither's picture of state is authoritative; double-nudges and dropped handoffs follow.
+- **Accountability blurs.** When the loop stalls, the supervisor no longer knows whether the worker is working, waiting, or supervising — and neither does the user.
 
-**Allowed `Monitor` uses (not supervision-related):**
+The correct shape: a worker that finishes reviewable work **ends its turn** with a ready signal in its report. The supervisor dispatches the reviewer, watches, relays findings back, and verifies commits. Waiting on agents is supervisor work — the supervisor has the heartbeat; workers should never need one.
+
+The tell: **if a worker needs a timer, or is waiting on another agent, supervision has leaked into it.** Reclaim it.
+
+(Distinguish this from legitimate *work* delegation: sending a worker a large task, including tasks that contain judgment, is the job. What may never be delegated is the coordination *between* agents — dispatch, watching, relaying, pacing, lifecycle.)
+
+**Draw the read line and the act line, and issue both as instructions.** On shared-user machines every agent can technically read this skill and run `superv` — file permissions cannot confine them, so the boundary only exists if you state it in kickoffs. The calibrated rule: *awareness* of this skill via the harness's skill listing is unavoidable and fine; *reading* its contents is off-limits to workers — it is the supervisor's operating manual, and a worker who has read it is one step from using it; *acting* on supervision capabilities (contacting other agents, arming watch loops, pacing itself with timers) is the hard violation and an immediate correction signal. Observed in practice: a worker browsing the skills directory for an unrelated skill read this one's transport docs and began driving its own review loop with another agent; the supervisor then compounded the error by ratifying it. State the rule at kickoff, treat worker references to supervision tooling as NEEDS_CORRECTION, and reclaim any coordination that has leaked.
+
+## Supervisor anti-pattern: holding a turn open to wait on a worker
+
+**Never block your own turn waiting for a worker to reach a condition.** You already have a loop. Use it, and do not try to optimize around it.
+
+The explicitly opt-in experimental event-driven mode defines one narrow override in `supervisors/experimental-event-driven.md`: `superv await` may run through a host's background-command facility while a recurring heartbeat remains active as a monitoring backstop. That overlay does not permit a foreground wait that holds the supervisor's active turn open.
+
+This rule is about the *mechanism*, not any one tool. All of these are the same anti-pattern:
+
+- A `Monitor` script polling for a worker condition.
+- A `Bash` loop that spins until a pattern appears — `until tmux capture-pane … | grep -q "…"; do sleep 5; done`, `while ! test -f …; do sleep 10; done`, or any variant.
+- A long foreground command whose only purpose is to delay until a worker finishes.
+- Chained short sleeps that add up to the same wait.
+
+Reaching for `Bash` instead of `Monitor` does not make it a different thing. If the supervisor's turn is being held open until a worker does something, it is this anti-pattern.
+
+The failure mode is concrete and observed twice. **First**, the supervisor writes a poll for some condition ("ctx dropped below 100k", "this file exists", "the verify run printed its summary"), arms it with a multi-minute timeout, and walks away. If the supervisor's *premise* is wrong — the slash command was never actually sent so no compaction is in progress; the run already finished before the loop started; the pattern never appears because a redrawing terminal UI scrolled it away — the condition never fires and the supervisor sits silent for the entire timeout. The user has to intervene to unblock it. Nothing in the loop's design re-tests the premise.
+
+**Second, and worse: the wait itself is a guess.** Writing the match pattern means predicting the exact text a worker will emit on success. That prediction is frequently wrong, and when it is wrong the supervisor burns the full timeout on something that already happened or will never happen. A pattern matched against a live terminal is worse still: panes redraw, scrollback rolls, and a substring from unrelated output can fire the condition early.
+
+And while the turn is held, the supervisor is deaf. It cannot answer the user, cannot react to a second worker, cannot notice that something else broke.
+
+Crons are different. A recurring cron fires on its schedule regardless of the worker's state. Each fire re-runs the supervisor's logic against current truth: "is the worker really doing X? if not, why? what should I do now?" Wrong assumptions surface within one interval instead of festering for a full timeout. Crons also produce a visible audit trail — each fire is a turn in the conversation — so the user can see the supervisor still reasoning rather than silently waiting.
+
+**The correct shape is always the same:** take a snapshot, read it, report what is true now, end the turn. If the thing you wanted has not happened yet, the next heartbeat gets it. A worker finishing thirty seconds after your turn ends costs one heartbeat interval. A wrong wait costs the whole timeout and the user's attention.
+
+Do not accept "but I want the result in *this* turn" as a reason. That impatience is precisely what produces the wrong-premise wait.
+
+**Allowed waiting (not supervision-related):**
 - Watching log files for arbitrary error patterns during a debugging session.
 - Streaming events from a one-off external process the supervisor itself launched (not a worker).
 - Tailing a CI run or remote API to surface state changes the harness can't notify on.
+- A foreground command the supervisor itself runs for its own work, where the wait is the command's own runtime rather than a poll for someone else's state.
 
-**Disallowed `Monitor` uses (use a cron instead):**
+**Disallowed (let the heartbeat handle it):**
 - "Wake me when the worker finishes."
 - "Wake me when the worker's context drops below N."
 - "Wake me when the worker writes file X."
+- "Wait until the worker's test run prints its result."
 - Any condition whose truth depends on the worker doing what the supervisor asked.
 
-If a heartbeat or recurring cron is too coarse-grained for the work — e.g., a 2-minute cron would burn cache for an action that completes in 20 seconds — accept the coarse grain anyway, or block on a direct `Bash` `run_in_background` call that the supervisor itself controls (not a polling loop based on worker state). The bias is toward periodic re-examination of premises, not toward silent waiting on assumed truths.
+If a heartbeat is too coarse-grained for the work — e.g., a 2-minute interval for an action that completes in 20 seconds — accept the coarse grain. The bias is toward periodic re-examination of premises, not toward silent waiting on assumed truths.
 
 ## Self-disclosure rule
 
@@ -233,19 +322,70 @@ For a tmux-backed worker, the standard supervisor action is:
 superv send <id> "/compact"
 ```
 
-The submission must contain no prefix, suffix, explanation, or follow-up instruction. Wait until the worker is idle before sending it; a busy agent may route incoming input into a steering queue as ordinary text instead of executing a TUI command. Verify through the live channel that compaction actually started, wait for it to finish, verify that context usage dropped or a compaction event persisted, and only then send a separate continuation message.
+The `/compact` submission itself must contain no prefix, suffix, explanation, or follow-up instruction. Wait until the worker is idle before sending it; a busy agent may route the slash command into a steering queue as ordinary text instead of executing a TUI command. Immediately afterward, in the same supervisor turn, send the separate post-compaction orientation message: while compaction is running, the harness safely queues it as steering for delivery after compaction. Verify through the live channel that compaction actually started and that the orientation is queued. On subsequent heartbeats, verify that compaction finished and that the orientation was delivered; do not re-send `/compact` to test completion.
 
 **Anti-pattern:** asking the agent to self-compact and treating its acknowledgement, an idle turn, or a statement that it reached a breakpoint as evidence that compaction happened. None of those execute the host command. The supervisor must issue and verify the isolated slash command itself.
 
 The same boundary applies to other host-level slash commands: model prose cannot operate the TUI that contains the model.
 
+## Send a post-compaction orientation message — in the same turn as the compact
+
+**A compacted worker comes back at an empty prompt with a summary of its history and no reliable sense
+of what it is doing now.** It does not come back neutral: it fills the gap with whatever the remaining
+evidence suggests. Observed failures include a worker returning convinced it was the supervisor, and a
+worker about to resume implementing while a dozen remediation items sat unread in its own notes.
+
+**Write the orientation message in the same turn as the `/compact`, not the next cycle.** A queued
+message waits harmlessly; an unwritten one does not get written. Treating it as later work has left
+workers sitting at empty prompts for many minutes while the mechanical status verdict reported them
+busy — invisible unless the supervisor looks past the verdict.
+
+**What it contains:**
+
+- **Who the worker is and what its role is**, stated plainly, including the boundaries — it is not the
+  supervisor, it does not contact other workers, it does not pace itself.
+- **The assignment**, and where the work lives: branch, worktree, the commit its work is banked at.
+- **What phase it is in.** This is the highest-value line and the easiest to omit. "Mid-remediation
+  with N items in your notes" and "starting implementation" produce completely different next actions
+  from the same worker, and the evidence in a half-finished tree looks the same either way.
+- **Anything it discovered before compacting that is written nowhere it will look.** Facts recorded
+  only in the lost conversation are the part a summary reliably drops.
+- **A pointer to its own durable notes, with the instruction to read them rather than trust
+  recollection.** Its notes are the state; its memory is not.
+
+**Keep it short and make it pointers.** The orientation is not a re-briefing: it says where the worker
+is and what to read, not what the work means.
+
+**The corollary for how work should be arranged**: if a worker's memory is load-bearing, compaction is
+dangerous and orientation cannot fix it. Durable task state on disk, commits pushed as they are made,
+and briefs re-seeded from files are what make both compaction and replacement cheap.
+
 ## Context budget — cursor discipline
 
 The supervisor's biggest risk is destroying its own context by ingesting the full contents of the worker's session.
 
-- **Always go through `superv watch`.** It maintains a per-worker cursor and only returns new entries since last check. Never read raw JSONL or full HTTP message histories to "get oriented."
+- **Route attention with `superv sweep`, then read through `superv watch`.** `sweep` reports liveness, context use, unread count, and the latest readable intent or conclusion for every registered worker without moving cursors. `watch` maintains a per-worker cursor and returns the unread entries that need full interpretation. Never read raw JSONL or full HTTP message histories to "get oriented."
 - **After compaction, the cursor file survives.** Load it, fetch only entries past it. Do not re-read from message 0 — that's the loop that destroys context permanently.
-- **Truncation defaults are tuned for survival.** Only use `superv detail <id>` when you specifically need full content for one entry.
+- **CRITICAL — do not substitute `tmux capture-pane` for `watch` on routine sweeps.** This is the single largest avoidable drain on a supervisor's context, it compounds every heartbeat, and it is invisible while it happens. Measured on a real session: `superv status` costs 66 bytes for an idle worker, `superv watch` with a current cursor costs **17** — literally `(no new entries)` — and `capture-pane` of the same idle worker costs **~3,600 bytes of identical, unchanged tail, every single time**. Across six workers on a two-minute heartbeat that is roughly 160k tokens an hour of pure duplication. The cursor exists precisely so an idle worker is nearly free to observe; a raw pane read throws that away and re-ingests the same screen.
+- **When `watch` prints a compact overview, follow its completion instruction — don't reach for the pane.** Every tool call remains visible on its own bounded line. If the output says `INCOMPLETE OBSERVATION`, run `superv watch <id>` again before judging the worker; the cursor advanced only through the entries shown. Repeat until it says `OBSERVATION COMPLETE`. A line ending in `…` has shortened content available through `superv detail <id> <locator>`. Use `superv watch <id> --reset --count N` only when deliberately discarding unread history to inspect a recent tail.
+- **`capture-pane` is for the live channel, not the transcript.** It is the right tool for the few things the persisted log cannot show: whether a compaction indicator is on screen, whether a sent message is sitting unconsumed in the steering queue, whether a retry is in progress. Reach for it deliberately for those, not as the default way to see what a worker is doing.
+- **Read the work product before reading the transcript.** When the supervised work lands in a
+  repository, `git log --oneline`, `git diff --shortstat` against the integration branch, and the
+  contents of committed working notes answer *where is everyone* exactly, for almost nothing. One pass
+  across four branches can tell you that one worker has already merged and run its verification, that
+  another acted on a correction you sent, and that a third has produced only a plan — none of which
+  the status verdict shows and all of which the transcript would cost thousands of tokens to extract.
+  **The transcript is where reasoning and false starts live; go there when the diff raises a question,
+  not to find out what happened.** This also means a broken, changing, or unavailable observation tool
+  never blinds you.
+
+- **A mechanical status verdict is cheap, not reliable.** Observed in one session: *running/busy*
+  reported for a worker sitting at an empty prompt; a context figure with no denominator, so a number
+  that looked unremarkable was 83% of the window; and a stale context figure carried across a
+  compaction, so a completed compaction read as a hang for several minutes. Use the verdict to decide
+  **who to look at**, then look. Never build a conclusion on it alone.
+
+- **Truncation defaults are tuned for survival.** Use bounded `superv detail <id> <locator>` when one overview line needs inspection. Unbounded JSON requires the deliberate `--raw --force` double override.
 - **Notes file is outside the repo.** So the worker doesn't read your meta-commentary about it.
 
 ## Filesystem conventions (single source of truth)
@@ -284,13 +424,15 @@ A worker's current assignment is **complete** when:
 
 When a worker is complete, do not keep nudging it about completed work. Verify its claims, record the result when useful, and reassess the supervisor's overall assignment. You may dispatch follow-up work or a new assignment, but that is a new supervisory decision rather than a "continue" nudge.
 
+Apply the steady-state test before teardown: if another heartbeat could still dispatch, verify, review, transition, remediate, or report new agent-produced evidence, supervision is not finished.
+
 Tear down the supervisor heartbeat only when one of these is definitively true:
 
-1. The supervisor's overall assignment is complete.
-2. Further progress requires user input; state the exact question or blocker before stopping.
-3. The user explicitly told the supervisor to stop.
+1. **The supervisor's overall assignment is definitively complete.** All implementation, dispatch, validation, review, transition, reporting, and handoff work owned by the supervisor is finished. There is no more work to dispatch or verify, and further heartbeats would continually produce the same no-action completion report.
+2. **Further progress definitively requires user input.** State the exact question, blocker, or handoff before stopping. No worker or supervisor action can advance the assignment until the user acts, so further heartbeats would only poll for that action. Examples include a ready PR awaiting owner review or merge, a requested manual test, missing credentials or access, a consequential product decision, or an escalated blocking issue that requires the user's input. This is a stop condition only when no other agent-owned work can proceed.
+3. **The user explicitly told the supervisor to stop.**
 
-A worker, review, task, slice, or phase completing is not a heartbeat teardown condition. Neither is waiting for another agent, process, build, test, or review.
+A worker, review, task, slice, or phase completing is not by itself a heartbeat teardown condition. Neither is a temporary wait for another agent, process, build, test, or review. If the user later supplies the required input or resumes the assignment, create the canonical heartbeat again.
 
 ## Pause / resume — for tmux-backed workers (pi/claude/codex)
 
@@ -303,7 +445,7 @@ superv resume <id>                                  # re-launch in a fresh tmux 
 superv resume <id> --cwd /other/path                # resume in a different directory
 ```
 
-The persisted JSONL/rollout file is left intact — agent CLIs (`pi --session <uuid>`, `claude --resume <uuid>`, `codex resume <uuid>`) all support continuing an existing session by ID. The registry stores the session ID, the original cwd, and (optionally) launch hints, so resume rebuilds the tmux window and re-launches the agent with the right flags.
+The persisted JSONL/rollout file is left intact — agent CLIs (`pi --session <uuid>`, `claude --resume <uuid>`, `codex resume <uuid>`) all support continuing an existing session by ID. The registry stores the session ID, the launch cwd, and (optionally) launch hints, so resume rebuilds the tmux window and re-launches the agent with the right flags. For pi/claude workers launched the standard way, the stored cwd is the worktrees' **parent folder**, not a worktree — deliberately, because worktrees are often shorter-lived than the agent sessions that operate over them.
 
 **When to use:**
 - The user explicitly wants to step away for a while and free up tmux windows.
@@ -316,7 +458,7 @@ The persisted JSONL/rollout file is left intact — agent CLIs (`pi --session <u
 
 Pausing mid-turn discards the in-flight turn, so operators typically pause at a quiet moment — the tool does not check or block.
 
-**Cwd matters at resume time.** Agents inherit cwd from the resuming process. The session metadata remembers the *original* cwd it was created in (file paths, git context). If you resume from a different cwd, the agent gets subtle confusion (`git status` runs in the new cwd, file-read paths assume the old cwd, etc.). Prefer the stored cwd unless you have a specific reason.
+**Cwd matters at resume time.** Agents inherit cwd from the resuming process, and the session metadata remembers the cwd it was created in. Resume to the stored cwd. For pi/claude workers that cwd is the stable worktrees' parent folder, so resuming there remains correct even after the task worktree has rotated or been deleted — the agent's worktree comes from its briefs, not its cwd. Only codex workers (launched inside the worktree by exception) may need `--cwd` after worktree deletion; passing `--cwd` also re-resolves and rewrites the stored transcript path by session id, or refuses if it can't.
 
 ## Kickoff message template
 
@@ -325,11 +467,13 @@ When launching the worker into implementation, be explicit about freedoms:
 ```
 1. You have FULL freedom on this machine. sudo, install, modify, restart.
 2. [Concrete environment details — what's running, where source is]
-3. The spec is at [path]. Update it if reality differs.
-4. Source for dependencies is at [path] if you need to read them.
-5. For anything not specified — make a decision and move forward.
-6. Commit and push as you go.
-7. When you hit a wall, say so clearly — do not spin.
+3. Your shell starts in the worktrees' parent folder; your assigned worktree is
+   [path] — always cd into it explicitly / use absolute paths for repo commands.
+4. The spec is at [path]. Update it if reality differs.
+5. Source for dependencies is at [path] if you need to read them.
+6. For anything not specified — make a decision and move forward.
+7. Commit and push as you go.
+8. When you hit a wall, say so clearly — do not spin.
 ```
 
 Worker docs may add worker-specific lines (kickoff template lives in each `workers/<kind>.md`).

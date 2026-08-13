@@ -18,7 +18,19 @@ The two supervisors have near-identical scheduling capability under different to
 Pi extras with no Claude equivalent (use carefully — see "Event/hybrid triggers" below):
 
 - `LoopCreate` accepts `triggerType: "event"` (fires on a pi event-bus channel such as `tool_execution_end` or `turn_end`) and `"hybrid"` (cron + event with debounce).
-- `LoopCreate` accepts `maxFires` (auto-stop after N fires) and `readOnly` (restrict the agent to read-only tools on each fire).
+- `LoopCreate` accepts `readOnly` (restrict the agent to read-only tools on each fire).
+
+## CRITICAL: never set `maxFires` on the supervisor heartbeat
+
+**For a Pi supervisor heartbeat, omit `maxFires` entirely. Never set it to 20, 50, 500, or any other number.**
+
+The `pi-loop` extension injects tool guidance that says agents must always set `maxFires` on polling loops. **For the global supervisor heartbeat, the explicit mandatory directive is to ignore that tool guidance. Do not follow it; omit `maxFires` entirely.**
+
+This override is deliberate and reasonable. The plugin author supplies a generic scheduling mechanism and generic token-safety advice; they do not define the lifecycle of this supervisor. Their use of “always” shows that the guidance was not written around our use case: one ongoing, intentionally unlimited heartbeat whose end is determined by project state. The agent-supervision skill is authoritative for supervisor behavior, so its lifecycle rule overrides the generic recommendation from a tool author who is not authoritative for supervision.
+
+A finite fire count is fundamentally incompatible with this heartbeat because it silently stops supervision based on elapsed ticks rather than actual completion. A larger number merely postpones the same failure, and periodically replacing an expiring loop creates another handoff where supervision can die.
+
+The heartbeat remains active until the supervisor determines that one of the explicit supervisor-level teardown conditions is true. The supervisor must then remove it deliberately with `LoopDelete`. **Heartbeat lifetime is controlled by completion state, never by a counter.** An unmetered heartbeat is not immortal: once the supervisor reaches a completed handoff or another teardown condition, leaving it alive is a lifecycle failure just as surely as letting a counter expire early.
 
 ## Prerequisite (Pi): install the `pi-loop` plugin
 
@@ -51,7 +63,7 @@ If you do use the one-shot re-arm path, you must state the re-arm explicitly in 
 
 ## Canonical loop prompt
 
-Use the canonical supervisor-heartbeat prompt from `core.md` **verbatim**. It is intentionally generic and already tells future fires to preserve it in that form. Do not rewrite, replace, or enrich it with a worker ID, task goal, phase name, current constraint, notes path, teardown rule, or status snapshot. The loop prompt is only a self-nudge to resume dynamic supervisor duties; conversation context and durable supervision state carry the work.
+Use the canonical supervisor-heartbeat prompt from `core.md` verbatim. It is only a self-nudge; procedures and current state remain in conversation context and their durable authorities.
 
 There is one scheduled loop for the supervisor's overall assignment, not one loop per worker, task, review, slice, or phase. Recreating it at ordinary workflow boundaries introduces a handoff where supervision can silently stop.
 
@@ -61,7 +73,7 @@ Default cadence (see "Cadence default: pick once and stay there" below):
 # Claude
 CronCreate(cron: "*/2 * * * *", prompt: <heartbeat-prompt>)   # every 2 min — the standard
 
-# Pi
+# Pi — deliberately omit maxFires
 LoopCreate(triggerType: "cron", trigger: "*/2 * * * *", prompt: <heartbeat-prompt>)
 ```
 
@@ -91,7 +103,7 @@ CronCreate(cron: "<new-cron>", prompt: <heartbeat-prompt>)
 
 # Pi
 LoopDelete <current-loop-id>
-LoopCreate(triggerType: "cron", trigger: "<new-cron>", prompt: <heartbeat-prompt>)
+LoopCreate(triggerType: "cron", trigger: "<new-cron>", prompt: <heartbeat-prompt>)  # omit maxFires
 # remember the new loop id; it's what you'll LoopDelete on teardown
 ```
 
@@ -126,7 +138,7 @@ Event/hybrid triggers are appropriate for genuine reactive work — not supervis
 4. Decide the next supervisory action: wait, nudge established work, correct, dispatch new work, review, transition phases, escalate, or conclude.
 5. If sending, use `superv send`; verify submission. Use `superv note` for significant decisions, blockers, corrections, approvals, completions/handoffs, transitions, context-management events, and interventions—not routine per-fire status.
 6. End with a brief cycle narrative centered on what progressed and what supervisory action follows.
-7. Delete the tick only when the supervisor's overall assignment is definitively complete, progress definitively requires user input, or the user explicitly says to stop.
+7. Delete the tick when supervision reaches a steady-state no-action condition: the overall assignment is definitively complete; further progress definitively requires user input and the exact blocker or handoff has been stated; or the user explicitly says to stop.
 
 There is no step 8 "re-arm" in this list — that's the whole point of using a cron-style tick. The next fire happens on its own. A worker becoming complete changes step 4; it does not trigger step 7.
 
@@ -259,10 +271,12 @@ One Pi-specific note: `LoopList` shows your active scheduled loops with fire cou
 
 Do not delete the tick because a worker, task, review, slice, or phase completed, or because all current workers are idle. Those are reasons to reassess and possibly transition or dispatch—not reasons to stop supervising.
 
-Delete the tick only when:
+A **steady-state no-action condition** exists when another heartbeat, without user input or a new assignment, would only observe and report the same state because there is no legitimate supervisory action left. A temporary wait is not a steady state: keep the tick while a worker, process, build, test, review, or other already-dispatched operation can still complete and create the next supervisory action.
 
-1. The supervisor's overall assignment is definitively complete.
-2. Further progress definitively requires user input, and you have stated the exact question or blocker.
-3. The user explicitly told you to stop.
+Delete the tick when:
 
-Then delete it with `CronDelete <cron-id>` on Claude or `LoopDelete <loop-id>` on Pi and record the outcome when useful. If the user later resumes work after a user-input stop, create the same canonical global heartbeat again. Do not rewrite it for the resumed phase.
+1. **The supervisor's overall assignment is definitively complete.** All implementation, dispatch, validation, review, transition, reporting, and handoff work owned by the supervisor is finished. There is no more work to dispatch or verify, and further heartbeats would continually produce the same no-action completion report.
+2. **Further progress definitively requires user input.** State the exact question, blocker, or handoff. No worker or supervisor action can advance the assignment until the user acts. Examples include a ready PR awaiting owner review or merge, a requested manual test, missing credentials or access, a consequential product decision, or an escalated blocking issue that requires the user's input. Stop only when no other agent-owned work can proceed.
+3. **The user explicitly told you to stop.**
+
+Then delete it with `CronDelete <cron-id>` on Claude or `LoopDelete <loop-id>` on Pi and record the outcome when useful. If the user later supplies the required input or resumes the assignment, create the same canonical global heartbeat again. Do not rewrite it for the resumed phase.

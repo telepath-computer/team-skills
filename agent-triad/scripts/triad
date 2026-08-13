@@ -193,15 +193,18 @@ resolve_triad() {
 }
 
 # ---------- idle prompts (single line; no double quotes) ----------
-idle_prompt() { # idle_prompt <role> <name> <worktree>
-  local role="$1" name="$2" wt="$3"
+idle_prompt() { # idle_prompt <role> <name> <worktree> <launch-cwd>
+  local role="$1" name="$2" wt="$3" cwd="$4" loc=""
+  if [ "$cwd" != "$wt" ]; then
+    loc=" Note: your shell starts in $cwd, the worktrees' parent folder, NOT inside the worktree — worktrees come and go, so agents are homed one level up. Every repo command must cd into the stated worktree explicitly or use absolute paths."
+  fi
   case "$role" in
     worker)
-      printf "You are '%s', an implementation worker. Your supervisor is your only point of contact. You are currently IDLE — do NOT start any work. Do not inspect any repository, read or edit files, run tests, install anything, or plan implementation until the supervisor sends you an explicit task. When work is later assigned you will use the git worktree at %s. For now just acknowledge you are ready and waiting for instructions, then stop." "$name" "$wt";;
+      printf "You are '%s', an implementation worker. Your supervisor is your only point of contact. You are currently IDLE — do NOT start any work. Do not inspect any repository, read or edit files, run tests, install anything, or plan implementation until the supervisor sends you an explicit task. When work is later assigned you will use the git worktree at %s.%s For now just acknowledge you are ready and waiting for instructions, then stop." "$name" "$wt" "$loc";;
     reviewer)
-      printf "You are '%s', a code reviewer. Your supervisor is your only point of contact. You are currently IDLE — do not review anything yet. Do NOT inspect any repository, read diffs, read or run code, or run tests until the supervisor sends you an explicit review request. When a review is later requested you may be asked to inspect the git worktree at %s. For now just acknowledge you are ready and waiting for a review request, then stop." "$name" "$wt";;
+      printf "You are '%s', a code reviewer. Your supervisor is your only point of contact. You are currently IDLE — do not review anything yet. Do NOT inspect any repository, read diffs, read or run code, or run tests until the supervisor sends you an explicit review request. When a review is later requested you may be asked to inspect the git worktree at %s.%s For now just acknowledge you are ready and waiting for a review request, then stop." "$name" "$wt" "$loc";;
     *)
-      printf "You are '%s', a %s agent for the supervisor. Your supervisor is your only point of contact. You are currently IDLE — do NOT start any work. Do not inspect any repository, read or edit files, run tests, or act in any way until the supervisor sends you explicit instructions. When work is later assigned you will use the git worktree at %s. For now just acknowledge you are ready and waiting, then stop." "$name" "$role" "$wt";;
+      printf "You are '%s', a %s agent for the supervisor. Your supervisor is your only point of contact. You are currently IDLE — do NOT start any work. Do not inspect any repository, read or edit files, run tests, or act in any way until the supervisor sends you explicit instructions. When work is later assigned you will use the git worktree at %s.%s For now just acknowledge you are ready and waiting, then stop." "$name" "$role" "$wt" "$loc";;
   esac
 }
 
@@ -242,11 +245,17 @@ wait_for_marker() { # wait_for_marker <tmux-target> <marker> [tries]
   return 1
 }
 
-register_with_retry() { # register_with_retry <id> <kind> <target> -> 0 ok, 2 name collision, 1 other
-  local id="$1" kind="$2" target="$3" tries=40 i=0 out
+register_with_retry() { # register_with_retry <id> <kind> <target> [extra superv args...] -> 0 ok, 2 name collision, 1 other
+  local id="$1" kind="$2" target="$3"; shift 3
+  local tries=40 i=0 out
   while [ "$i" -lt "$tries" ]; do
-    if out="$(superv register "$id" --kind "$kind" --tmux "$target" 2>&1)"; then return 0; fi
+    if out="$(superv register "$id" --kind "$kind" --tmux "$target" "$@" 2>&1)"; then return 0; fi
     if printf '%s' "$out" | grep -qiE "already registered|worker .* already registered"; then return 2; fi
+    # Terminal identity errors can't be fixed by waiting — stop retrying.
+    if printf '%s' "$out" | grep -qiE "matches multiple session files|already bound to registered worker|belongs to cwd|needs an exact session identity|--path and --session-id disagree"; then
+      warn "superv register failed terminally for '$id': $(printf '%s' "$out" | head -n 1)"
+      return 1
+    fi
     i=$((i+1))
     if { [ "$kind" = "claude" ] || [ "$kind" = "codex" ]; } && [ $((i % 8)) -eq 0 ]; then
       tmux send-keys -t "$target" Enter 2>/dev/null || true
@@ -256,11 +265,30 @@ register_with_retry() { # register_with_retry <id> <kind> <target> -> 0 ok, 2 na
   return 1
 }
 
-launch_agent() { # launch_agent <state-file> <session> <worktree> <role> <kind> [name]
-  local sf="$1" session="$2" wt="$3" role="$4" kind="$5" requested_name="${6:-}"
+launch_agent() { # launch_agent <state-file> <session> <worktree> <launch-cwd> <role> <kind> [name]
+  local sf="$1" session="$2" wt="$3" launch_cwd="$4" role="$5" kind="$6" requested_name="${7:-}"
   case "$kind" in pi|claude|codex) ;; *) warn "unsupported kind '$kind' (pi|claude|codex)"; return 1;; esac
   valid_ident "$role" || { warn "invalid role '$role' (use ^[a-z][a-z0-9-]*$)"; return 1; }
   [ -z "$requested_name" ] || valid_ident "$requested_name" || { warn "invalid name '$requested_name' (use ^[a-z][a-z0-9-]*$)"; return 1; }
+
+  # Agents launch in the worktrees' parent folder, not the worktree itself:
+  # worktrees are often shorter-lived than the agent sessions that operate over
+  # them, and a deleted worktree strands a shell (and cwd-keyed session files)
+  # homed inside it. The idle prompt / task brief names the worktree instead.
+  # EXCEPTION: codex sessions bind to their pane only by cwd (superv matches
+  # the rollout's payload.cwd; there is no id-based binding), so multiple codex
+  # agents sharing the parent folder would misbind — codex keeps launching
+  # inside its worktree until it gains id-based binding.
+  local cwd="$launch_cwd"
+  [ "$kind" = "codex" ] && cwd="$wt"
+  if [ "$cwd" != "$wt" ] && [ ! -f "$cwd/AGENTS.md" ]; then
+    cat >"$cwd/AGENTS.md" <<'EOF'
+Agents are launched in this folder because worktrees come and go; your
+assignment names your worktree. Read the AGENTS.md inside your assigned
+worktree before working in it, and always cd into the worktree explicitly
+(absolute path) for repo commands.
+EOF
+  fi
 
   local attempts=0 max_attempts=5 name auto_name
   while [ "$attempts" -lt "$max_attempts" ]; do
@@ -270,19 +298,25 @@ launch_agent() { # launch_agent <state-file> <session> <worktree> <role> <kind> 
     valid_ident "$name" || { warn "allocated invalid name '$name' (use ^[a-z][a-z0-9-]*$)"; return 1; }
 
     local prompt window_id target pane_target qprompt
-    prompt="$(idle_prompt "$role" "$name" "$wt")"
+    prompt="$(idle_prompt "$role" "$name" "$wt" "$cwd")"
     info "Launching $role '$name' ($kind) in window '$name'…"
-    if ! window_id="$(tmux new-window -P -F '#{window_id}' -t "$session:" -n "$name" -d -c "$wt")"; then
+    if ! window_id="$(tmux new-window -P -F '#{window_id}' -t "$session:" -n "$name" -d -c "$cwd")"; then
       warn "failed to create tmux window '$name' in session '$session'"; return 1
     fi
     target="$window_id"
     pane_target="$session:$name.0"
 
     qprompt="$(shell_quote "$prompt")"
+    local pi_session_id=""
     case "$kind" in
       pi)
-        local qmodel; qmodel="$(shell_quote "$PI_MODEL")"
-        tmux send-keys -t "$target" "pi --model $qmodel $qprompt" Enter
+        # Seed an explicit session id at launch so registration can bind this
+        # pane to exactly its own transcript. Several pi agents may share one
+        # cwd; superv refuses to guess by recency.
+        pi_session_id="$name-$(node -e 'process.stdout.write(require("crypto").randomUUID())')" \
+          || { warn "failed to generate a session id for '$name'"; tmux kill-window -t "$window_id" 2>/dev/null || true; return 1; }
+        local qmodel qsid; qmodel="$(shell_quote "$PI_MODEL")"; qsid="$(shell_quote "$pi_session_id")"
+        tmux send-keys -t "$target" "pi --model $qmodel --session-id $qsid $qprompt" Enter
         wait_for_marker "$target" "escape interrupt" || warn "pi readiness marker not seen for $name; continuing."
         ;;
       claude)
@@ -305,8 +339,9 @@ launch_agent() { # launch_agent <state-file> <session> <worktree> <role> <kind> 
         ;;
     esac
 
-    local reg_rc=0
-    register_with_retry "$name" "$kind" "$pane_target" || reg_rc=$?
+    local reg_rc=0 reg_extra=()
+    [ -n "$pi_session_id" ] && reg_extra=(--session-id "$pi_session_id")
+    register_with_retry "$name" "$kind" "$pane_target" "${reg_extra[@]}" || reg_rc=$?
     if [ "$reg_rc" -eq 0 ]; then
       info "Registered $role '$name' ($kind)."
       local sid; sid="$(worker_session_id "$name")"
@@ -323,7 +358,7 @@ launch_agent() { # launch_agent <state-file> <session> <worktree> <role> <kind> 
     if [ "$reg_rc" -eq 2 ]; then
       warn "name '$name' is already registered; killed orphan window"
     else
-      warn "failed to register $role '$name' ($kind) — session file never appeared; killed orphan window '$name'"
+      warn "failed to register $role '$name' ($kind) — session file never appeared or registration was refused; killed orphan window '$name'"
     fi
     return 1
   done
@@ -373,6 +408,10 @@ cmd_up() {
   [ -n "$SLUG" ] || die "task slug empty after normalization: '$TASK'"
   local ID="$REPO--$SLUG"
   local WT="$PARENT/wt/$REPO/$SLUG"
+  # Agents' shells are homed here (the worktrees' parent), not inside the
+  # worktree — worktrees are often shorter-lived than the agent sessions that
+  # operate over them. Codex-kind agents are the exception (see launch_agent).
+  local LAUNCH_CWD="$PARENT/wt/$REPO"
   local BRANCH="thopter/$SLUG"
   local def_ref; def_ref="$(git -C "$CANON" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
   local DEFAULT_BRANCH="${def_ref##*/}"; [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="main"
@@ -403,13 +442,13 @@ cmd_up() {
   mkdir "$TRIADS_DIR/$ID" || die "triad '$ID' was created concurrently; use 'triad status $ID' or choose another task id"
   node -e '
     const fs=require("fs");
-    const [f,id,repo,canon,parent,slug,wt,branch,base,defb,sess]=process.argv.slice(1);
+    const [f,id,repo,canon,parent,slug,wt,launch_cwd,branch,base,defb,sess]=process.argv.slice(1);
     const j={id,created_at:new Date().toISOString(),repo,canonical_repo:canon,parent,task_slug:slug,
-             worktree:wt,branch,base,default_branch:defb,tmux_session:sess,
+             worktree:wt,launch_cwd,branch,base,default_branch:defb,tmux_session:sess,
              supervisor:{note:"current agent in this session; never managed or torn down by triad"},
              agents:[],status:"creating"};
     fs.writeFileSync(f, JSON.stringify(j,null,2)+"\n");
-  ' "$SF" "$ID" "$REPO" "$CANON" "$PARENT" "$SLUG" "$WT" "$BRANCH" "$BASE" "$DEFAULT_BRANCH" "$SESSION"
+  ' "$SF" "$ID" "$REPO" "$CANON" "$PARENT" "$SLUG" "$WT" "$LAUNCH_CWD" "$BRANCH" "$BASE" "$DEFAULT_BRANCH" "$SESSION"
   info "State written: $SF (creating)"
 
   info "Fetching origin…"
@@ -431,10 +470,10 @@ cmd_up() {
 
   local WORKER_NAME="" REVIEWER_NAME=""
   if [ "$DO_WORKER" -eq 1 ]; then
-    if launch_agent "$SF" "$SESSION" "$WT" worker "$WORKER_KIND"; then WORKER_NAME="$LAUNCHED_NAME"; else state_set_status "$SF" create_failed; die "worker launch failed; triad state left at $SF with status create_failed. Standard recovery: run 'triad down $ID', then re-run 'triad up' (the worktree/branch will be reused if present)."; fi
+    if launch_agent "$SF" "$SESSION" "$WT" "$LAUNCH_CWD" worker "$WORKER_KIND"; then WORKER_NAME="$LAUNCHED_NAME"; else state_set_status "$SF" create_failed; die "worker launch failed; triad state left at $SF with status create_failed. Standard recovery: run 'triad down $ID', then re-run 'triad up' (the worktree/branch will be reused if present)."; fi
   fi
   if [ "$DO_REVIEWER" -eq 1 ]; then
-    if launch_agent "$SF" "$SESSION" "$WT" reviewer "$REVIEWER_KIND"; then REVIEWER_NAME="$LAUNCHED_NAME"; else state_set_status "$SF" create_failed; die "reviewer launch failed; triad state left at $SF with status create_failed. Standard recovery: run 'triad down $ID', then re-run 'triad up' (the worktree/branch will be reused if present)."; fi
+    if launch_agent "$SF" "$SESSION" "$WT" "$LAUNCH_CWD" reviewer "$REVIEWER_KIND"; then REVIEWER_NAME="$LAUNCHED_NAME"; else state_set_status "$SF" create_failed; die "reviewer launch failed; triad state left at $SF with status create_failed. Standard recovery: run 'triad down $ID', then re-run 'triad up' (the worktree/branch will be reused if present)."; fi
   fi
   state_set_status "$SF" active
 
@@ -482,9 +521,13 @@ cmd_add() {
   fi
   local SESSION WT; SESSION="$(state_get "$TRIAD_FILE" tmux_session)"; WT="$(state_get "$TRIAD_FILE" worktree)"
   tmux has-session -t "$SESSION" 2>/dev/null || die "tmux session '$SESSION' not found"
+  # A new agent's task targets this worktree, so it must exist — even though
+  # the agent's shell launches in the parent folder, not inside it.
   [ -d "$WT" ] || die "worktree missing: $WT"
+  local LAUNCH_CWD; LAUNCH_CWD="$(state_get "$TRIAD_FILE" launch_cwd)"
+  [ -n "$LAUNCH_CWD" ] || LAUNCH_CWD="$(dirname "$WT")"  # older state files predate launch_cwd
 
-  if ! launch_agent "$TRIAD_FILE" "$SESSION" "$WT" "$ROLE" "$KIND" "$NAME"; then
+  if ! launch_agent "$TRIAD_FILE" "$SESSION" "$WT" "$LAUNCH_CWD" "$ROLE" "$KIND" "$NAME"; then
     die "failed to add $ROLE ($KIND) to triad '$TRIAD_ID'"
   fi
   info "Added $ROLE '$LAUNCHED_NAME' ($KIND) to triad '$TRIAD_ID' — idle, recorded in state, included in future teardown."
@@ -544,7 +587,7 @@ cmd_resume() {
   local st; st="$(state_get "$TRIAD_FILE" status)"
   { [ "$st" = "paused" ] || [ "$st" = "resume_failed" ]; } || die "triad '$TRIAD_ID' is '$st' — only paused/resume_failed triads can be resumed"
   local WT SESSION; WT="$(state_get "$TRIAD_FILE" worktree)"; SESSION="$(state_get "$TRIAD_FILE" tmux_session)"
-  [ -d "$WT" ] || die "worktree missing: $WT — agents' stored cwd is gone; investigate before resuming"
+  [ -d "$WT" ] || die "worktree missing: $WT — agents resume in the worktrees' parent folder, but this triad's task worktree is gone; investigate before resuming"
 
   # If the recorded tmux session no longer exists, resume into the current one.
   local sess_args=()

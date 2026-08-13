@@ -100,15 +100,15 @@ The OC adapter uses `prompt_async` (returns 204 immediately) by default rather t
 
 The script refuses `superv watch` on established sessions (>20 messages) without an existing cursor — this is intentional protection against context destruction. Use `superv watch <id> --reset` to deliberately bootstrap a fresh cursor on an existing session.
 
-`superv detail <id> <message-id>` fetches the full message, including full tool-call args and full tool results.
+`superv detail <id> <message-or-child-id>` renders bounded supervisor-oriented content. Unbounded API JSON requires both `--raw` and `--force`.
 
 ## 6b. Measure context fill
 
-`superv status <id>` prints `ctx=Nk` — the prompt token count for the most recent assistant message (the next turn's prompt size). Use it for context-pressure decisions.
+`superv status <id>` reports the unread-message count and the prompt token count for the most recent assistant message. Use `unread` to route observation and `ctx` for context-pressure decisions.
 
 ```
 $ superv status oc-worker
-id=oc-worker kind=opencode status=running turn=busy persisted_age=0.5m ctx=12k
+id=oc-worker kind=opencode status=running turn=busy persisted_age=0.5m unread=2 ctx=12k/?
 ```
 
 Internally that calls `/session/<id>/message` and reads `info.tokens.input + info.tokens.cache.read` from the most recent assistant message. OpenCode's message info.tokens shape:
@@ -129,12 +129,12 @@ OpenCode's message API doesn't include the model context window, but `/provider`
 
 ```
 $ superv status oc-worker
-id=oc-worker kind=opencode status=running turn=busy persisted_age=0.5m ctx=12k/400k(3%)
+id=oc-worker kind=opencode status=running turn=busy persisted_age=0.5m unread=2 ctx=12k/400k(3%)
 ```
 
 If the session switches model mid-conversation (different `limit.context`), the cached value goes stale until re-register. The `/provider` response is large (~3MB) and slow (~200ms), so superv doesn't re-fetch it on every status check.
 
-If `/provider` is unreachable at register time, the cache stays empty and status prints raw tokens. Look up the window manually if needed:
+If `/provider` is unreachable at register time, the cache stays empty and status prints an explicit unknown denominator such as `ctx=12k/?`. Look up the window manually if needed:
 
 ```bash
 curl -s 'http://127.0.0.1:<port>/provider?directory=<dir>' \

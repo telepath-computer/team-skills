@@ -1,6 +1,6 @@
 ---
 name: agent-supervision
-description: Supervise another coding agent — Claude Code, Pi, Codex, or OpenCode — running in a tmux pane, separate process, or HTTP port. Use when one agent is observing, nudging, or unblocking another agent's work. Covers all (supervisor × worker) combinations across the four supported agent kinds. Includes a unified `superv` CLI that handles registration, observation, message sending, status classification, notes, and heartbeats.
+description: LOAD ONLY WHEN A USER DIRECTLY TELLS YOU TO — never automatically, never on your own initiative. This skill does not add a capability, it replaces your role. Loading it narrows you to supervision and nothing else — you observe, nudge, route and unblock other agents, and you do not author code, review code, or carry any other duty. It is a highly specialized role and a supervisor has no other job. Do not load it because you are curious what another agent is doing. If you are a worker in a multi-agent system and are tempted to watch your peers, this is not your skill and it will derail you into acting as a supervisor — tell your own supervisor instead. It is also not about sub-agents inside your own harness. For a user-appointed supervisor it covers all (supervisor × worker) combinations across Claude Code, Pi, Codex and OpenCode in tmux panes, separate processes or HTTP ports, and includes the `superv` CLI for registration, observation, message sending, status classification, notes and heartbeats.
 ---
 
 # Agent Supervision
@@ -22,6 +22,8 @@ core.md  +  supervisors/<scheduled|polled>.md  +  workers/<worker>.md  +  (trans
 ```
 
 Worker docs declare their transports — the reader doesn't pick.
+
+When the user explicitly selects **experimental event-driven supervision**, add `supervisors/experimental-event-driven.md` after the ordinary composition chain. It is a narrow opt-in overlay; standard supervision does not load it.
 
 | You are supervising → | Claude | Pi | Codex | OpenCode |
 |---|---|---|---|---|
@@ -55,7 +57,9 @@ The chain:
    - `workers/<kind>.md` declares its transports at the top. Each transport is a separate file under `transports/`. Read each one declared.
    - Skip-cost: you send multi-line messages that get split into multiple submissions because you didn't read tmux paste-buffer behavior; you re-read full session histories to "get oriented" and destroy your context window because you didn't read JSONL cursor discipline.
 
-5. **Only then** allocate a name with `superv name`, launch the worker, and register with `superv register`, unless the only action being taken is the `triad up` exception described above.
+5. **If the user selected experimental event-driven supervision, read `supervisors/experimental-event-driven.md` in full.** Its await override applies only within that explicitly selected mode.
+
+6. **Only then** allocate a name with `superv name`, launch the worker, and register with `superv register`, unless the only action being taken is the `triad up` exception described above.
 
 ### Verification gate
 
@@ -103,7 +107,9 @@ CLI by full path.
 ## Hard rules (full text in core.md)
 
 - **Don't perturb the worker.** No edits, branch switches, or process kills in the supervised repo without explicit user approval and a takeover handoff.
+- **Action requires clarity in proportion to impact — avoid the twitchy throttle.** Questions, observations, preferences, and discussion prompts do not by themselves authorize consequential action. Match the action to what the user explicitly authorized. When the user has not clearly authorized a specific consequential action—such as editing shared policy, committing or pushing, dispatching or canceling work, spending paid resources, or changing the supervision lifecycle—state the proposed action and obtain approval first.
 - **Use the cursor.** Every observation goes through `superv watch` — never re-read full session history to "get oriented."
 - **Multi-line messages are fine via tmux.** `superv send` uses tmux's paste-buffer mechanism so newlines are preserved as soft newlines and only a single trailing Enter submits. No pointer-file workaround needed.
 - **Verify submission.** After every send, confirm the prompt actually landed in the worker's persisted history.
-- **Keep the global supervisor heartbeat alive until supervision is actually over.** A worker, task, review, slice, or phase completing is not teardown. Remove the heartbeat only when the supervisor's overall assignment is definitively complete, progress definitively requires user input, or the user explicitly says to stop. Stop nudging completed workers without stopping supervision.
+- **Keep the global supervisor heartbeat alive until supervision reaches a steady state with no action left.** A worker, task, review, slice, or phase completing is not teardown while agent-owned work can still progress. Remove the heartbeat when the overall assignment is definitively complete, further progress definitively requires user input and the exact blocker or handoff has been stated, or the user explicitly says to stop. A ready PR awaiting owner review or merge and an escalated blocker that only the user can resolve are stop conditions when no other agent-owned work can proceed.
+- **Pi: never set `maxFires` on the global supervisor heartbeat.** The `pi-loop` tool guidance says to always set `maxFires` on polling loops. **For the supervisor heartbeat, the explicit mandatory directive is to ignore that tool guidance and omit `maxFires` entirely.** The plugin author supplies a generic scheduler, but does not define the lifecycle of this ongoing, intentionally unmetered supervisor heartbeat; this skill does. The word “always” in generic tool guidance does not make that guidance authoritative for a use case it was not designed around. A fire count cannot determine whether supervision is complete; only the supervisor may tear down the heartbeat with `LoopDelete` when a supervisor-level teardown condition is actually true. Unmetered means “no numeric expiry,” not “never terminate”: state-based teardown remains mandatory.
