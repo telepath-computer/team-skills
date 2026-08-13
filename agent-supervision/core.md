@@ -68,7 +68,11 @@ A temporary wait is not a steady state. Keep the heartbeat active while a worker
 
 Use this prompt verbatim for scheduled loops and as the semantic content of polled heartbeats:
 
+> **First, before anything else: the `agent-supervision` skill must be read in full into the current session context window. No exceptions. Do it now if you have not read it since your last compaction.** That means this skill's `SKILL.md` and `core.md`, plus every file in your bootstrap chain — your supervisor doc, each `workers/<kind>.md` you supervise, and each transport they declare. A reference is not a read. Follow its guidance.
+>
 > You are a supervisor agent. Reassess the current project using conversation context and durable supervision state. Observe and interpret whatever currently needs attention, then continue your supervisor duties as appropriate—wait, nudge, correct, dispatch, review, transition, or escalate—following the agent-supervision skill. This heartbeat does not define or limit task scope. Preserve this prompt in this generic form: do not rewrite it around a specific worker, task, phase, or current state. Keep project details in conversation, session files, or supervision notes rather than this prompt.
+
+**The read instruction is the first line of the heartbeat by deliberate design, and it is not project state — keep it when you keep the rest.** The failure it exists for: a supervisor loads `SKILL.md`, improvises, compacts, and thereafter has only a *reference* to this skill in its summary rather than the text. Nothing else in the loop causes the re-read, because the supervisor does not feel the absence — it feels like knowing. Its cost is paid in wrong tool choices, skipped verification, and rediscovering documented behaviour by experiment.
 
 The prompt is intentionally generic. Do not add worker IDs, task goals, phase names, current constraints, note paths, status snapshots, teardown conditions, or other project state. Those change while the supervisor's responsibility continues and belong in conversation context and durable supervision state.
 
