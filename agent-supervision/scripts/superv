@@ -2363,8 +2363,48 @@ def await_turn_state(kind: str, entries: List[Dict[str, Any]]) -> str:
     return "unknown"
 
 
-def await_unresolved_compaction(kind: str, entries: List[Dict[str, Any]]) -> bool:
-    """A compaction after the last terminal turn still needs attention."""
+def await_cursor_position(rec: Dict[str, Any], path: Path,
+                          entries: List[Dict[str, Any]]) -> Optional[int]:
+    """Raw/active entry position acknowledged by the ordinary watch cursor."""
+    cursor = load_cursor(rec["id"])
+    if cursor is None or cursor.get("session_path") != str(path):
+        return None
+    kind = rec.get("kind")
+    if kind == "pi":
+        last_entry_id = cursor.get("last_entry_id")
+        if not last_entry_id:
+            return None
+        ids = [str(entry.get("id")) for entry in entries]
+        try:
+            return ids.index(str(last_entry_id))
+        except ValueError:
+            return None
+    if kind == "claude":
+        last_entry_id = cursor.get("last_entry_id")
+        if not last_entry_id:
+            return None
+        ids = [str(entry.get("uuid")) for entry in entries]
+        try:
+            return ids.index(str(last_entry_id))
+        except ValueError:
+            return None
+    if kind == "codex":
+        try:
+            if "last_raw_idx" in cursor:
+                position = int(cursor["last_raw_idx"])
+                return position if -1 <= position < len(entries) else None
+            legacy = codex_visible_indexed(entries, legacy=True)
+            old_index = int(cursor.get("last_idx", -1))
+            return legacy[old_index][0] if 0 <= old_index < len(legacy) else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def await_unresolved_compaction(rec: Dict[str, Any], path: Path,
+                                entries: List[Dict[str, Any]]) -> bool:
+    """Whether the latest in-flight compaction remains unread by watch."""
+    kind = str(rec.get("kind", ""))
     last_compaction = -1
     last_idle = -1
     for index, entry in enumerate(entries):
@@ -2373,7 +2413,10 @@ def await_unresolved_compaction(kind: str, entries: List[Dict[str, Any]]) -> boo
             last_compaction = index
         elif event == "idle":
             last_idle = index
-    return last_compaction > last_idle
+    if last_compaction <= last_idle:
+        return False
+    cursor_position = await_cursor_position(rec, path, entries)
+    return cursor_position is None or cursor_position < last_compaction
 
 
 def await_attention(worker_id: str, reason: str) -> None:
@@ -2407,7 +2450,7 @@ def cmd_await(args: argparse.Namespace) -> int:
         eprint(f"await: cannot establish transcript snapshot: {error}")
         return 2
 
-    if await_unresolved_compaction(kind, entries):
+    if await_unresolved_compaction(rec, path, entries):
         await_attention(args.id, "COMPACTION")
         return 0
 

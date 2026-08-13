@@ -44,9 +44,9 @@ The waiter exits for these structural events:
 - `COMPACTION` — the persisted stream recorded a compaction boundary. The worker may stop or continue; inspect the stream.
 - `STREAM RESYNC REQUIRED` — the transcript changed identity, shrank, left Pi's armed branch, or could not provide a reliable turn state.
 
-Compaction interrupts the wait immediately because post-compaction continuation is not predictable. The supervisor determines what happened next through `watch`.
+Compaction interrupts the wait immediately because post-compaction continuation is not predictable. The supervisor determines what happened next through `watch`. The watch cursor also acknowledges that compaction for future await invocations: once `watch` has advanced through the boundary, rearming against a worker that continued running waits for the next attention event rather than redelivering the same compaction. If the boundary remains unread, `await` continues to report it.
 
-`await` does not classify worker completion, blockers, questions, or corrections. It does not print worker message text, summaries, excerpts, or locators, and it never advances the watch cursor. Its output deliberately directs the supervisor to the authoritative stream:
+`await` does not classify worker completion, blockers, questions, or corrections. It does not print worker message text, summaries, excerpts, or locators, and it never advances the watch cursor itself. Its output deliberately directs the supervisor to the authoritative stream:
 
 ```text
 ATTENTION bob: IDLE

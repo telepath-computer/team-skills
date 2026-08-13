@@ -41,6 +41,10 @@ class AwaitIntegrationTest(unittest.TestCase):
         }
         (self.state / "workers" / f"{worker}.json").write_text(json.dumps(record))
 
+    def set_cursor(self, worker, cursor):
+        (self.state / "cursors").mkdir(parents=True, exist_ok=True)
+        (self.state / "cursors" / f"{worker}.json").write_text(json.dumps(cursor))
+
     def run_await(self, worker):
         return subprocess.run(
             [sys.executable, str(SUPERV), "await", worker], env=self.env,
@@ -98,6 +102,53 @@ class AwaitIntegrationTest(unittest.TestCase):
         self.assertIn("ATTENTION pi-busy: IDLE", stdout)
         self.assertNotIn("PRIVATE DONE", stdout)
 
+    def test_observed_pi_compaction_is_not_redelivered_on_rearm(self):
+        path = self.root / "pi-observed-compact.jsonl"
+        entries = [
+            {"type": "session", "version": 3, "id": "s", "cwd": str(self.root)},
+            {"type": "message", "id": "u1", "parentId": None,
+             "message": {"role": "user", "content": [{"type": "text", "text": "work"}]}},
+            {"type": "message", "id": "a1", "parentId": "u1",
+             "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "call1", "name": "bash"}],
+                         "stopReason": "toolUse"}},
+            {"type": "message", "id": "t1", "parentId": "a1",
+             "message": {"role": "toolResult", "content": [{"type": "text", "text": "ok"}]}},
+            {"type": "compaction", "id": "c1", "parentId": "t1", "summary": "SECRET SUMMARY"},
+            {"type": "message", "id": "u2", "parentId": "c1",
+             "message": {"role": "user", "content": [{"type": "text", "text": "continue"}]}},
+            {"type": "message", "id": "a2", "parentId": "u2",
+             "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "call2", "name": "bash"}],
+                         "stopReason": "toolUse"}},
+        ]
+        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+        self.register("pi-observed-compact", "pi", path)
+
+        first = self.run_await("pi-observed-compact")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("ATTENTION pi-observed-compact: COMPACTION", first.stdout)
+
+        # The supervisor follows every await alert with watch. Its cursor now
+        # proves that this compaction has already received attention.
+        self.set_cursor("pi-observed-compact", {
+            "session_path": str(path), "last_entry_id": "a2",
+        })
+        process = self.start_await("pi-observed-compact")
+        armed = process.stdout.readline()
+        self.append(path, {"type": "message", "id": "t2", "parentId": "a2",
+                           "message": {"role": "toolResult", "content": [{"type": "text", "text": "ok"}]}})
+        self.append(path, {"type": "message", "id": "a3", "parentId": "t2",
+                           "message": {"role": "assistant", "content": [{"type": "text", "text": "PRIVATE DONE"}],
+                                       "stopReason": "stop"}})
+        remainder, stderr = process.communicate(timeout=5)
+        stdout = armed + remainder
+
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("AWAIT pi-observed-compact: CURRENTLY BUSY", stdout)
+        self.assertIn("ATTENTION pi-observed-compact: IDLE", stdout)
+        self.assertEqual(stdout.count("COMPACTION"), 0)
+        self.assertNotIn("SECRET SUMMARY", stdout)
+        self.assertNotIn("PRIVATE DONE", stdout)
+
     def test_pi_compaction_interrupts_busy_wait(self):
         path = self.root / "pi-compact.jsonl"
         path.write_text("".join(json.dumps(entry) + "\n" for entry in [
@@ -151,6 +202,38 @@ class AwaitIntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "ATTENTION claude-compact: COMPACTION\nRun: superv watch claude-compact\n")
         self.assertNotIn("SECRET SYNTHETIC SUMMARY", result.stdout)
+
+    def test_observed_codex_compaction_is_not_redelivered_on_rearm(self):
+        path = self.root / "codex-observed-compact.jsonl"
+        entries = [
+            {"type": "session_meta", "payload": {"id": "s", "cwd": str(self.root)}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
+            {"type": "compacted", "payload": {"summary": "SECRET SUMMARY"}},
+            {"type": "event_msg", "payload": {"type": "context_compacted"}},
+            {"type": "response_item", "payload": {"type": "reasoning", "summary": []}},
+        ]
+        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+        self.register("codex-observed-compact", "codex", path)
+
+        first = self.run_await("codex-observed-compact")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("ATTENTION codex-observed-compact: COMPACTION", first.stdout)
+
+        # `watch` has consumed through the post-compaction reasoning entry.
+        self.set_cursor("codex-observed-compact", {
+            "session_path": str(path), "cursor_version": 2, "last_raw_idx": 4,
+        })
+        process = self.start_await("codex-observed-compact")
+        armed = process.stdout.readline()
+        self.append(path, {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1"}})
+        remainder, stderr = process.communicate(timeout=5)
+        stdout = armed + remainder
+
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("AWAIT codex-observed-compact: CURRENTLY BUSY", stdout)
+        self.assertIn("ATTENTION codex-observed-compact: IDLE", stdout)
+        self.assertEqual(stdout.count("COMPACTION"), 0)
+        self.assertNotIn("SECRET SUMMARY", stdout)
 
     def test_codex_assistant_text_is_not_terminal_before_task_complete(self):
         path = self.root / "codex.jsonl"
