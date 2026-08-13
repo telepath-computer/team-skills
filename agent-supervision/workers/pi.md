@@ -178,6 +178,31 @@ Wait until the worker is idle before sending `/compact`. If Pi is busy, incoming
 
 After sending, verify with `superv watch <id> --live` that Pi displays `⠴ Compacting context... (escape to cancel)`. The operation typically takes 30s–2min on a deep context. When it finishes, the status-bar percentage drops substantially (often to single digits) and the prompt area returns to idle. Verify again with `superv watch <id> --live`, then send any continuation instruction as a separate message.
 
+#### NEVER send Escape while a compaction is running — Escape is its cancel key
+
+The compaction indicator says `(escape to cancel)` and it means it. A supervisor who reaches for Escape as a generic "unstick the pane" gesture **cancels the compaction**, and does so silently as far as `superv status` is concerned — the worker keeps reading `idle`, the pane stays quiet, and the context stays deep. Repeat the gesture and you get a cancel loop that keeps a worker pinned over its limit indefinitely.
+
+This bites because two different situations look identical from outside: a worker that is compacting, and a worker sitting in the post-compaction phantom state where sends stack unsubmitted (see § 8 Quirks). Both read `busy` or `idle` with a still pane and no new JSONL entries. The flush-and-submit recovery for the phantom state — `Escape` then `Enter` — is exactly the wrong move for the first.
+
+**Always distinguish before touching the pane.** Read the scrollback, not just the last few lines:
+
+```bash
+tmux capture-pane -t <target> -p -S -20 | grep -iE 'compacting|compaction|context overflow'
+```
+
+- `⠴ Compacting context...` or `Context overflow detected, Auto-compacting...` → **hands off entirely.** No keystrokes, no sends. Wait it out; deep contexts can take minutes.
+- `Queued message for after compaction` → your `/compact` (or any other send) is parked behind a compaction already in flight. It will deliver when that finishes. Sending again just queues more.
+- `Error: Compaction cancelled` → something cancelled it, and the most likely something is a supervisor keystroke. Stop touching it; the runtime generally retries on its own.
+- No compaction text at all, worker idle, sends not landing → *now* the phantom state applies and `Escape` then `Enter` is the right recovery.
+
+#### Auto-compaction, overflow, and hard failure
+
+Pi may run **past 100% of its nominal window** (a 272k worker observed working normally at 113%) before the runtime declares `Context overflow detected` and auto-compacts. So a percentage over 100 is not itself a fault, and interrupting a productive turn to force a compaction usually costs more than it saves.
+
+Auto-compaction can fail outright — observed: `Error: Compaction failed: Cannot read properties of undefined (reading 'signal')`. A worker in that state is **unrecoverable by supervision**: it sits far over its window, ignores sends including direct status probes, and cannot compact its way down. Do not spend cycles nudging it. Retire it and launch a replacement.
+
+The real defence is arranging beforehand that a worker's memory is never load-bearing, so replacement is cheap: durable task state on disk (see the context-file practice in `core.md`), commits pushed as they are made rather than batched, and briefs re-seeded from files rather than from conversation. When those hold, losing a worker costs a relaunch and nothing else.
+
 ### When to actually do this
 
 **Only if instructed by the user's monitoring goals.** Compaction is a destructive context operation: pi loses fine-grained recall of earlier turns and replaces it with a summary. That can break in-flight tasks if pi was holding onto state the supervisor expected it to remember. Don't compact unilaterally on a percentage threshold.
@@ -199,6 +224,7 @@ Document any compact you trigger in `superv note --tag supervisor` so the user c
 
 ## 8. Quirks
 
+- **Post-compaction phantom state** — after a compaction, Pi can land in a state where it reads `idle` (or `busy`) with a still pane while everything you send stacks in its steering buffer unsubmitted. Nothing lands; the worker looks like it is thinking and is not. Recovery is `tmux send-keys -t <target> Escape` to flush the queue into the composer, then `Enter` to submit. **Confirm no compaction is running first** — Escape cancels a compaction (see § 7).
 - **`/name` doesn't fully persist alone** — to make a named session show up later in `/resume`, send at least one real message after naming it.
 - **Branch switches** — if the active branch changes (rare in normal supervision), the cursor entry may no longer be on the active branch. The adapter detects this and tells you to reset via `superv watch <id> --reset` rather than silently jumping branches.
 - **TUI chrome strips during live capture** — `tmux-poll` removes the bottom separator pair and status bar before snapshot anchoring; this is automatic and not normally a concern.
