@@ -5,8 +5,11 @@ All integration cases use a temporary HOME and AGENT_SUPERVISION_ROOT. No live
 worker, registry, tmux server, or OpenCode server is contacted.
 """
 
+import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -176,6 +179,41 @@ class ObservationIntegrationTest(unittest.TestCase):
         self.assertIn("Read", result.stdout)
         self.assertIn("Grep", result.stdout)
 
+    def test_claude_overflow_pages_advance_without_skipping_parallel_calls(self):
+        path = self.root / "claude-overflow.jsonl"
+        first_id = "00000000-1111-4111-8111-111111111111"
+        entries = [{"type": "user", "uuid": first_id, "timestamp": "2026-08-10T01:00:00Z",
+                    "message": {"role": "user", "content": "start"}}]
+        expected = []
+        for number in range(90):
+            entry_id = f"{number + 1:08x}-1111-4111-8111-{number + 1:012x}"
+            tokens = [f"claude-call-{number:03d}-a", f"claude-call-{number:03d}-b"]
+            expected.extend(tokens)
+            entries.append({"type": "assistant", "uuid": entry_id,
+                            "timestamp": f"2026-08-10T01:{number // 60:02d}:{number % 60:02d}Z",
+                            "message": {"role": "assistant", "stop_reason": "tool_use", "content": [
+                                {"type": "tool_use", "id": f"tool-{token}", "name": "Grep",
+                                 "input": {"pattern": token}} for token in tokens
+                            ]}})
+        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+        self.register_path("claude-pages", "claude", path)
+        self.set_cursor("claude-pages", {"session_path": str(path), "last_entry_id": first_id})
+        combined = []
+        for _ in range(10):
+            result = self.run_superv("watch", "claude-pages")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            combined.append(result.stdout)
+            if "INCOMPLETE OBSERVATION" not in result.stdout:
+                self.assertIn("OBSERVATION COMPLETE", result.stdout)
+                break
+        else:
+            self.fail("claude overflow pagination never completed")
+        output = "\n".join(combined)
+        for token in expected:
+            self.assertEqual(output.count(token), 1, token)
+        cursor = json.loads((self.state / "cursors" / "claude-pages.json").read_text())
+        self.assertEqual(cursor["last_entry_id"], entries[-1]["uuid"])
+
     def test_claude_ambiguous_prefix_fails_loudly(self):
         path, _ = self.write_claude_fixture()
         self.register_path("claude-detail", "claude", path)
@@ -221,6 +259,45 @@ class ObservationIntegrationTest(unittest.TestCase):
         cursor = json.loads((self.state / "cursors" / "codex-worker.json").read_text())
         self.assertEqual(cursor["cursor_version"], 2)
         self.assertEqual(cursor["last_raw_idx"], 4)
+
+    def test_codex_overflow_pages_preserve_call_result_pairing(self):
+        path = self.root / "codex-overflow.jsonl"
+        entries = [
+            {"type": "session_meta", "timestamp": "2026-08-10T02:00:00Z", "payload": {"cwd": str(self.root)}},
+            {"type": "response_item", "timestamp": "2026-08-10T02:00:01Z", "payload": {
+                "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "start"}]}},
+        ]
+        call_tokens = []
+        result_tokens = []
+        for number in range(90):
+            call = f"codex-call-{number:03d}"
+            result = f"codex-result-{number:03d}"
+            call_tokens.append(call)
+            result_tokens.append(result)
+            entries.extend([
+                {"type": "response_item", "timestamp": "2026-08-10T02:01:00Z", "payload": {
+                    "type": "custom_tool_call", "call_id": f"call-{number}", "name": "apply_patch", "input": call}},
+                {"type": "response_item", "timestamp": "2026-08-10T02:01:01Z", "payload": {
+                    "type": "custom_tool_call_output", "call_id": f"call-{number}", "output": result}},
+            ])
+        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+        self.register_path("codex-pages", "codex", path)
+        self.set_cursor("codex-pages", {"session_path": str(path), "cursor_version": 2, "last_raw_idx": 1})
+        combined = []
+        for _ in range(10):
+            result = self.run_superv("watch", "codex-pages")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            combined.append(result.stdout)
+            if "INCOMPLETE OBSERVATION" not in result.stdout:
+                self.assertIn("OBSERVATION COMPLETE", result.stdout)
+                break
+        else:
+            self.fail("codex overflow pagination never completed")
+        output = "\n".join(combined)
+        for token in call_tokens + result_tokens:
+            self.assertEqual(output.count(token), 1, token)
+        cursor = json.loads((self.state / "cursors" / "codex-pages.json").read_text())
+        self.assertEqual(cursor["last_raw_idx"], len(entries) - 1)
 
     def test_recent_query_does_not_move_cursor(self):
         path, first_id, _ = self.write_pi_overflow()
@@ -341,6 +418,28 @@ class ObservationIntegrationTest(unittest.TestCase):
 
 
 class FormattingContractTest(unittest.TestCase):
+    def test_sorted_neighbor_prefixes_match_exhaustive_resolution(self):
+        module = load_superv(f"superv_prefix_{uuid.uuid4().hex}")
+        values = [
+            "aaaaaaaa-1111-4111-8111-111111111111",
+            "aaaaaaaa-2222-4222-8222-222222222222",
+            "aaaaaaab-3333-4333-8333-333333333333",
+            "bbbbbbbb-4444-4444-8444-444444444444",
+            "short",
+            "duplicate-value",
+            "duplicate-value",
+        ]
+        def exhaustive(items, minimum=8):
+            output = {}
+            strings = [str(value) for value in items if value]
+            for value in strings:
+                size = min(len(value), minimum)
+                while size < len(value) and sum(other.startswith(value[:size]) for other in strings) > 1:
+                    size += 1
+                output[value] = value[:size]
+            return output
+        self.assertEqual(module.unique_prefixes(values), exhaustive(values))
+
     def test_overview_truncation_is_character_wise_after_whitespace_normalization(self):
         module = load_superv(f"superv_format_{uuid.uuid4().hex}")
         line = module.OverviewLine("id", "12:00:00", "assistant",
@@ -502,6 +601,66 @@ class OpenCodeAdapterTest(unittest.TestCase):
         self.assertIn('latest_intent="Checking the final report"', line)
         raw = module.OpenCodeAdapter.raw_detail(rec, "msg_bbbbbbbb/result/1")
         self.assertEqual(raw["state"]["output"], "done")
+
+    def test_overflow_pages_preserve_every_call_and_result(self):
+        module = load_superv(f"superv_oc_pages_{uuid.uuid4().hex}")
+        with tempfile.TemporaryDirectory(prefix="superv-oc-pages-") as directory:
+            root = Path(directory)
+            module.STATE_ROOT = root
+            module.WORKERS_DIR = root / "workers"
+            module.CURSORS_DIR = root / "cursors"
+            module.NOTES_DIR = root / "notes"
+            module.HEARTBEATS_DIR = root / "heartbeats"
+            module.POINTER_FILES_DIR = root / "pointer-files"
+            module.TMUX_CURSORS_DIR = root / "tmux-cursors"
+            messages = [{"info": {"id": "msg_0000000000000000", "role": "user", "time": {"created": 1}},
+                         "parts": [{"type": "text", "text": "start"}]}]
+            call_tokens = []
+            result_tokens = []
+            for number in range(90):
+                call = f"oc-call-{number:03d}"
+                result = f"oc-result-{number:03d}"
+                call_tokens.append(call)
+                result_tokens.append(result)
+                messages.append({
+                    "info": {"id": f"msg_{number + 1:016x}", "role": "assistant",
+                             "time": {"created": number + 2, "completed": number + 3}},
+                    "parts": [
+                        {"type": "tool", "tool": "read", "state": {
+                            "status": "completed", "input": {"path": call + "-a"}, "output": result + "-a"}},
+                        {"type": "tool", "tool": "grep", "state": {
+                            "status": "completed", "input": {"pattern": call + "-b"}, "output": result + "-b"}},
+                    ],
+                })
+            module.http_get = lambda path, directory="/", timeout=10: messages
+            rec = {"id": "oc-pages", "kind": "opencode", "live": {}, "send": {},
+                   "persisted": {"type": "http"},
+                   "extra": {"session_id": "ses_x", "directory": "/tmp"}}
+            module.save_record(rec)
+            module.save_cursor("oc-pages", {"session_id": "ses_x", "last_msg_count": 1})
+            args = argparse.Namespace(id="oc-pages", live=False, reset=False, full=False,
+                                      count=None, force=False)
+            combined = []
+            for _ in range(10):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(module.cmd_watch(args), 0)
+                rendered = output.getvalue()
+                combined.append(rendered)
+                if "INCOMPLETE OBSERVATION" not in rendered:
+                    self.assertIn("OBSERVATION COMPLETE", rendered)
+                    break
+            else:
+                self.fail("opencode overflow pagination never completed")
+            output = "\n".join(combined)
+            for token in call_tokens:
+                self.assertEqual(output.count(token + "-a"), 1, token + "-a")
+                self.assertEqual(output.count(token + "-b"), 1, token + "-b")
+            for token in result_tokens:
+                self.assertEqual(output.count(token + "-a"), 1, token + "-a")
+                self.assertEqual(output.count(token + "-b"), 1, token + "-b")
+            cursor = module.load_cursor("oc-pages")
+            self.assertEqual(cursor["last_msg_count"], len(messages))
 
 
 if __name__ == "__main__":

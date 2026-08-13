@@ -170,14 +170,29 @@ def reasoning_labels(text: Any) -> List[str]:
     return labels
 
 
+def common_prefix_length(left: str, right: str) -> int:
+    size = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        size += 1
+    return size
+
+
 def unique_prefixes(values: List[str], minimum: int = LOCATOR_PREFIX_MIN) -> Dict[str, str]:
-    """Shortest prefixes that uniquely identify each value in this collection."""
-    strings = [str(value) for value in values if value]
+    """Shortest unique prefixes, found from each sorted value's neighbors.
+
+    In sorted order, the value sharing the longest prefix must be adjacent.
+    Comparing only those neighbors avoids comparing every session id with
+    every other id during each watch.
+    """
+    strings = sorted(str(value) for value in values if value)
     out: Dict[str, str] = {}
-    for value in strings:
-        size = min(len(value), minimum)
-        while size < len(value) and sum(other.startswith(value[:size]) for other in strings) > 1:
-            size += 1
+    for index, value in enumerate(strings):
+        previous = common_prefix_length(value, strings[index - 1]) if index else 0
+        following = common_prefix_length(value, strings[index + 1]) if index + 1 < len(strings) else 0
+        needed = max(previous, following) + 1
+        size = min(len(value), max(minimum, needed))
         out[value] = value[:size]
     return out
 
@@ -2224,6 +2239,7 @@ def oc_format_message(m: Dict[str, Any], idx: int, locator: Optional[str] = None
                     result_number += 1
                     value = error if error is not None else output
                     value_text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                    body_lines.append(f"  result: {tool} state={status} {single_line(value_text, RESULT_TRUNC)}")
                     prefix = f"{tool} status={status} "
                     overview.append(OverviewLine(f"{loc}/result/{result_number}", ts, "result", prefix + value_text,
                                                  limit=OVERVIEW_RESULT_TRUNC, preserve_tail=True))

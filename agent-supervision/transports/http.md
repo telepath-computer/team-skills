@@ -27,17 +27,18 @@ Used by `workers/opencode.md` only. OpenCode runs a Hono.js server (default port
 `superv` calls these internally:
 
 - `superv list` → `/session` (with `x-opencode-directory: /` for discovery).
-- `superv register --auto-oc <ses-id>` → `/session/:id` to discover the directory; cached locally in the registry.
+- `superv register <id> --kind opencode --oc-session <ses-id>` → `/session/:id` to discover the directory; cached locally in the registry.
 - `superv watch <id>` → `/session/:id/message` filtered past the cursor.
-- `superv watch <id> --live` → `/session/status` for active-run state. Combines with `/session/:id` for last-update time.
+- `superv watch <id> --live` → `/session/status` for active-run state.
+- `superv status <id>` and `superv sweep` → one `/session/:id/message` read for turn state, context use, unread count, and the latest intent, plus `/session/:id` for persisted age.
 - `superv send <id>` → `/session/:id/prompt_async` (preferred over `/message` to avoid blocking).
-- `superv detail <id> <msg-id>` → full message rendering.
+- `superv detail <id> <msg-or-child-id>` → bounded supervisor-oriented rendering. Unbounded API JSON requires `--raw --force`.
 
 ## Cursor strategy
 
-OC cursors are message-count-based: `{"last_msg_count": N, "last_check": ts}` at `~/.agent-supervision/cursors/<id>.json`.
+OC cursors are message-count-based: `{"session_id": "ses_...", "last_msg_count": N}` at `~/.agent-supervision/cursors/<id>.json`.
 
-`superv watch` refuses to operate on established sessions (>20 messages) without an existing cursor. Use `--reset` once to deliberately bootstrap.
+`superv watch` refuses to operate on established sessions (>20 messages) without an existing cursor. Use `--count N` to establish a cursor from a recent tail. With a cursor, `--count N` reads the oldest N unread messages. `--reset --count N` explicitly discards unread history and starts from a recent tail.
 
 ## Stuck detection
 
@@ -45,19 +46,13 @@ OC cursors are message-count-based: `{"last_msg_count": N, "last_check": ts}` at
 
 ## Message rendering
 
-Per the supervisor cursor strategy:
+The ordinary detailed view uses the shared adapter budgets: 4,000 characters for assistant and user text, 140 for tool arguments, and 220 for tool results. Every terminal OpenCode tool part renders both its call and its result. Readable plaintext reasoning summaries render as `intent` lines; empty and opaque payloads are omitted.
 
-- Assistant text: cap ~1200 chars (where decisions and blockers live).
-- Tool invocations: one-liner with name + state + 80-char arg preview.
-- Reasoning: skipped.
-- Step markers: skipped.
-- User text: cap ~120 chars (usually the supervisor's own nudges).
-
-`superv detail <id> <msg-id>` shows full content for one message.
+When the detailed batch exceeds 12,000 characters, the compact overview preserves every call and result on separate bounded lines and pages chronologically without skipping messages. `superv detail <id> <locator>` gives bounded content for one message, tool, result, or intent. Use `--raw --force` only when the unbounded API object is necessary.
 
 ## Process management
 
-The user typically owns the OpenCode process. Supervisor does **not** start or kill it during normal operation. **Exception**: if the user is absent and the process dies, restart with `nohup opencode --port 4096 &`, then `superv note <id> "restarted opencode" --tag supervisor`.
+The user typically owns the OpenCode process. Supervisor does **not** start or kill it during normal operation. **Exception**: if the user is absent and the process dies, restart with `nohup opencode serve --port 4096 > /tmp/opencode.log 2>&1 &`, then `superv note <id> "restarted opencode" --tag supervisor`.
 
 Before restarting, always `ps aux | grep '[o]pencode'` to avoid the duplicate-process problem.
 
