@@ -189,6 +189,24 @@ When reviewing observations, watch for and correct:
 
 When you spot one of these, send a direct correction. Do not let it ride.
 
+## Supervisor anti-pattern: delegating supervision to a worker
+
+**Do not hand supervisor duties to a worker agent to shirk your own coordination work.** Workers do the work; the supervisor does the cross-agent coordination and higher-level goal driving. This division is not negotiable and is not yours to redistribute.
+
+The failure has a recognizable arc, observed in practice: a worker spontaneously coordinates with another worker (e.g., drives its own review with a reviewer agent) and it *works* — faster, fewer supervisor round-trips. The supervisor then ratifies the pattern ("drive the review peer-to-peer; I'll verify outcomes"), keeping the easy half (verification) while offloading the real coordination (dispatching, waiting, relaying). It reads as efficiency. It is abdication, and the costs arrive quickly:
+
+- **Workers grow supervisor machinery.** A worker told to "drive" another agent must *wait* on that agent, so it arms itself timers and polling loops — context burned on supervision instead of work, and machinery the supervisor doesn't control.
+- **Dual supervision with no authority.** Two agents now nudge and watch the same target; neither's picture of state is authoritative; double-nudges and dropped handoffs follow.
+- **Accountability blurs.** When the loop stalls, the supervisor no longer knows whether the worker is working, waiting, or supervising — and neither does the user.
+
+The correct shape: a worker that finishes reviewable work **ends its turn** with a ready signal in its report. The supervisor dispatches the reviewer, watches, relays findings back, and verifies commits. Waiting on agents is supervisor work — the supervisor has the heartbeat; workers should never need one.
+
+The tell: **if a worker needs a timer, or is waiting on another agent, supervision has leaked into it.** Reclaim it.
+
+(Distinguish this from legitimate *work* delegation: sending a worker a large task, including tasks that contain judgment, is the job. What may never be delegated is the coordination *between* agents — dispatch, watching, relaying, pacing, lifecycle.)
+
+**Draw the read line and the act line, and issue both as instructions.** On shared-user machines every agent can technically read this skill and run `superv` — file permissions cannot confine them, so the boundary only exists if you state it in kickoffs. The calibrated rule: *awareness* of this skill via the harness's skill listing is unavoidable and fine; *reading* its contents is off-limits to workers — it is the supervisor's operating manual, and a worker who has read it is one step from using it; *acting* on supervision capabilities (contacting other agents, arming watch loops, pacing itself with timers) is the hard violation and an immediate correction signal. Observed in practice: a worker browsing the skills directory for an unrelated skill read this one's transport docs and began driving its own review loop with another agent; the supervisor then compounded the error by ratifying it. State the rule at kickoff, treat worker references to supervision tooling as NEEDS_CORRECTION, and reclaim any coordination that has leaked.
+
 ## Supervisor anti-pattern: Monitor for worker waits
 
 **Do not use the `Monitor` tool to wait on a worker action.** Use cron loops instead — `CronCreate` with a recurring schedule on Claude, `LoopCreate` with a cron trigger on Pi, or repeated heartbeats from the user on Codex/OpenCode.
@@ -323,7 +341,7 @@ superv resume <id>                                  # re-launch in a fresh tmux 
 superv resume <id> --cwd /other/path                # resume in a different directory
 ```
 
-The persisted JSONL/rollout file is left intact — agent CLIs (`pi --session <uuid>`, `claude --resume <uuid>`, `codex resume <uuid>`) all support continuing an existing session by ID. The registry stores the session ID, the original cwd, and (optionally) launch hints, so resume rebuilds the tmux window and re-launches the agent with the right flags.
+The persisted JSONL/rollout file is left intact — agent CLIs (`pi --session <uuid>`, `claude --resume <uuid>`, `codex resume <uuid>`) all support continuing an existing session by ID. The registry stores the session ID, the launch cwd, and (optionally) launch hints, so resume rebuilds the tmux window and re-launches the agent with the right flags. For pi/claude workers launched the standard way, the stored cwd is the worktrees' **parent folder**, not a worktree — deliberately, because worktrees are often shorter-lived than the agent sessions that operate over them.
 
 **When to use:**
 - The user explicitly wants to step away for a while and free up tmux windows.
@@ -336,7 +354,7 @@ The persisted JSONL/rollout file is left intact — agent CLIs (`pi --session <u
 
 Pausing mid-turn discards the in-flight turn, so operators typically pause at a quiet moment — the tool does not check or block.
 
-**Cwd matters at resume time.** Agents inherit cwd from the resuming process. The session metadata remembers the *original* cwd it was created in (file paths, git context). If you resume from a different cwd, the agent gets subtle confusion (`git status` runs in the new cwd, file-read paths assume the old cwd, etc.). Prefer the stored cwd unless you have a specific reason.
+**Cwd matters at resume time.** Agents inherit cwd from the resuming process, and the session metadata remembers the cwd it was created in. Resume to the stored cwd. For pi/claude workers that cwd is the stable worktrees' parent folder, so resuming there remains correct even after the task worktree has rotated or been deleted — the agent's worktree comes from its briefs, not its cwd. Only codex workers (launched inside the worktree by exception) may need `--cwd` after worktree deletion; passing `--cwd` also re-resolves and rewrites the stored transcript path by session id, or refuses if it can't.
 
 ## Kickoff message template
 
@@ -345,11 +363,13 @@ When launching the worker into implementation, be explicit about freedoms:
 ```
 1. You have FULL freedom on this machine. sudo, install, modify, restart.
 2. [Concrete environment details — what's running, where source is]
-3. The spec is at [path]. Update it if reality differs.
-4. Source for dependencies is at [path] if you need to read them.
-5. For anything not specified — make a decision and move forward.
-6. Commit and push as you go.
-7. When you hit a wall, say so clearly — do not spin.
+3. Your shell starts in the worktrees' parent folder; your assigned worktree is
+   [path] — always cd into it explicitly / use absolute paths for repo commands.
+4. The spec is at [path]. Update it if reality differs.
+5. Source for dependencies is at [path] if you need to read them.
+6. For anything not specified — make a decision and move forward.
+7. Commit and push as you go.
+8. When you hit a wall, say so clearly — do not spin.
 ```
 
 Worker docs may add worker-specific lines (kickoff template lives in each `workers/<kind>.md`).

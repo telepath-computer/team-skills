@@ -947,8 +947,20 @@ class ClaudeAdapter:
         path = rec.get("persisted", {}).get("path")
         if path and Path(path).exists():
             return Path(path)
-        cwd = rec.get("persisted", {}).get("cwd") or rec.get("extra", {}).get("cwd")
-        return claude_resolve_session(cwd, None)
+        # Stored transcript path is gone. Claude agents launch in the
+        # worktrees' PARENT folder, which several agents share, so the
+        # cwd-keyed projects dir holds other agents' transcripts too —
+        # "newest jsonl for this cwd" would happily grab someone else's.
+        # Re-resolve only by the stored session id; otherwise fail loudly.
+        sid = rec.get("extra", {}).get("session_id")
+        if not sid:
+            raise ValueError(
+                f"claude: stored session file is missing ({path or 'no path recorded'}) and the "
+                f"record has no extra.session_id to re-resolve it safely.\n"
+                f"  Refusing to guess by recency (shared cwd => could bind another agent's transcript).\n"
+                f"  Fix persisted.path, or re-register with an explicit --path."
+            )
+        return claude_resolve_session(None, sid)
 
     @classmethod
     def read_persisted(cls, rec, count=None, use_cursor=True):
@@ -1211,6 +1223,10 @@ class CodexAdapter:
         path = rec.get("persisted", {}).get("path")
         if path and Path(path).exists():
             return Path(path)
+        # Prefer the stored session id. The cwd fallback is acceptable for
+        # codex only because codex agents (unlike pi/claude) still launch
+        # INSIDE their worktree — cwd is unique per agent, since codex
+        # sessions bind by rollout payload.cwd and have no id-based binding.
         cwd = rec.get("persisted", {}).get("cwd") or rec.get("extra", {}).get("cwd")
         sid = rec.get("extra", {}).get("session_id")
         return codex_resolve_session(cwd, sid)
@@ -2161,11 +2177,35 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if not Path(cwd).exists():
         raise ValueError(
             f"cwd does not exist: {cwd}\n"
-            f"  hint: pass --cwd <other-path>; the worker's stored cwd may be a deleted worktree"
+            f"  hint: pi/claude workers store the worktrees' parent folder as cwd, which outlives\n"
+            f"  worktree rotation — if even that is gone, something upstream moved. codex workers\n"
+            f"  still store the worktree itself and may need --cwd <path> after it is deleted."
         )
 
     extra_flags = args.launch_hint or (rec.get("extra") or {}).get("launch_hint", "")
     cmd = build_resume_cmd(rec, extra_flags)
+
+    # --cwd relocates the worker, and persisted.path is cwd-adjacent state:
+    # leaving it stale would force later reads onto the resolve-by-recency
+    # fallback, which can grab another agent's transcript. Re-resolve the
+    # transcript by session id up front, or refuse before touching tmux.
+    repointed_path: Optional[str] = None
+    if args.cwd:
+        sid = extract_session_id(rec)
+        try:
+            if kind == "pi":
+                p = pi_resolve_by_session_id(sid, None, (rec.get("persisted") or {}).get("session_dir"))
+            elif kind == "claude":
+                p = claude_resolve_session(None, sid)
+            else:
+                p = codex_resolve_session(None, sid)
+        except ValueError as e:
+            raise ValueError(
+                f"--cwd was passed, but persisted.path could not be re-resolved by session id '{sid}': {e}\n"
+                f"  refusing to resume with a cwd that no longer matches the stored transcript path.\n"
+                f"  Inspect with 'superv show {args.id}', fix persisted.path, or re-register with --path."
+            )
+        repointed_path = str(p)
 
     # Determine target tmux session and window.
     prev_target = (rec.get("live") or {}).get("target", "")
@@ -2211,9 +2251,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
     rec["extra"]["resumed_at"] = now_iso()
     if args.cwd:
         # If the user resumed in a different cwd, update the stored cwd too,
-        # since future re-pause/re-resume should use the new location.
+        # since future re-pause/re-resume should use the new location — and
+        # keep persisted.path in step (re-resolved by session id above).
         rec.setdefault("persisted", {})
         rec["persisted"]["cwd"] = cwd
+        if repointed_path:
+            rec["persisted"]["path"] = repointed_path
     save_record(rec)
 
     print(f"resumed {args.id} (kind={kind}) in tmux {new_target}")

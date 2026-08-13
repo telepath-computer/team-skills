@@ -38,9 +38,16 @@ tmux new-window -t <session> -n pi-worker -d
 #    launch shape. Always pass --model explicitly, and ALWAYS seed an explicit
 #    --session-id — it is the only thing that lets registration bind this pane
 #    to exactly this worker's transcript (see "Identify" below).
+#
+#    Launch cwd: the WORKTREES' PARENT folder (e.g. ~/workspace/wt/<repo>/),
+#    not the task worktree itself. Worktrees are often shorter-lived than the
+#    agent sessions that operate over them; a worker homed inside one is
+#    stranded (shell and cwd-keyed session files) when the worktree is deleted.
+#    The trade: the worker cannot infer its worktree from its cwd, so the
+#    initial prompt / task brief MUST state the worktree's absolute path.
 SID="pi-worker-$(uuidgen)"
 tmux send-keys -t <session>:pi-worker.0 \
-  'cd /path/to/workdir && pi --model openai-codex/gpt-5.6-sol:xhigh --session-id '"$SID"' "<initial prompt>"' Enter
+  'cd /path/to/wt-parent && pi --model openai-codex/gpt-5.6-sol:xhigh --session-id '"$SID"' "<initial prompt naming the worktree path>"' Enter
 ```
 
 **Common flags:**
@@ -212,7 +219,7 @@ Pi supports session resume by UUID. The supervisor wraps this via `superv pause`
 - **Re-registering a resumed worker**: the resume id IS the session identity — register with `superv register <name> --kind pi --tmux <target> --session-id <uuid>`.
 - **No `--model` at resume.** Resuming a session restores the model and reasoning level it was launched with (Pi persists `model_change`/`thinking_level_change` in the JSONL), so the explicit `--model` belongs at first launch, not at resume.
 - **Cwd-independent for *finding*** the session — Pi searches by partial UUID across `~/.pi/agent/sessions/`.
-- **But run resume in the original cwd** for cleanest behavior. The session metadata remembers the cwd it was created in; resuming elsewhere makes file paths and git context inconsistent. `superv resume` defaults to the stored cwd.
+- **But run resume in the stored cwd** for cleanest behavior; `superv resume` defaults to it. For workers launched the standard way, the stored cwd is the worktrees' parent folder — stable even after the task worktree rotates or is deleted, which is exactly why workers are homed there. Passing `--cwd` to relocate also re-resolves and rewrites the stored transcript path by session id (or refuses if it can't).
 - **Pi has no permission-bypass flag** like Claude's `--dangerously-skip-permissions` — Pi's permission model is governed elsewhere; nothing extra is needed at resume time.
 
 ## 10. Kickoff template (Pi-flavored additions)
@@ -220,10 +227,10 @@ Pi supports session resume by UUID. The supervisor wraps this via `superv pause`
 Append to the core kickoff:
 
 ```
-8. You were launched with an explicit model (e.g. `pi --model openai-codex/gpt-5.6-sol:xhigh`),
+9. You were launched with an explicit model (e.g. `pi --model openai-codex/gpt-5.6-sol:xhigh`),
    which already sets your reasoning level; use `pi --thinking xhigh` only if you need to
    raise effort beyond what the launch set.
-9. The supervisor reads your active-branch JSONL and live tmux pane — both are observed.
-10. When you complete a phase, summarize in a final assistant turn so the supervisor's
+10. The supervisor reads your active-branch JSONL and live tmux pane — both are observed.
+11. When you complete a phase, summarize in a final assistant turn so the supervisor's
     persisted-history check picks up a clear done signal.
 ```

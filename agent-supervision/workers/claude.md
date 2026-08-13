@@ -19,9 +19,18 @@ tmux new-window -t <session> -n claude-worker -d
 
 # 2. Start Claude Code inside that window. The TUI does NOT take a positional
 #    initial prompt — send the kickoff message afterward via 'superv send'.
+#
+#    Launch cwd: for worktree-based tasks, use the WORKTREES' PARENT folder
+#    (e.g. ~/workspace/wt/<repo>/), not the task worktree. Worktrees are often
+#    shorter-lived than the agent sessions that operate over them; homing the
+#    worker one level up keeps its shell and cwd-keyed transcript dir valid
+#    when a worktree is deleted. The kickoff message MUST then name the
+#    worktree's absolute path — the worker can't infer it from its cwd.
 tmux send-keys -t <session>:claude-worker.0 \
-  'cd /path/to/repo && claude --dangerously-skip-permissions' Enter
+  'cd /path/to/wt-parent && claude --dangerously-skip-permissions' Enter
 ```
+
+Because Claude auto-loads AGENTS.md/CLAUDE.md from its launch cwd, launching in the parent folder skips the repo's own copy. The `triad` CLI drops a small AGENTS.md stub in the parent folder pointing agents at their assigned worktree's AGENTS.md; if you launch manually, keep such a stub there (and add `--add-dir` if the worker needs paths outside the parent tree).
 
 **Common flags:**
 
@@ -195,7 +204,7 @@ Claude supports session resume by UUID. The supervisor wraps this via `superv pa
 
 - **Resume command shape**: `claude --resume <uuid> --dangerously-skip-permissions`. The `<uuid>` is the session ID, stored in the registry as `rec.extra.session_id` (and is also the JSONL filename stem).
 - **Cwd-independent for *finding*** the session — Claude searches across `~/.claude/projects/*/<uuid>.jsonl`.
-- **But run resume in the original cwd** for cleanest behavior. `superv resume` defaults to the stored cwd.
+- **But run resume in the stored cwd** for cleanest behavior; `superv resume` defaults to it. For worktree-based workers the stored cwd is the worktrees' parent folder, so resume stays valid even after the task worktree rotates or is deleted. Passing `--cwd` to relocate also re-resolves and rewrites the stored transcript path by session id (or refuses if it can't).
 - **Always include `--dangerously-skip-permissions`** at resume for autonomous workers — without it, Claude blocks on every tool call once it starts running again. `superv resume` includes this flag by default.
 
 ## 9. Kickoff template (Claude-flavored additions)
@@ -203,7 +212,7 @@ Claude supports session resume by UUID. The supervisor wraps this via `superv pa
 Append to the core kickoff:
 
 ```
-8. You are running with --dangerously-skip-permissions; permission prompts will not block you.
-9. Use TaskCreate / TaskUpdate liberally to track progress; the supervisor reads them.
-10. When you compact, it's fine — the supervisor's cursor survives compaction.
+9. You are running with --dangerously-skip-permissions; permission prompts will not block you.
+10. Use TaskCreate / TaskUpdate liberally to track progress; the supervisor reads them.
+11. When you compact, it's fine — the supervisor's cursor survives compaction.
 ```

@@ -92,7 +92,12 @@ After sending:
 # 1. Create a background tmux window
 tmux new-window -t <session> -n <name> -d
 
-# 2. Start the worker interactively
+# 2. Start the worker interactively. For worktree-based tasks, <cwd> is the
+#    WORKTREES' PARENT folder (e.g. ~/workspace/wt/<repo>/), not the worktree —
+#    worktrees are often shorter-lived than the agent sessions that operate
+#    over them, and the brief names the worktree explicitly. Exception: codex
+#    workers cd into the worktree itself (cwd-only session binding; see
+#    workers/codex.md).
 tmux send-keys -t <session>:<name>.0 'cd <cwd> && <agent-cmd>' Enter
 
 # 3. Poll briefly until ready (look for the agent's compose prompt)

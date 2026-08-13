@@ -40,6 +40,8 @@ The same flags work regardless of worker kind — the adapter under the hood han
 
 The cwd-with-dashes encoding differs slightly per worker (Pi has surrounding `--`, Claude has a single leading `-`). The adapters handle this; you address the worker by its registered id, not by file path.
 
+For pi and claude workers launched the standard way, the cwd in these paths is the **worktrees' parent folder** (e.g. `~/workspace/wt/<repo>/`), not a worktree — workers are homed there because worktrees are often shorter-lived than the agent sessions that operate over them. That makes the cwd-keyed session dir **shared per repo**: every agent on that repo writes into the same directory, so a file's location says nothing about which agent owns it. Binding relies on session ids (pi: mandatory launch-seeded `--session-id`; claude: `extra.session_id` captured at registration), never on "newest file in the dir". Codex is the exception — its rollouts are date-keyed anyway, and codex workers still launch inside their worktree.
+
 ## Truncation defaults
 
 The adapters render with these caps:
