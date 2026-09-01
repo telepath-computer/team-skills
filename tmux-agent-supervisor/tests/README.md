@@ -1,9 +1,9 @@
-# agent-supervision tests
+# tmux-agent-supervisor tests
 
 Run:
 
 ```bash
-python3 -m unittest discover -s skills/agent-supervision/tests -p 'test_*.py' -v
+python3 -m unittest discover -s skills/tmux-agent-supervisor/tests -p 'test_*.py' -v
 ```
 
 Stdlib-only (`unittest`); no pytest, network service, or real agents. Observation tests cover Pi, Claude, Codex, and OpenCode using temporary session fixtures and an in-process OpenCode response stub. Experimental await tests update temporary Pi, Claude, and Codex transcripts while an isolated copied CLI process waits on them.

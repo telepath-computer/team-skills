@@ -104,6 +104,19 @@ Concretely, prefer the left column:
 from outside their environment, something another worker discovered that is not yet written down. That
 is the category worth spending your turn on, and it is much smaller than it feels.
 
+## Delegate the judgment, not just the lookup
+
+The rule above is usually read as being about facts. It is equally about judgment, and that is where it is broken most often.
+
+A worker or reviewer is as capable as the supervisor. When the supervisor writes an extended brief — enumerated criteria, a rubric, a required structure or length for the deliverable, prescribed wording, a list of files to consult — the supervisor is doing the agent's thinking for it, and the agent reads the detail as a specification of the expected result. Two failures follow, and both have been observed in practice:
+
+- **Runaway complexity.** A checklist in the brief becomes a checklist in the output. Seven enumerated points become seven expanded sections; a seven-criterion review request produces a twenty-thousand-character report; "document the exact behavior" produces paragraphs the document never needed. The agent covers the list instead of judging what the work needs, and a reviewer handed the same list grades against it, so nothing pushes back.
+- **Over-constrained work that misses the point.** A detailed brief pre-decides the shape of the answer, so the agent never gets to notice that the shape is wrong. Steered into a structure, it cannot conclude "this step should stay two bullets" or "the right fix is to restore the original," and the detail the supervisor did not think of goes unaddressed because it was not on the list.
+
+A dispatch is one paragraph: the outcome wanted, where the work lives, the decisions and constraints that come from outside the agent's environment, and how to report. A review request is the target and the bar — "no loss of quality, enhancements only" — not a rubric. The agent decides scope, method, structure, and size. A supervisor who finds itself writing the deliverable's outline into the brief has crossed into doing the work, and the work comes back worse for it.
+
+The test before sending: strike every sentence the agent could have worked out for itself. What remains is the brief.
+
 ## Nudge taxonomy
 
 **Nudge when** all four hold:
@@ -126,7 +139,7 @@ A nudge is "keep going on established work," not "find something to work on."
 - **Make success and failure gates explicit.** Bad: "Run the tests, then refactor." Good: "Run the tests. If all pass, proceed to refactor. If any fail, diagnose and fix before moving on."
 - **Always specify failure behavior.** Agents optimize for forward progress. If you don't say what to do on failure, they may skip past it or paper over it.
 - **Avoid ambiguous chaining.** "Do X then Y" is ambiguous when Y depends on X succeeding. Use: "Do X. If X succeeds, proceed to Y."
-- **Be specific about "done."** Not "keep going until it's done" but "keep going until all unit tests, type-check, and E2E tests pass."
+- **Be specific about "done."** Not "keep going until it's done" but "keep going until all unit tests, type-check, and E2E tests pass." A done condition is a verifiable gate, not a rubric for the deliverable — see "Delegate the judgment, not just the lookup."
 
 ## Idle taxonomy
 

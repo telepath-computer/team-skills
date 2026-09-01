@@ -5,7 +5,7 @@ description: Audit a system for accreted complexity — machinery that exists be
 
 # Cargo Cult Review Audit
 
-**Depends on:** agent-supervision.
+**Depends on:** tmux-agent-supervisor.
 
 ## What this is for
 
@@ -24,7 +24,7 @@ Use it when:
 
 ## How to run it
 
-**1. Create two fresh agents.** Different model families, so their blind spots differ. Default to one pi running GPT-5.6 Sol and one Claude running Fable; override when a particular invocation calls for something else. Follow the `agent-supervision` skill for launching, registering, observing, and messaging them.
+**1. Create two fresh agents.** Different model families, so their blind spots differ. Default to one pi running GPT-5.6 Sol and one Claude running Fable; override when a particular invocation calls for something else. Follow the `tmux-agent-supervisor` skill for launching, registering, observing, and messaging them.
 
 Fresh context is a requirement, not a nicety. Do not reuse an agent that participated in building the system, reviewed it earlier, or has already read findings about it. An auditor carrying prior framing will cargo-cult that framing, which is the same failure one level up. If a suitable agent already exists but has history, retire it and create a new one.
 
