@@ -59,6 +59,14 @@ The same accretion happens in what you write *to* a capable reader, not only in 
 
 The test before writing a constraint: *could this reader do the right thing without it?* If yes, the constraint is not protection, it is noise with authority.
 
+## A positive statement is not a negative rule
+
+The most common way toothy limitations get volunteered into existence: read a statement of what something *is* or *does*, notice the space around it that the statement does not cover, and treat that space as a gap that a rule must fill. "The spec says we buy cherries at the store — but it doesn't say what we *cannot* buy! Can we buy lemons? It's a flawed spec!" No. It is fine. A spec describes what a thing has and does. It does not, by default, define the total, logically derivable landscape of everything it does not cover and does not allow, and it is not defective for leaving that landscape open. The open space is where judgment lives.
+
+So: when a statement says where something lives, that is not a statement that it may live nowhere else. When a statement says what a hook exposes, that is not a request to enumerate what may not be read from it. When a policy is positive about one thing, do not infer the negative about its neighbors and then promote the inference into a global rule. Nobody asked for the rule; you volunteered it.
+
+Negative rules — limitations with teeth — remain available. They are the rare exception, chosen deliberately when extreme emphasis or strict procedure is worth what it costs: every hard line removes a case from agent judgment, and unasked-for ones create a litigious, fearful status quo in which every small new thing has to be raised for human approval against a limitation nobody actually wanted. Write one only when that cost is being paid on purpose.
+
 ## While designing, implementing, or reviewing
 
 When work begins to expand, stop reasoning only from the most recent local decision. Restate the original problem and inspect the entire chain that led to the proposed machinery.
