@@ -47,8 +47,9 @@ If you must intervene, promote to *intervene* mode explicitly: state what you'll
 
 - Read files (Read tool, `cat`, `head`)
 - Read git state (`git status`, `git log`, `git diff`, `git branch`)
-- Run `superv` commands (they are read-only against the worker by design, except `send` which writes to the worker's input)
-- Write to your own state directory `~/.agent-supervision/`
+- Run `supervisr` commands (read-only against the worker by design, except `send`/`answer`/`dispatch` which write to the worker's input)
+- Read the worker's live screen with `supervisr screen` (liveness/anomaly only, not routine observation)
+- Write to your own state directory `~/.local/state/supervisr/`
 - Spawn research agents *with* `isolation: "worktree"` for any code investigation
 
 ## Supervisor heartbeat, worker nudges, and two kinds of completion
@@ -56,7 +57,7 @@ If you must intervene, promote to *intervene* mode explicitly: state what you'll
 Keep these concepts separate:
 
 - The **supervisor heartbeat** is the supervisor's global self-nudging timer. It periodically returns the supervisor to its dynamic duties: reassess the overall goal, observe whichever workers or systems currently matter, and decide what to do next. A heartbeat fire does not imply that any worker should receive a message.
-- A **worker nudge** is a deliberate `superv send` decision to help a worker continue an established, unfinished assignment. It is one possible supervisor action, not the purpose or guaranteed result of a heartbeat.
+- A **worker nudge** is a deliberate `supervisr send` decision to help a worker continue an established, unfinished assignment. It is one possible supervisor action, not the purpose or guaranteed result of a heartbeat.
 - **Worker completion** means one worker's current assignment is done. Stop nudging that worker about the completed assignment, verify the result, and reassess the overall goal. Worker completion may lead to review, a new dispatch, a phase transition, or eventual supervisor completion; it never by itself tears down the supervisor heartbeat.
 - **Supervisor completion** means the supervisor's overall assignment is definitively complete. This is distinct from a worker, task, review, slice, or phase being complete.
 
@@ -104,6 +105,19 @@ Concretely, prefer the left column:
 from outside their environment, something another worker discovered that is not yet written down. That
 is the category worth spending your turn on, and it is much smaller than it feels.
 
+## Delegate the judgment, not just the lookup
+
+The rule above is usually read as being about facts. It is equally about judgment, and that is where it is broken most often.
+
+A worker or reviewer is as capable as the supervisor. When the supervisor writes an extended brief — enumerated criteria, a rubric, a required structure or length for the deliverable, prescribed wording, a list of files to consult — the supervisor is doing the agent's thinking for it, and the agent reads the detail as a specification of the expected result. Two failures follow, and both have been observed in practice:
+
+- **Runaway complexity.** A checklist in the brief becomes a checklist in the output. Seven enumerated points become seven expanded sections; a seven-criterion review request produces a twenty-thousand-character report; "document the exact behavior" produces paragraphs the document never needed. The agent covers the list instead of judging what the work needs, and a reviewer handed the same list grades against it, so nothing pushes back.
+- **Over-constrained work that misses the point.** A detailed brief pre-decides the shape of the answer, so the agent never gets to notice that the shape is wrong. Steered into a structure, it cannot conclude "this step should stay two bullets" or "the right fix is to restore the original," and the detail the supervisor did not think of goes unaddressed because it was not on the list.
+
+A dispatch is one paragraph: the outcome wanted, where the work lives, the decisions and constraints that come from outside the agent's environment, and how to report. A review request is the target and the bar — "no loss of quality, enhancements only" — not a rubric. The agent decides scope, method, structure, and size. A supervisor who finds itself writing the deliverable's outline into the brief has crossed into doing the work, and the work comes back worse for it.
+
+The test before sending: strike every sentence the agent could have worked out for itself. What remains is the brief.
+
 ## Nudge taxonomy
 
 **Nudge when** all four hold:
@@ -126,7 +140,7 @@ A nudge is "keep going on established work," not "find something to work on."
 - **Make success and failure gates explicit.** Bad: "Run the tests, then refactor." Good: "Run the tests. If all pass, proceed to refactor. If any fail, diagnose and fix before moving on."
 - **Always specify failure behavior.** Agents optimize for forward progress. If you don't say what to do on failure, they may skip past it or paper over it.
 - **Avoid ambiguous chaining.** "Do X then Y" is ambiguous when Y depends on X succeeding. Use: "Do X. If X succeeds, proceed to Y."
-- **Be specific about "done."** Not "keep going until it's done" but "keep going until all unit tests, type-check, and E2E tests pass."
+- **Be specific about "done."** Not "keep going until it's done" but "keep going until all unit tests, type-check, and E2E tests pass." A done condition is a verifiable gate, not a rubric for the deliverable — see "Delegate the judgment, not just the lookup."
 
 ## Idle taxonomy
 
@@ -153,11 +167,11 @@ When you need to verify a worker claim or check something the worker hasn't repo
 Often the simplest correct path. The worker is already in the right environment, on the right branch, with the right uncommitted state. Ask it to do the validation, report the result, and continue.
 
 ```
-superv send <id> "Before continuing: run the unit tests for the auth module and report pass/fail. Then proceed with the refactor."
+supervisr send <id> "Before continuing: run the unit tests for the auth module and report pass/fail. Then proceed with the refactor."
 ```
 
 ```
-superv send <id> "Pause and run 'cargo check'. Report any errors. If clean, continue with the migration."
+supervisr send <id> "Pause and run 'cargo check'. Report any errors. If clean, continue with the migration."
 ```
 
 This works well when:
@@ -165,11 +179,11 @@ This works well when:
 - You trust the worker to actually run it and report honestly (verify against the persisted entries afterward).
 - The worker has the necessary context loaded already, which avoids you re-deriving environment.
 
-Be explicit about failure behavior — "if X passes, do Y; if X fails, stop and report" — per the nudge guidance above. After the worker reports, follow up with `superv send <id> "Continue."` so it doesn't sit waiting on you.
+Be explicit about failure behavior — "if X passes, do Y; if X fails, stop and report" — per the nudge guidance above. After the worker reports, follow up with `supervisr send <id> "Continue."` so it doesn't sit waiting on you.
 
 ### Rung 2: spawn a subagent for independent verification
 
-When you don't want to interrupt the worker, or you want an *independent* verification that doesn't go through the worker, spawn a subagent in your own supervisor environment. The exact mechanism depends on which agent you are — see your supervisor doc (`supervisors/scheduled.md` for Claude's `Agent` tool with `isolation: "worktree"` and for Pi's worker-as-subagent pattern; `supervisors/polled.md` for codex/opencode specifics).
+When you don't want to interrupt the worker, or you want an *independent* verification that doesn't go through the worker, spawn a subagent in your own supervisor environment. The exact mechanism depends on which agent kind you are: Claude Code has the `Agent` tool with `isolation: "worktree"` (its own checkout from `HEAD`, auto-cleaned if unchanged) — use it for any command-running verification; Pi has no isolation flag, so its "subagent" is a fresh short-lived worker launched in its own worktree cwd (dispatch it, read its result, tear it down). Whatever the mechanism, the isolation classes below decide how much protection it needs.
 
 How much protection the subagent needs depends on **what it will do**, not just on which rung you're at. Classify the work first, then pick the mechanism.
 
@@ -200,12 +214,12 @@ Frame your verification questions accordingly: ask things that committed reality
 When you need to verify the worker's *current* state and a subagent against `HEAD` won't reflect it (and Rung 1 isn't appropriate — e.g., the verification involves something the worker shouldn't run, or you specifically need an independent perspective), ask the worker to pause and commit:
 
 ```
-superv send <id> "Pausing for verification — please commit your current WIP (any throwaway message is fine) so I can read the current state. Reply when committed."
+supervisr send <id> "Pausing for verification — please commit your current WIP (any throwaway message is fine) so I can read the current state. Reply when committed."
 ```
 
-This is explicit interaction, not silent intervention — the worker knows you've paused it and why. After it confirms, spawn the Rung 2 subagent against the new `HEAD`, get an accurate picture, then `superv send <id> "Verified X — resume your work."`
+This is explicit interaction, not silent intervention — the worker knows you've paused it and why. After it confirms, spawn the Rung 2 subagent against the new `HEAD`, get an accurate picture, then `supervisr send <id> "Verified X — resume your work."`
 
-Rung 3 is a valid escalation of the supervisor stance. You've stepped briefly out of pure observation and asked the worker to cooperate so you can verify it. Document with `superv note --tag supervisor`.
+Rung 3 is a valid escalation of the supervisor stance. You've stepped briefly out of pure observation and asked the worker to cooperate so you can verify it. Document with `supervisr note --tag supervisor`.
 - **Reuse of identifiers from failed runs poisons diagnostics.** Insist the worker uses fresh inputs for each diagnostic probe.
 
 ## Worker anti-pattern catalog
@@ -237,18 +251,18 @@ The tell: **if a worker needs a timer, or is waiting on another agent, supervisi
 
 (Distinguish this from legitimate *work* delegation: sending a worker a large task, including tasks that contain judgment, is the job. What may never be delegated is the coordination *between* agents — dispatch, watching, relaying, pacing, lifecycle.)
 
-**Draw the read line and the act line, and issue both as instructions.** On shared-user machines every agent can technically read this skill and run `superv` — file permissions cannot confine them, so the boundary only exists if you state it in kickoffs. The calibrated rule: *awareness* of this skill via the harness's skill listing is unavoidable and fine; *reading* its contents is off-limits to workers — it is the supervisor's operating manual, and a worker who has read it is one step from using it; *acting* on supervision capabilities (contacting other agents, arming watch loops, pacing itself with timers) is the hard violation and an immediate correction signal. Observed in practice: a worker browsing the skills directory for an unrelated skill read this one's transport docs and began driving its own review loop with another agent; the supervisor then compounded the error by ratifying it. State the rule at kickoff, treat worker references to supervision tooling as NEEDS_CORRECTION, and reclaim any coordination that has leaked.
+**Draw the read line and the act line, and issue both as instructions.** On shared-user machines every agent can technically read this skill and run `supervisr` — file permissions cannot confine them, so the boundary only exists if you state it in kickoffs. The calibrated rule: *awareness* of this skill via the harness's skill listing is unavoidable and fine; *reading* its contents is off-limits to workers — it is the supervisor's operating manual, and a worker who has read it is one step from using it; *acting* on supervision capabilities (contacting other agents, arming watch loops, pacing itself with timers) is the hard violation and an immediate correction signal. Observed in practice: a worker browsing the skills directory for an unrelated skill read this one's docs and began driving its own review loop with another agent; the supervisor then compounded the error by ratifying it. State the rule at kickoff, treat worker references to supervision tooling as NEEDS_CORRECTION, and reclaim any coordination that has leaked.
 
 ## Supervisor anti-pattern: holding a turn open to wait on a worker
 
 **Never block your own turn waiting for a worker to reach a condition.** You already have a loop. Use it, and do not try to optimize around it.
 
-The explicitly opt-in experimental event-driven mode defines one narrow override in `supervisors/experimental-event-driven.md`: `superv await` may run through a host's background-command facility while a recurring heartbeat remains active as a monitoring backstop. That overlay does not permit a foreground wait that holds the supervisor's active turn open.
+`supervisr events` is the one sanctioned exception: it streams herdr status transitions for the agents in scope from herdr's event hub, and may run under a host background-command facility (a Monitor) as an accelerator while a recurring heartbeat stays active as the backstop. It fires on herdr's authoritative state, not on a text pattern you guessed, so it is not the wrong-premise trap below. It still does not permit a foreground wait that holds the supervisor's active turn open.
 
 This rule is about the *mechanism*, not any one tool. All of these are the same anti-pattern:
 
 - A `Monitor` script polling for a worker condition.
-- A `Bash` loop that spins until a pattern appears — `until tmux capture-pane … | grep -q "…"; do sleep 5; done`, `while ! test -f …; do sleep 10; done`, or any variant.
+- A `Bash` loop that spins until a pattern appears — `until supervisr status … | grep -q "…"; do sleep 5; done`, `while ! test -f …; do sleep 10; done`, or any variant.
 - A long foreground command whose only purpose is to delay until a worker finishes.
 - Chained short sleeps that add up to the same wait.
 
@@ -319,7 +333,7 @@ Compaction happens only when the supervisor or operator submits the literal slas
 For a tmux-backed worker, the standard supervisor action is:
 
 ```bash
-superv send <id> "/compact"
+supervisr send <id> "/compact"
 ```
 
 The `/compact` submission itself must contain no prefix, suffix, explanation, or follow-up instruction. Wait until the worker is idle before sending it; a busy agent may route the slash command into a steering queue as ordinary text instead of executing a TUI command. Immediately afterward, in the same supervisor turn, send the separate post-compaction orientation message: while compaction is running, the harness safely queues it as steering for delivery after compaction. Verify through the live channel that compaction actually started and that the orientation is queued. On subsequent heartbeats, verify that compaction finished and that the orientation was delivered; do not re-send `/compact` to test completion.
@@ -364,11 +378,11 @@ and briefs re-seeded from files are what make both compaction and replacement ch
 
 The supervisor's biggest risk is destroying its own context by ingesting the full contents of the worker's session.
 
-- **Route attention with `superv sweep`, then read through `superv watch`.** `sweep` reports liveness, context use, unread count, and the latest readable intent or conclusion for every registered worker without moving cursors. `watch` maintains a per-worker cursor and returns the unread entries that need full interpretation. Never read raw JSONL or full HTTP message histories to "get oriented."
+- **Route attention with `supervisr sweep`, then read through `supervisr watch`.** `sweep` reports liveness, context use, unread count, and the latest readable intent or conclusion for every registered worker without moving cursors. `watch` maintains a per-worker cursor and returns the unread entries that need full interpretation. Never read raw JSONL or full HTTP message histories to "get oriented."
 - **After compaction, the cursor file survives.** Load it, fetch only entries past it. Do not re-read from message 0 — that's the loop that destroys context permanently.
-- **CRITICAL — do not substitute `tmux capture-pane` for `watch` on routine sweeps.** This is the single largest avoidable drain on a supervisor's context, it compounds every heartbeat, and it is invisible while it happens. Measured on a real session: `superv status` costs 66 bytes for an idle worker, `superv watch` with a current cursor costs **17** — literally `(no new entries)` — and `capture-pane` of the same idle worker costs **~3,600 bytes of identical, unchanged tail, every single time**. Across six workers on a two-minute heartbeat that is roughly 160k tokens an hour of pure duplication. The cursor exists precisely so an idle worker is nearly free to observe; a raw pane read throws that away and re-ingests the same screen.
-- **When `watch` prints a compact overview, follow its completion instruction — don't reach for the pane.** Every tool call remains visible on its own bounded line. If the output says `INCOMPLETE OBSERVATION`, run `superv watch <id>` again before judging the worker; the cursor advanced only through the entries shown. Repeat until it says `OBSERVATION COMPLETE`. A line ending in `…` has shortened content available through `superv detail <id> <locator>`. Use `superv watch <id> --reset --count N` only when deliberately discarding unread history to inspect a recent tail.
-- **`capture-pane` is for the live channel, not the transcript.** It is the right tool for the few things the persisted log cannot show: whether a compaction indicator is on screen, whether a sent message is sitting unconsumed in the steering queue, whether a retry is in progress. Reach for it deliberately for those, not as the default way to see what a worker is doing.
+- **CRITICAL — do not substitute `supervisr screen` (herdr's live pane read) for `watch` on routine sweeps.** This is the single largest avoidable drain on a supervisor's context, it compounds every heartbeat, and it is invisible while it happens. A live screen read re-ingests the same full pane of identical, unchanged tail every single time, whereas `supervisr watch` with a current cursor costs almost nothing — literally `(no new entries)` for an idle worker. Across several workers on a two-minute heartbeat that is the difference between a few bytes and hundreds of thousands of tokens an hour of pure duplication. The cursor exists precisely so an idle worker is nearly free to observe; a raw screen read throws that away. (herdr's own `agent read` is the same trap at the herdr layer — `supervisr` deliberately does not use it for observation.)
+- **When `watch` prints a compact overview, follow its completion instruction — don't reach for the screen.** Every tool call remains visible on its own bounded line. If the output says `INCOMPLETE OBSERVATION`, run `supervisr watch <id>` again before judging the worker; the cursor advanced only through the entries shown. Repeat until it says `OBSERVATION COMPLETE`. A line ending in `…` has shortened content available through `supervisr detail <id> <locator>`. Use `supervisr watch <id> --reset --count N` only when deliberately discarding unread history to inspect a recent tail.
+- **`supervisr screen` is for the live channel, not the transcript.** It is the right tool for the few things the persisted log cannot show — but note herdr already turns most of them into a first-class status: a permission/approval dialog shows as `blocked` in `supervisr sweep` without a screen read. Reach for `screen` deliberately to read the *content* of a blocked dialog, or to see a compaction indicator or an unconsumed steering message — not as the default way to see what a worker is doing.
 - **Read the work product before reading the transcript.** When the supervised work lands in a
   repository, `git log --oneline`, `git diff --shortstat` against the integration branch, and the
   contents of committed working notes answer *where is everyone* exactly, for almost nothing. One pass
@@ -385,20 +399,26 @@ The supervisor's biggest risk is destroying its own context by ingesting the ful
   compaction, so a completed compaction read as a hang for several minutes. Use the verdict to decide
   **who to look at**, then look. Never build a conclusion on it alone.
 
-- **Truncation defaults are tuned for survival.** Use bounded `superv detail <id> <locator>` when one overview line needs inspection. Unbounded JSON requires the deliberate `--raw --force` double override.
+- **Truncation defaults are tuned for survival.** Use bounded `supervisr detail <id> <locator>` when one overview line needs inspection. Unbounded JSON requires the deliberate `--raw --force` double override.
 - **Notes file is outside the repo.** So the worker doesn't read your meta-commentary about it.
 
 ## Filesystem conventions (single source of truth)
 
+There is **no worker registry** — herdr's `agent list` is the registry, and
+`supervisr` state is keyed by each worker's native session id, never by a name
+you allocate:
+
 ```
-~/.agent-supervision/
-  workers/<id>.json       # worker registry (kind, addresses, paths)
-  cursors/<id>.json       # observation cursor
-  notes/<id>.md           # supervisor's running notes
-  heartbeats/<id>.md             # exact canonical global heartbeat prompt
-  heartbeats/<id>.state.json     # polled timer metadata; id is only its mechanical anchor
-  # (legacy: pointer-files/ is no longer used — superv now sends multi-line content directly via tmux paste-buffer)
+~/.local/state/supervisr/
+  cursors/<session-id>.json    # observation cursor (survives compaction & herdr restart)
+  notes/<session-id>.md        # supervisor's running notes
+  sessions/<session-id>.json   # resolved transcript path + last-seen name/pane cache
+  claude-ctx/<session-id>.json # Claude context-window record from the statusline sidecar
 ```
+
+The state root follows `$SUPERVISR_STATE_ROOT` → `$HERDR_PLUGIN_STATE_DIR` →
+`$XDG_STATE_HOME/supervisr` → `~/.local/state/supervisr`. Never write any of it
+inside a supervised repo.
 
 Never put any of these inside the worker's repo.
 
@@ -412,7 +432,7 @@ Each entry: timestamp, brief status, and a tag indicating *who* drove the decisi
 
 Without these tags you can't reconstruct whose judgment drove each choice — and the worker has two principals (you and the user).
 
-Use `superv note` for significant durable observations: decisions, blockers, corrections, approvals, worker completions and handoffs, phase transitions, context-management events, and interventions whose rationale should survive compaction or supervisor handoff. Do not write routine per-fire status updates; the conversation's cycle narratives already carry that pulse. The heartbeat merely reminds the supervisor to reassess—it does not replace this selective note-taking duty.
+Use `supervisr note` for significant durable observations: decisions, blockers, corrections, approvals, worker completions and handoffs, phase transitions, context-management events, and interventions whose rationale should survive compaction or supervisor handoff. Do not write routine per-fire status updates; the conversation's cycle narratives already carry that pulse. The heartbeat merely reminds the supervisor to reassess—it does not replace this selective note-taking duty.
 
 ## Worker completion and supervisor teardown
 
@@ -434,29 +454,19 @@ Tear down the supervisor heartbeat only when one of these is definitively true:
 
 A worker, review, task, slice, or phase completing is not by itself a heartbeat teardown condition. Neither is a temporary wait for another agent, process, build, test, or review. If the user later supplies the required input or resumes the assignment, create the canonical heartbeat again.
 
-## Pause / resume — for tmux-backed workers (pi/claude/codex)
+## Stepping away — herdr persists; there is no pause/resume dance
 
-If the user wants to free up tmux UI space without losing a worker's session — typical when work is paused for hours/days and the agent doesn't need to be running — use `superv pause` and later `superv resume`.
+herdr owns process lifecycle and persistence, so the tmux "pause/resume to free
+UI space" ritual does not exist here. To step away, **detach herdr** (`ctrl+a q`
+if you rebound the prefix, else `ctrl+b q`): panes and agents keep running, and
+reattaching — or a herdr server restart — resumes them (herdr relaunches each
+agent with its native `--resume` from the reported session id). The observation
+cursor is keyed by that session id, so it survives the restart untouched.
 
-```bash
-superv pause <id>                                   # kill tmux window; preserve session
-superv pause <id> --launch-hint "--effort high"     # capture custom flags for the next resume
-superv resume <id>                                  # re-launch in a fresh tmux window
-superv resume <id> --cwd /other/path                # resume in a different directory
-```
-
-The persisted JSONL/rollout file is left intact — agent CLIs (`pi --session <uuid>`, `claude --resume <uuid>`, `codex resume <uuid>`) all support continuing an existing session by ID. The registry stores the session ID, the launch cwd, and (optionally) launch hints, so resume rebuilds the tmux window and re-launches the agent with the right flags. For pi/claude workers launched the standard way, the stored cwd is the worktrees' **parent folder**, not a worktree — deliberately, because worktrees are often shorter-lived than the agent sessions that operate over them.
-
-**When to use:**
-- The user explicitly wants to step away for a while and free up tmux windows.
-- The session has substantial context (a long architectural design, a multi-file refactor) you don't want to lose to a re-launch.
-- A future invocation will benefit from the agent remembering prior decisions, conversations, file reads.
-
-**When NOT to use:**
-- You want a fresh start. Just `unregister` and re-launch normally; resume is for continuing, not starting over.
-- The worker is opencode (HTTP-based; sessions live on the opencode server independently of tmux).
-
-Pausing mid-turn discards the in-flight turn, so operators typically pause at a quiet moment — the tool does not check or block.
+To actually end a worker, `supervisr stop <name> --close-pane` (its cursor and
+notes are kept; `supervisr forget <name>` drops them). A worker whose session is
+worth keeping but whose pane you want gone can simply be closed — herdr can
+resume the session later from its id.
 
 **Cwd matters at resume time.** Agents inherit cwd from the resuming process, and the session metadata remembers the cwd it was created in. Resume to the stored cwd. For pi/claude workers that cwd is the stable worktrees' parent folder, so resuming there remains correct even after the task worktree has rotated or been deleted — the agent's worktree comes from its briefs, not its cwd. Only codex workers (launched inside the worktree by exception) may need `--cwd` after worktree deletion; passing `--cwd` also re-resolves and rewrites the stored transcript path by session id, or refuses if it can't.
 
@@ -476,4 +486,4 @@ When launching the worker into implementation, be explicit about freedoms:
 8. When you hit a wall, say so clearly — do not spin.
 ```
 
-Worker docs may add worker-specific lines (kickoff template lives in each `workers/<kind>.md`).
+Per-kind kickoff additions live in this skill's `workers.md`.

@@ -2629,7 +2629,7 @@ def acquire_context_window(rec: Dict[str, Any]) -> Optional[int]:
 
     Per-kind sources:
       pi:       tmux status bar (fallback; look for `46.8%/1.0M` style fragment)
-      claude:   tmux status bar after the agent-supervision statusLine script is wired in
+      claude:   tmux status bar after the tmux-agent-supervisor statusLine script is wired in
                 (look for `ctx:1000k` fragment); requires `superv install-claude-statusline`
       codex:    None — Codex publishes the window per turn in the JSONL token_count event,
                 so no register-time acquisition needed
@@ -2704,7 +2704,7 @@ def acquire_context_window(rec: Dict[str, Any]) -> Optional[int]:
 
 
 def cmd_install_claude_statusline(args: argparse.Namespace) -> int:
-    """Install the agent-supervision Claude statusLine into ~/.claude/settings.json.
+    """Install the tmux-agent-supervisor Claude statusLine into ~/.claude/settings.json.
 
     The status line gives the operator an at-a-glance context-window display
     AND lets `superv register --kind claude` parse the model context window from
@@ -2950,7 +2950,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     save_record(rec)
     print(json.dumps(rec, indent=2))
     if args.kind == "claude" and "context_window_tokens" not in rec.get("extra", {}):
-        eprint("hint: install the agent-supervision statusLine for auto-percentage:")
+        eprint("hint: install the tmux-agent-supervisor statusLine for auto-percentage:")
         eprint("      superv install-claude-statusline")
     return 0
 
@@ -3767,7 +3767,7 @@ examples:
     # install-claude-statusline
     sp = sub.add_parser(
         "install-claude-statusline",
-        help="install the agent-supervision statusLine into ~/.claude/settings.json",
+        help="install the tmux-agent-supervisor statusLine into ~/.claude/settings.json",
         description="Wires scripts/claude-statusline.sh as the Claude Code statusLine. Gives the operator a context-window display in the TUI status bar AND lets `superv register --kind claude` parse the model context window from a tmux capture (one-time acquisition, cached in the worker registry).",
     )
     sp.add_argument("--force", action="store_true", help="overwrite an existing statusLine entry")

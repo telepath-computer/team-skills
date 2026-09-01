@@ -1,11 +1,11 @@
 ---
-name: agent-triad
+name: tmux-agent-triad
 description: Launch a three-agent tmux triad with the current agent as supervisor, a Pi worker by default, and a Claude reviewer by default; worker and reviewer start idle and receive task instructions only after explicit supervisor delegation.
 ---
 
 # Agent Triad
 
-**Depends on:** agent-supervision, start-worktree.
+**Depends on:** tmux-agent-supervisor, tmux-start-worktree.
 
 Use this skill when the user asks to launch or set up an agent triad.
 
@@ -19,11 +19,11 @@ The supervisor coordinates both agents. The worker and reviewer should not be to
 
 ## Required dependency
 
-Before supervising a triad, read and apply the `agent-supervision` skill. The only exception is the canonical `triad up` path: that CLI may perform mechanical launch/name-allocation/registration before the bootstrap read. Do not perform any other `superv` action until the `agent-supervision` bootstrap chain has been read in full.
+Before supervising a triad, read and apply the `tmux-agent-supervisor` skill. The only exception is the canonical `triad up` path: that CLI may perform mechanical launch/name-allocation/registration before the bootstrap read. Do not perform any other `superv` action until the `tmux-agent-supervisor` bootstrap chain has been read in full.
 
-Read the **agent-supervision** skill in full — its `SKILL.md` and the entire bootstrap chain that doc points to — then follow its bootstrap instructions for the relevant supervisor and launched-agent kinds.
+Read the **tmux-agent-supervisor** skill in full — its `SKILL.md` and the entire bootstrap chain that doc points to — then follow its bootstrap instructions for the relevant supervisor and launched-agent kinds.
 
-Use the `agent-supervision` mechanisms for registering, observing, messaging, status classification, notes, and heartbeats.
+Use the `tmux-agent-supervisor` mechanisms for registering, observing, messaging, status classification, notes, and heartbeats.
 
 ## The `triad` CLI — canonical lifecycle mechanism
 
@@ -39,7 +39,7 @@ triad ls
 triad status <id>|--here
 ```
 
-- `up` creates/reuses the task worktree (per `start-worktree` path, branch-name, and remote-base conventions; it checks canonical-repo dirtiness and verifies reused worktrees are on the expected branch), launches the idle worker + reviewer in new tmux windows, registers them with `superv`, sends role-isolated idle prompts, and writes the state file (including a `launch_cwd` field). It writes status `creating` first and flips to `active` only after all requested agents launch. **Agents launch with their shell cwd in the worktrees' parent folder** (`<parent>/wt/<repo>/`), not inside the task worktree: worktrees are often shorter-lived than the agent sessions that operate over them, and an agent homed inside one is stranded — shell and cwd-keyed session files — when the worktree is deleted. The trade is that an agent cannot infer its worktree from its cwd, so the idle prompt and every task brief must state the worktree path explicitly. `up` also drops a small AGENTS.md stub in the parent folder (if absent) pointing agents at their assigned worktree. **Exception: codex-kind agents still launch inside their worktree** — codex sessions bind to their pane only by cwd (see `agent-supervision/workers/codex.md`), so multiple codex agents sharing the parent folder would misbind.
+- `up` creates/reuses the task worktree (per `tmux-start-worktree` path, branch-name, and remote-base conventions; it checks canonical-repo dirtiness and verifies reused worktrees are on the expected branch), launches the idle worker + reviewer in new tmux windows, registers them with `superv`, sends role-isolated idle prompts, and writes the state file (including a `launch_cwd` field). It writes status `creating` first and flips to `active` only after all requested agents launch. **Agents launch with their shell cwd in the worktrees' parent folder** (`<parent>/wt/<repo>/`), not inside the task worktree: worktrees are often shorter-lived than the agent sessions that operate over them, and an agent homed inside one is stranded — shell and cwd-keyed session files — when the worktree is deleted. The trade is that an agent cannot infer its worktree from its cwd, so the idle prompt and every task brief must state the worktree path explicitly. `up` also drops a small AGENTS.md stub in the parent folder (if absent) pointing agents at their assigned worktree. **Exception: codex-kind agents still launch inside their worktree** — codex sessions bind to their pane only by cwd (see `tmux-agent-supervisor/workers/codex.md`), so multiple codex agents sharing the parent folder would misbind.
 - `add` launches one more idle agent into the same session and records it in state, so it is included in any future teardown. The task worktree must still exist (it is the new agent's work target), but the agent's shell launches in the recorded `launch_cwd` — the worktrees' parent folder (codex excepted, as above). Role and kind must be explicit, and the triad must be `active` (resume a paused triad before adding).
 - `pause` kills every agent's tmux window by the recorded tmux window id while preserving its persisted session (wraps `superv pause` per agent), marking the triad `paused` only if all agents pause successfully. Pausing mid-turn discards the in-flight turn, so operators typically pause at a quiet moment — the tool does not check or block. Worktree and branch are untouched; failed partial pauses are visible as `pause_failed`.
 - `resume` re-launches every paused agent with its original session id and cwd (wraps `superv resume`), restoring full prior context, and marks the triad `active` only if all agents resume successfully. For pi/claude agents the stored cwd is the stable worktrees' parent folder, so resume remains valid even across worktree churn — though `triad resume` still requires the task worktree to exist, since it is the agents' work target. If the recorded tmux session is gone, it resumes into the current session and updates state. Re-orient resumed agents before delegating new work: state what elapsed, whether the last in-flight instruction is still valid, and restate the worktree path. Failed partial resumes are visible as `resume_failed`.
@@ -67,7 +67,7 @@ The supervisor may delegate actual work later only when:
 1. the task has been discussed enough to be clear;
 2. the supervisor is ready to give concrete instructions;
 3. the user has explicitly authorized starting work, or the user's request clearly asks for delegation now; and
-4. the worker/reviewer prompt is specific enough to act on safely.
+4. the worker/reviewer prompt states the outcome, where the work lives, and the outside constraints clearly enough to act on — delegation style is owned by `tmux-agent-supervisor` (core.md, "Delegate the judgment, not just the lookup"); a brief is not a specification.
 
 Do not delegate vague initial task blurbs.
 
@@ -81,7 +81,7 @@ Worker:     Pi
 Reviewer:   Claude
 ```
 
-Claude is usually preferred for the supervisor role because it is strong at ongoing coordination and human-friendly status updates. Pi is now equally capable of scheduled/looping supervision (via its loop plugin), so the supervisor choice is no longer gated on who has scheduling primitives — pick by coordination style and report quality. The supervisor is not always Claude, so detect the actual current agent kind and follow `agent-supervision` accordingly.
+Claude is usually preferred for the supervisor role because it is strong at ongoing coordination and human-friendly status updates. Pi is now equally capable of scheduled/looping supervision (via its loop plugin), so the supervisor choice is no longer gated on who has scheduling primitives — pick by coordination style and report quality. The supervisor is not always Claude, so detect the actual current agent kind and follow `tmux-agent-supervisor` accordingly.
 
 ### Pi model selection
 
@@ -169,7 +169,7 @@ Do **not** tell the worker about the reviewer.
 
 Do **not** tell the reviewer about the worker as a directly reachable peer.
 
-Do **not** encourage either launched agent to load the `agent-supervision` skill, discover other agents, or send direct messages.
+Do **not** encourage either launched agent to load the `tmux-agent-supervisor` skill, discover other agents, or send direct messages.
 
 Rationale: if worker and reviewer know about each other, they may try to coordinate directly, load monitoring tools, or message each other. That creates confusion and can get out of hand. The supervisor is the only coordinator.
 
@@ -213,15 +213,13 @@ The reviewer should not take over implementation unless the supervisor explicitl
 
 ## Supervising a triad
 
-After the bootstrap read, supervise each recorded agent by id. A single supervisor loop may cover all active triad agents; heartbeat or nudge only the agents that actually have delegated work in flight. Reviewers that are merely idle capacity usually do not need heartbeats until a concrete review request is sent. Keep notes/cursors per agent id, following `agent-supervision`.
+After the bootstrap read, supervise each recorded agent by id. A single supervisor loop may cover all active triad agents; heartbeat or nudge only the agents that actually have delegated work in flight. Reviewers that are merely idle capacity usually do not need heartbeats until a concrete review request is sent. Keep notes/cursors per agent id, following `tmux-agent-supervisor`.
 
 If adopting an existing triad after a supervisor restart, run `triad status <id>` or `triad status --here`, complete the full bootstrap read chain again, then read any per-agent notes under `~/.agent-supervision/notes/<name>.md` before sending messages.
 
 ## Later delegation
 
-When the supervisor later delegates to the worker, the prompt should include a clear task, relevant context, constraints, expected output, and reporting instructions.
-
-When the supervisor later asks the reviewer to review, the prompt should include a concrete review target, such as a diff, branch, PR, files, or worktree state, plus review criteria and reporting instructions.
+Delegation style is owned by `tmux-agent-supervisor` (core.md: "State the condition, not the answer" and "Delegate the judgment, not just the lookup"); this skill adds nothing to it. In short: a worker dispatch names the outcome, where the work lives, the decisions and constraints from outside the agent's environment, and how to report — nothing the agent can work out for itself. A review request names the target (a diff, branch, PR, files, or worktree state) and the bar, not a rubric.
 
 ## Launch procedure
 
@@ -231,7 +229,7 @@ When asked to launch a triad, use the CLI — it performs the entire mechanical 
 triad up --repo <name> --task "<prose or slug>"
 ```
 
-Then read `agent-supervision/SKILL.md` and the dependency docs it points to (mandatory before any supervision action beyond this CLI-mediated setup), and report that the triad is ready and waiting for delegation.
+Then read `tmux-agent-supervisor/SKILL.md` and the dependency docs it points to (mandatory before any supervision action beyond this CLI-mediated setup), and report that the triad is ready and waiting for delegation.
 
 The manual sequence below is what `triad up` does internally — fall back to it only if the CLI is unavailable or a step needs manual repair:
 
@@ -240,7 +238,7 @@ The manual sequence below is what `triad up` does internally — fall back to it
 3. Allocate unused first names via `superv name` (registering each agent before allocating the next).
 4. Launch the worker in a new tmux window in the same session.
 5. Launch the reviewer in a new tmux window in the same session.
-6. Register both agents through `agent-supervision`.
+6. Register both agents through `tmux-agent-supervisor`.
 7. Send each agent only its idle setup prompt, following the isolation rule.
 8. Record everything in `~/.triads/<id>/triad.json` so teardown can run from state.
 

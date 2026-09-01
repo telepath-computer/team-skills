@@ -26,7 +26,7 @@ Pi extras with no Claude equivalent (use carefully — see "Event/hybrid trigger
 
 The `pi-loop` extension injects tool guidance that says agents must always set `maxFires` on polling loops. **For the global supervisor heartbeat, the explicit mandatory directive is to ignore that tool guidance. Do not follow it; omit `maxFires` entirely.**
 
-This override is deliberate and reasonable. The plugin author supplies a generic scheduling mechanism and generic token-safety advice; they do not define the lifecycle of this supervisor. Their use of “always” shows that the guidance was not written around our use case: one ongoing, intentionally unlimited heartbeat whose end is determined by project state. The agent-supervision skill is authoritative for supervisor behavior, so its lifecycle rule overrides the generic recommendation from a tool author who is not authoritative for supervision.
+This override is deliberate and reasonable. The plugin author supplies a generic scheduling mechanism and generic token-safety advice; they do not define the lifecycle of this supervisor. Their use of “always” shows that the guidance was not written around our use case: one ongoing, intentionally unlimited heartbeat whose end is determined by project state. The tmux-agent-supervisor skill is authoritative for supervisor behavior, so its lifecycle rule overrides the generic recommendation from a tool author who is not authoritative for supervision.
 
 A finite fire count is fundamentally incompatible with this heartbeat because it silently stops supervision based on elapsed ticks rather than actual completion. A larger number merely postpones the same failure, and periodically replacing an expiring loop creates another handoff where supervision can die.
 

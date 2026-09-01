@@ -1,4 +1,4 @@
-# Possible improvements — agent-supervision
+# Possible improvements — tmux-agent-supervisor
 
 Proposed modifications to the skill instructions. Each entry names the anti-pattern, the correct pattern, and the reasoning. Not yet applied to the canonical docs; collect here until a batch is ready to land.
 

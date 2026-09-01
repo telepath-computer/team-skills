@@ -11,7 +11,7 @@ Pi as the supervised agent.
 
 `superv` does not launch agents. The operator launches pi using whichever flags fit the task; `superv register` attaches the running pi to the supervision tooling afterward.
 
-**Always launch pi with an explicit `--model`.** A bare `pi` inherits whatever model and reasoning level were last used interactively, so a worker launched without `--model` silently picks up whatever you were last experimenting with — non-reproducible and easy to miss. The model string encodes both the model and the reasoning level, e.g. `openai-codex/gpt-5.6-sol:xhigh` selects gpt-5.6-sol at xhigh reasoning. (The `triad` CLI automates this; see the `agent-triad` skill.)
+**Always launch pi with an explicit `--model`.** A bare `pi` inherits whatever model and reasoning level were last used interactively, so a worker launched without `--model` silently picks up whatever you were last experimenting with — non-reproducible and easy to miss. The model string encodes both the model and the reasoning level, e.g. `openai-codex/gpt-5.6-sol:xhigh` selects gpt-5.6-sol at xhigh reasoning. (The `triad` CLI automates this; see the `tmux-agent-triad` skill.)
 
 Known Pi models (use the one the user asks for; default to GPT-5.6 Sol):
 

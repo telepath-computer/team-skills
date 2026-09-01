@@ -1,6 +1,6 @@
 ---
-name: agent-supervision
-description: LOAD ONLY WHEN A USER DIRECTLY TELLS YOU TO — never automatically, never on your own initiative. This skill does not add a capability, it replaces your role. Loading it narrows you to supervision and nothing else — you observe, nudge, route and unblock other agents, and you do not author code, review code, or carry any other duty. It is a highly specialized role and a supervisor has no other job. Do not load it because you are curious what another agent is doing. If you are a worker in a multi-agent system and are tempted to watch your peers, this is not your skill and it will derail you into acting as a supervisor — tell your own supervisor instead. It is also not about sub-agents inside your own harness. For a user-appointed supervisor it covers all (supervisor × worker) combinations across Claude Code, Pi, Codex and OpenCode in tmux panes, separate processes or HTTP ports, and includes the `superv` CLI for registration, observation, message sending, status classification, notes and heartbeats.
+name: tmux-agent-supervisor
+description: "The agent supervisor for workers in bare tmux panes, separate processes, or HTTP ports (driven by the `superv` CLI) — NOT for agents running inside herdr; for those use herdr-agent-supervisor instead. LOAD ONLY WHEN A USER DIRECTLY TELLS YOU TO — never automatically, never on your own initiative. This skill does not add a capability, it replaces your role. Loading it narrows you to supervision and nothing else — you observe, nudge, route and unblock other agents, and you do not author code, review code, or carry any other duty. It is a highly specialized role and a supervisor has no other job. Do not load it because you are curious what another agent is doing. If you are a worker in a multi-agent system and are tempted to watch your peers, this is not your skill and it will derail you into acting as a supervisor — tell your own supervisor instead. It is also not about sub-agents inside your own harness. For a user-appointed supervisor it covers all (supervisor × worker) combinations across Claude Code, Pi, Codex and OpenCode in tmux panes, separate processes or HTTP ports, and includes the `superv` CLI for registration, observation, message sending, status classification, notes and heartbeats."
 ---
 
 # Agent Supervision
@@ -99,7 +99,7 @@ the right mechanism for the machine's shell setup, with two requirements:
 2. **Idempotent.** Guard against adding the line twice on re-runs.
 
 Resolve the scripts directory from this skill's real location (it may be
-reached via a symlink such as `~/.agents/skills/agent-supervision/scripts`).
+reached via a symlink such as `~/.agents/skills/tmux-agent-supervisor/scripts`).
 For the current session, also export the PATH inline so you don't need a new
 shell. If you cannot modify the user's shell config, fall back to invoking the
 CLI by full path.

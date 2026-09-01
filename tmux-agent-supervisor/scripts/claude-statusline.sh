@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claude Code statusLine emitter for agent-supervision.
+# Claude Code statusLine emitter for tmux-agent-supervisor.
 #
 # Wired into ~/.claude/settings.json -> "statusLine" { "type": "command", "command": "..." }.
 # Claude Code spawns this on every status refresh, pipes a JSON state blob to stdin,

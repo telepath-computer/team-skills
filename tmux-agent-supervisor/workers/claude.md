@@ -62,7 +62,7 @@ superv register <id> --kind claude --tmux <session>:claude-worker.0
 
 `register` resolves the JSONL path automatically by reading `~/.claude/sessions/<pid>.json` for the running Claude process under the tmux pane.
 
-**Before registering your first Claude worker on this machine**, install the agent-supervision statusLine so `superv register` can capture the model context window:
+**Before registering your first Claude worker on this machine**, install the tmux-agent-supervisor statusLine so `superv register` can capture the model context window:
 
 ```bash
 superv install-claude-statusline
@@ -152,7 +152,7 @@ tail -5 ~/.claude/projects/<cwd-key>/<session-id>.jsonl \
   | tail -1
 ```
 
-**Claude's JSONL doesn't include the model context window**, but you can get auto-percentage by installing the agent-supervision statusLine. It writes `ctx:1000k`-style fragments into the Claude TUI status bar, which `superv register --kind claude` parses once and caches in the worker registry. After install:
+**Claude's JSONL doesn't include the model context window**, but you can get auto-percentage by installing the tmux-agent-supervisor statusLine. It writes `ctx:1000k`-style fragments into the Claude TUI status bar, which `superv register --kind claude` parses once and caches in the worker registry. After install:
 
 ```
 $ superv install-claude-statusline       # one-time per machine
