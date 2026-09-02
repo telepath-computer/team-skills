@@ -67,6 +67,14 @@ So: when a statement says where something lives, that is not a statement that it
 
 Negative rules — limitations with teeth — remain available. They are the rare exception, chosen deliberately when extreme emphasis or strict procedure is worth what it costs: every hard line removes a case from agent judgment, and unasked-for ones create a litigious, fearful status quo in which every small new thing has to be raised for human approval against a limitation nobody actually wanted. Write one only when that cost is being paid on purpose.
 
+## The asymmetry: following rules versus writing them
+
+An agent is highly efficient at following litigious rules and extremely inefficient at authoring them unsupervised. Given a precise rule, it applies the rule faithfully, to the letter, in every case the rule reaches — including the cases the author never imagined. Asked to write one, it produces a sentence that reads confidently and has not been traced against the cases it will govern. The two skills do not come as a pair, and the gap is invisible from the inside: writing a rule feels like the same activity as understanding one.
+
+The downstream reader of an agent-authored rule is usually another litigious agent — often the author itself a few turns later — which will apply it exactly as written. So the cost of a rule authored with too little thought is not a vague one; it is a specific wrong action, taken confidently, the first time reality presents a case the author did not consider. A numeric cap on review rounds, invented to make a loop terminate, ends a review that genuinely needed another round. A stopping test phrased as "if the next check could not change anything, stop" halts supervision of any task long enough to outlast one check interval. Both were written to sound like principles; neither survived its first real case.
+
+So treat authoring a rule as the higher-risk act, the opposite of how it feels. When a situation seems to call for a rule that the governing document does not contain, the default is to ask the owner, not to supply one. Where a rule genuinely must be written, walk it against the concrete cases it will meet — especially the long, the slow, the iterative, and the ones where the reader is an agent that will not second-guess it — before it becomes text with authority.
+
 ## While designing, implementing, or reviewing
 
 When work begins to expand, stop reasoning only from the most recent local decision. Restate the original problem and inspect the entire chain that led to the proposed machinery.
