@@ -53,6 +53,7 @@ Stated in full, with worked examples, in [audit-brief.md](audit-brief.md). In br
 - **Cascade is a smell.** If satisfying X requires adding Y, which requires constraint Z, which forces a new failure case — the chain is evidence that X was wrong.
 - **Deletion is the first move to consider.** The gradient runs the other way naturally: adding feels productive and its cost is invisible; deleting feels risky and its benefit is invisible.
 - **The one-sentence test.** Describe the mechanism aloud in one sentence and predict the owner's response. If the sentence sounds absurd, the mechanism is wrong regardless of whether the code is correct.
+- **Rules that agents wrote are prime suspects.** Agents follow litigious rules with great efficiency and author them with very little — an agent-written rule was likely stated without tracing its downstream effect on the litigious agents that will apply it literally. When a rule in the system has no owner decision behind it, ask what case prompted it and what it does to the cases its author never considered.
 
 ## What this skill is not
 
